@@ -14,7 +14,7 @@ export function Rail({onGearClick, gearActive}: Props) {
         aria-label="Home"
         title="Home"
         data-od-id="home-button"
-        onClick={() => window.dispatchEvent(new Event('openharness:new-chat'))}
+        onClick={() => window.dispatchEvent(new Event('openharness:home'))}
       >
         <HomeIcon width={17} height={17} aria-hidden="true" />
       </button>

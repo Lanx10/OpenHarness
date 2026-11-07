@@ -18,6 +18,8 @@ export function OpenHarness() {
       if (event.key === 'Escape') setSettingsOpen(false);
     };
     window.addEventListener('openharness:open-settings', openSettings);
+    const goHome = () => setSettingsOpen(false);
+    window.addEventListener('openharness:home', goHome);
     const checkUpdates = async () => {
       try {
         const {check} = await import('@tauri-apps/plugin-updater');
@@ -29,6 +31,7 @@ export function OpenHarness() {
     window.addEventListener('keydown', closeOnEscape);
     return () => {
       window.removeEventListener('openharness:open-settings', openSettings);
+      window.removeEventListener('openharness:home', goHome);
       window.removeEventListener('keydown', closeOnEscape);
     };
   }, []);

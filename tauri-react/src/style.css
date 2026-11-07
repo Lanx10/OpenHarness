@@ -580,8 +580,22 @@ svg { display: block; }
   border-right: 1px solid #242622;
   padding: 10px 7px;
   display: flex;
-  justify-content: center;
+  flex-direction: column;
+  align-items: center;
+  gap: 10px;
 }
+.settings-home, .settings-gear {
+  width: 32px;
+  height: 32px;
+  border: 0;
+  display: grid;
+  place-items: center;
+  color: #f2f2f2;
+  background: transparent;
+  border-radius: 8px;
+  cursor: pointer;
+}
+.settings-gear { margin-top: auto; }
 .settings-home {
   width: 32px;
   height: 32px;
