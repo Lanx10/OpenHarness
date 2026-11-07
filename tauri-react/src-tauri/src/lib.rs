@@ -39,68 +39,9 @@ pub struct AppState {
 
 impl Default for AppState {
     fn default() -> Self {
-        let default_projects = vec![
-            ProjectInfo {
-                id: "victory-liner".into(),
-                name: "Victory Liner".into(),
-                subtitle: "💬 Homepage, Navigation and...".into(),
-                path: None,
-                active: true,
-            },
-            ProjectInfo {
-                id: "experts".into(),
-                name: "Experts".into(),
-                subtitle: "💬 MT5 Gold# Scalping EA".into(),
-                path: None,
-                active: false,
-            },
-            ProjectInfo {
-                id: "smart-inventory".into(),
-                name: "Smart Inventory".into(),
-                subtitle: "💬 /impeccable shape the staff...".into(),
-                path: None,
-                active: false,
-            },
-            ProjectInfo {
-                id: "lgu-educ".into(),
-                name: "LGU EducAssistance".into(),
-                subtitle: "3 archived chats".into(),
-                path: None,
-                active: false,
-            },
-            ProjectInfo {
-                id: "kondukt".into(),
-                name: "kondukt".into(),
-                subtitle: "No chats yet".into(),
-                path: None,
-                active: false,
-            },
-            ProjectInfo {
-                id: "prmsu".into(),
-                name: "prmsu-research-services".into(),
-                subtitle: "1 archived chat".into(),
-                path: None,
-                active: false,
-            },
-            ProjectInfo {
-                id: "lanxbooth".into(),
-                name: "LanxBooth".into(),
-                subtitle: "No chats yet".into(),
-                path: None,
-                active: false,
-            },
-            ProjectInfo {
-                id: "ai-trading".into(),
-                name: "AI Trading".into(),
-                subtitle: "2 archived chats".into(),
-                path: None,
-                active: false,
-            },
-        ];
-
         Self {
             providers: Mutex::new(HashMap::new()),
-            projects: Mutex::new(default_projects),
+            projects: Mutex::new(Vec::new()),
         }
     }
 }
@@ -376,9 +317,7 @@ mod tests {
     fn test_app_state_defaults() {
         let state = AppState::default();
         let projects = state.projects.lock().unwrap();
-        assert_eq!(projects.len(), 8);
-        assert_eq!(projects[0].name, "Victory Liner");
-        assert!(projects[0].active);
+        assert!(projects.is_empty());
     }
 
     #[test]
@@ -413,12 +352,5 @@ mod tests {
 
         let projects = state.get_projects().unwrap();
         assert_eq!(projects[0].name, "Alpha Project");
-
-        let after_select = state.select_project("victory-liner").unwrap();
-        let victory = after_select
-            .iter()
-            .find(|p| p.id == "victory-liner")
-            .unwrap();
-        assert!(victory.active);
     }
 }

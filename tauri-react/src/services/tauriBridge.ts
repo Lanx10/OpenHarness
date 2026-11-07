@@ -45,18 +45,7 @@ export type ChatResponse = {
   provider: string;
 };
 
-const DEFAULT_PROJECTS: ProjectInfo[] = [
-  { id: 'victory-liner', name: 'Victory Liner', subtitle: '💬 Homepage, Navigation and...', active: true },
-  { id: 'experts', name: 'Experts', subtitle: '💬 MT5 Gold# Scalping EA', active: false },
-  { id: 'smart-inventory', name: 'Smart Inventory', subtitle: '💬 /impeccable shape the staff...', active: false },
-  { id: 'lgu-educ', name: 'LGU EducAssistance', subtitle: '3 archived chats', active: false },
-  { id: 'kondukt', name: 'kondukt', subtitle: 'No chats yet', active: false },
-  { id: 'prmsu', name: 'prmsu-research-services', subtitle: '1 archived chat', active: false },
-  { id: 'lanxbooth', name: 'LanxBooth', subtitle: 'No chats yet', active: false },
-  { id: 'ai-trading', name: 'AI Trading', subtitle: '2 archived chats', active: false },
-];
-
-let localProjects: ProjectInfo[] = [...DEFAULT_PROJECTS];
+let localProjects: ProjectInfo[] = [];
 let localProviders: ProviderInfo[] = [];
 
 export async function apiSaveProvider(
