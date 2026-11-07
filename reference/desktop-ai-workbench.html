@@ -1,0 +1,465 @@
+
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Workbench · AI Development Environment</title>
+<style>
+:root {
+  --bg: #121311;
+  --surface: #161716;
+  --fg: #f2f2f2;
+  --muted: #868b86;
+  --border: #242622;
+  --accent: #bce29e;
+  --accent-soft: color-mix(in oklch, var(--accent) 14%, transparent);
+  --font-display: 'Space Grotesk', 'Avenir Next', 'Segoe UI', system-ui, sans-serif;
+  --font-body: 'Space Grotesk', 'Avenir Next', 'Segoe UI', system-ui, sans-serif;
+  --font-mono: ui-monospace, 'SF Mono', 'Cascadia Code', Consolas, monospace;
+}
+*, *::before, *::after { box-sizing: border-box; }
+html, body { width: 100%; height: 100%; margin: 0; }
+body {
+  background: var(--bg);
+  color: var(--fg);
+  font-family: var(--font-body);
+  font-size: 13px;
+  line-height: 1.45;
+  letter-spacing: -0.02em;
+  -webkit-font-smoothing: antialiased;
+  overflow: hidden;
+}
+button, textarea, input { font: inherit; color: inherit; }
+button { cursor: pointer; }
+button:focus-visible, textarea:focus-visible, input:focus-visible, [tabindex]:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+svg { display: block; }
+.app { height: 100dvh; min-height: 480px; display: flex; background: var(--surface); }
+.rail {
+  width: 46px; flex: 0 0 46px; background: var(--bg);
+  border-right: 1px solid var(--border);
+  display: flex; flex-direction: column; align-items: center;
+  padding: 8px 0 9px;
+}
+.rail-button {
+  width: 30px; height: 30px; display: grid; place-items: center;
+  border: 0; border-radius: 8px; color: var(--muted); background: transparent;
+  transition: background .14s ease, color .14s ease;
+}
+.rail-button svg { width: 16px; height: 16px; }
+.rail-button:hover { color: var(--fg); background: #20221f; }
+.rail-button.active { color: var(--fg); background: #262826; }
+.rail-bottom { margin-top: auto; }
+.drawer {
+  width: 250px; flex: 0 0 250px; background: var(--surface);
+  border-right: 1px solid var(--border); padding: 16px 12px 12px;
+  display: flex; flex-direction: column; min-width: 0;
+}
+.brand { display: flex; align-items: center; gap: 9px; padding: 0 6px; margin: 1px 0 18px; }
+.brand-mark {
+  width: 24px; height: 24px; display: grid; place-items: center;
+  color: var(--accent); background: #20231e; border: 1px solid #33372e;
+  border-radius: 7px;
+}
+.brand-mark svg { width: 15px; height: 15px; }
+.brand-name { font-size: 14px; font-weight: 650; letter-spacing: -0.04em; }
+.actions { display: grid; gap: 6px; margin-bottom: 23px; }
+.action-button {
+  min-height: 32px; width: 100%; display: flex; align-items: center; gap: 9px;
+  padding: 0 9px; background: #1b1d1b; color: #c2c6c1;
+  border: 1px solid #292b28; border-radius: 7px; text-align: left;
+  font-size: 12px; font-weight: 550; transition: background .14s, border-color .14s, color .14s;
+}
+.action-button svg { width: 14px; height: 14px; color: var(--muted); }
+.action-button:hover { background: #232522; border-color: #393c37; color: var(--fg); }
+.group-heading {
+  padding: 0 8px; margin: 0 0 7px; color: var(--muted);
+  font: 10px/1.2 var(--font-mono); letter-spacing: .07em; text-transform: uppercase;
+}
+.project-list { display: grid; gap: 3px; overflow: auto; }
+.project {
+  position: relative; min-width: 0; padding: 8px 8px 7px 10px; border-radius: 6px;
+  color: #b8bcb7; border: 1px solid transparent; background: transparent;
+  text-align: left; transition: background .14s, color .14s;
+}
+.project:hover { color: var(--fg); background: #1d1f1d; }
+.project.selected { color: var(--fg); background: #212320; border-color: #2b2d29; }
+.project.selected::before {
+  content: ""; position: absolute; left: -1px; top: 9px; bottom: 9px;
+  width: 2px; border-radius: 2px; background: var(--accent);
+}
+.project-top { display: flex; align-items: center; gap: 8px; min-width: 0; }
+.project-top svg { flex: 0 0 14px; width: 14px; height: 14px; color: #9da29c; }
+.project-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 12px; }
+.project-subtitle {
+  display: block; margin: 3px 0 0 22px; color: #777c76;
+  font-size: 11px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.drawer-foot { margin-top: auto; padding: 11px 8px 0; border-top: 1px solid var(--border); }
+.workspace { flex: 1; min-width: 0; position: relative; display: flex; flex-direction: column; }
+.titlebar {
+  height: 39px; flex: 0 0 39px; display: flex; align-items: center;
+  border-bottom: 1px solid var(--border); background: #151615;
+  user-select: none;
+}
+.tabs { height: 100%; display: flex; align-items: center; gap: 4px; padding-left: 10px; }
+.tab {
+  height: 28px; display: flex; align-items: center; gap: 9px; padding: 0 9px 0 11px;
+  color: #c4c8c3; background: #20221f; border: 1px solid #2b2d29; border-radius: 6px;
+  font-size: 11px;
+}
+.tab-close, .icon-button {
+  border: 0; background: transparent; color: #858a84; display: grid; place-items: center;
+}
+.tab-close { width: 16px; height: 18px; border-radius: 4px; padding: 0; }
+.tab-close svg { width: 11px; height: 11px; }
+.tab-close:hover, .icon-button:hover { background: #2a2c29; color: var(--fg); }
+.new-tab {
+  height: 26px; width: 26px; border: 0; border-radius: 5px; color: #898e88;
+  background: transparent; display: grid; place-items: center;
+}
+.new-tab:hover { color: var(--fg); background: #222421; }
+.new-tab svg { width: 14px; height: 14px; }
+.drag-region { flex: 1; height: 100%; }
+.window-controls { height: 100%; display: flex; align-items: stretch; }
+.window-control {
+  width: 44px; border: 0; background: transparent; color: #8b908a;
+  display: grid; place-items: center; transition: background .12s, color .12s;
+}
+.window-control svg { width: 13px; height: 13px; }
+.window-control:hover { background: #252724; color: var(--fg); }
+.window-control.close:hover { background: #a7433d; color: white; }
+.canvas {
+  flex: 1; min-height: 0; position: relative; display: flex; flex-direction: column;
+  align-items: center; justify-content: center; padding: 36px 28px 26px;
+}
+.hero { display: flex; flex-direction: column; align-items: center; text-align: center; margin-top: -16px; }
+.hero-mark {
+  width: 76px; height: 76px; display: grid; place-items: center; margin-bottom: 23px;
+  color: var(--accent); background: #1d201b; border: 1px solid #30342c; border-radius: 20px;
+}
+.hero-mark svg { width: 38px; height: 38px; }
+.hero h1 { margin: 0; font-size: 24px; line-height: 1.2; font-weight: 650; letter-spacing: -0.045em; }
+.hero-note { margin: 9px 0 17px; color: #898e88; font-size: 13px; letter-spacing: -0.015em; }
+.quick-actions { display: flex; align-items: center; gap: 7px; }
+.quick-pill {
+  min-height: 27px; padding: 0 10px; display: inline-flex; align-items: center; gap: 6px;
+  border: 1px solid #30322e; border-radius: 6px; background: #1a1c19;
+  color: #b3b8b2; font-size: 11px; transition: background .14s, border-color .14s, color .14s;
+}
+.quick-pill:hover { background: #232621; border-color: #454941; color: var(--fg); }
+.quick-pill.local { color: var(--accent); border-color: #3a4433; background: #20251d; }
+.quick-pill.local svg { width: 12px; height: 12px; }
+.composer-wrap { position: absolute; bottom: 26px; width: min(100%, 680px); }
+.composer {
+  min-height: 112px; display: flex; flex-direction: column; padding: 12px 12px 10px;
+  background: #1b1d1b; border: 1px solid #2e302e; border-radius: 12px;
+  transition: border-color .16s, box-shadow .16s;
+}
+.composer:focus-within { border-color: #58644e; box-shadow: 0 0 0 1px color-mix(in oklch, var(--accent) 12%, transparent); }
+.composer textarea {
+  width: 100%; min-height: 44px; flex: 1; resize: none; border: 0; outline: 0;
+  background: transparent; color: var(--fg); font-size: 13px; line-height: 1.5;
+  letter-spacing: -0.015em;
+}
+.composer textarea::placeholder { color: #777c76; opacity: 1; }
+.composer textarea:focus-visible { outline: 0; }
+.composer-row { display: flex; align-items: center; gap: 7px; }
+.compose-icon {
+  width: 30px; height: 30px; padding: 0; display: grid; place-items: center;
+  border: 0; border-radius: 6px; background: transparent; color: #939891;
+  transition: background .14s, color .14s;
+}
+.compose-icon:hover { color: var(--fg); background: #292b28; }
+.compose-icon svg { width: 16px; height: 16px; }
+.composer-spacer { flex: 1; }
+.model-wrap { position: relative; }
+.model-button {
+  height: 29px; display: flex; align-items: center; gap: 7px; padding: 0 8px;
+  background: transparent; border: 1px solid transparent; border-radius: 6px;
+  color: #afb4ae; font-size: 11px; transition: background .14s, border-color .14s;
+}
+.model-button:hover, .model-button[aria-expanded="true"] { background: #252724; border-color: #343732; }
+.model-button svg { width: 12px; height: 12px; color: #818680; }
+.model-menu {
+  display: none; position: absolute; z-index: 5; right: 0; bottom: 36px; width: 186px;
+  padding: 5px; background: #202220; border: 1px solid #383b36; border-radius: 8px;
+  box-shadow: 0 10px 30px #0007;
+}
+.model-menu.open { display: block; }
+.model-option {
+  width: 100%; min-height: 30px; display: flex; align-items: center; justify-content: space-between;
+  padding: 0 8px; border: 0; border-radius: 5px; background: transparent;
+  color: #c7cbc6; text-align: left; font-size: 11px;
+}
+.model-option:hover, .model-option.chosen { color: var(--fg); background: #2a2d28; }
+.model-option.chosen::after { content: "✓"; color: var(--accent); }
+.send-button {
+  width: 30px; height: 30px; display: grid; place-items: center; padding: 0;
+  color: #161914; background: var(--accent); border: 1px solid var(--accent); border-radius: 7px;
+  transition: background .14s, border-color .14s, transform .08s;
+}
+.send-button:hover { background: color-mix(in oklch, var(--accent) 88%, black); border-color: color-mix(in oklch, var(--accent) 88%, black); }
+.send-button:active { transform: translateY(1px); }
+.send-button svg { width: 15px; height: 15px; }
+.conversation {
+  display: none; width: min(100%, 680px); max-height: calc(100% - 150px); overflow: auto;
+  align-self: center; margin: auto 0; padding: 8px 0 145px;
+}
+.message { margin: 8px 0 18px auto; max-width: 78%; padding: 11px 14px; border-radius: 10px; background: #222421; color: #d9ddd8; overflow-wrap: anywhere; }
+.notice {
+  position: absolute; top: 53px; left: 50%; transform: translateX(-50%);
+  padding: 8px 12px; border: 1px solid #3a3d38; border-radius: 7px;
+  background: #222421; color: #d8dcd7; font-size: 11px; opacity: 0; pointer-events: none;
+  transition: opacity .16s;
+}
+.notice.show { opacity: 1; }
+.modal-backdrop {
+  position: fixed; inset: 0; z-index: 10; display: none; place-items: center;
+  background: #0009;
+}
+.modal-backdrop.open { display: grid; }
+.modal {
+  width: min(400px, calc(100vw - 32px)); padding: 18px;
+  background: #1c1e1c; border: 1px solid #373a35; border-radius: 10px;
+}
+.modal h2 { margin: 0 0 6px; font-size: 15px; letter-spacing: -0.03em; }
+.modal p { margin: 0 0 15px; color: #929790; font-size: 12px; }
+.modal input {
+  width: 100%; height: 36px; padding: 0 10px; color: var(--fg); background: #151715;
+  border: 1px solid #3a3d37; border-radius: 6px; outline: 0;
+}
+.modal input:focus { border-color: #81966f; box-shadow: 0 0 0 2px var(--accent-soft); }
+.modal-actions { display: flex; justify-content: flex-end; gap: 7px; margin-top: 14px; }
+.modal-actions button { min-height: 31px; padding: 0 11px; border-radius: 6px; border: 1px solid #3a3d37; background: #242724; color: #c4c8c3; font-size: 11px; }
+.modal-actions button:hover { background: #30332e; color: var(--fg); }
+.modal-actions .confirm { background: var(--accent); border-color: var(--accent); color: #171a14; }
+.modal-actions .confirm:hover { background: color-mix(in oklch, var(--accent) 88%, black); }
+@media (max-width: 760px) {
+  .drawer { width: 208px; flex-basis: 208px; }
+  .canvas { padding-inline: 18px; }
+}
+@media (max-width: 560px) {
+  .drawer { display: none; }
+  .canvas { padding: 24px 14px 18px; }
+  .composer-wrap { bottom: 16px; }
+  .hero { margin-top: -48px; }
+}
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after { scroll-behavior: auto !important; transition-duration: .01ms !important; }
+}
+/* Opaque glass surfaces: retain layered borders and inset highlights without transparency. */
+.app { position: relative; isolation: isolate; background: var(--surface); }
+.rail { background: var(--bg); }
+.drawer, .workspace, .canvas { background: var(--surface); }
+.titlebar { background: #151615; }
+.brand-mark, .hero-mark { box-shadow: inset 0 1px color-mix(in oklch, var(--fg) 6%, transparent); }
+.composer {
+  background: #1b1d1b;
+  border-color: #2e302e;
+  box-shadow: inset 0 1px color-mix(in oklch, var(--fg) 5%, transparent);
+}
+.composer:focus-within { border-color: color-mix(in oklch, var(--accent) 42%, var(--border)); }
+.model-menu, .modal { background: #1c1e1c; border-color: #373a35; }
+.modal-backdrop { background: color-mix(in oklch, var(--bg) 72%, transparent); backdrop-filter: blur(3px); }
+.window-control.close:hover { background: var(--border); }
+</style>
+</head>
+<body>
+<div class="app">
+  <nav class="rail" aria-label="Primary navigation" data-od-id="left-rail">
+    <button class="rail-button active" aria-label="Home" title="Home" data-od-id="home-button">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m3.5 10 8.5-7 8.5 7v10.5h-6v-6h-5v6h-6z"/></svg>
+    </button>
+    <button class="rail-button rail-bottom" aria-label="Settings" title="Settings" data-od-id="settings-button">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="3"/><path d="m19.4 15 .1.1 1.2 2.1-2 2-2.1-1.2-.2-.1a7.6 7.6 0 0 1-1.5.6l-.1.2-.4 2.4h-2.8l-.4-2.4-.2-.2a7.6 7.6 0 0 1-1.5-.6l-.2.1-2.1 1.2-2-2 1.2-2.1.1-.2a7.6 7.6 0 0 1-.6-1.5l-.2-.1-2.4-.4v-2.8l2.4-.4.2-.2a7.6 7.6 0 0 1 .6-1.5l-.1-.2L5.2 5.9l2-2 2.1 1.2.2.1a7.6 7.6 0 0 1 1.5-.6l.1-.2.4-2.4h2.8l.4 2.4.2.2a7.6 7.6 0 0 1 1.5.6l.2-.1 2.1-1.2 2 2-1.2 2.1-.1.2a7.6 7.6 0 0 1 .6 1.5l.2.1 2.4.4v2.8l-2.4.4-.2.2a7.6 7.6 0 0 1-.6 1.5z"/></svg>
+    </button>
+  </nav>
+
+  <aside class="drawer" aria-label="Projects and chats" data-od-id="project-drawer">
+    <div class="brand" data-od-id="brand">
+      <span class="brand-mark" aria-hidden="true">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3.5 19.5 8v8L12 20.5 4.5 16V8z"/><path d="m8.5 10 3.5-2 3.5 2v4l-3.5 2-3.5-2z"/></svg>
+      </span>
+      <span class="brand-name">Workbench</span>
+    </div>
+    <div class="actions">
+      <button class="action-button" id="new-chat" data-od-id="new-chat-button">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" aria-hidden="true"><path d="M12 5v14M5 12h14"/></svg>New chat
+      </button>
+      <button class="action-button" id="new-project" data-od-id="new-project-button">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3.5 6.5h6l2 2h9v9.8a1.2 1.2 0 0 1-1.2 1.2H4.7a1.2 1.2 0 0 1-1.2-1.2z"/><path d="M3.5 9h17"/></svg>New project
+      </button>
+    </div>
+    <p class="group-heading">Projects</p>
+    <div class="project-list" id="project-list">
+      <button class="project selected" data-project="Workbench">
+        <span class="project-top"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3.5 6.5h6l2 2h9v9.8a1.2 1.2 0 0 1-1.2 1.2H4.7a1.2 1.2 0 0 1-1.2-1.2z"/><path d="M3.5 9h17"/></svg><span class="project-name">Workbench</span></span>
+        <span class="project-subtitle">Tighten composer focus treatment</span>
+      </button>
+      <button class="project" data-project="Runtime">
+        <span class="project-top"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3.5 6.5h6l2 2h9v9.8a1.2 1.2 0 0 1-1.2 1.2H4.7a1.2 1.2 0 0 1-1.2-1.2z"/><path d="M3.5 9h17"/></svg><span class="project-name">Runtime</span></span>
+        <span class="project-subtitle">Review streaming response state</span>
+      </button>
+      <button class="project" data-project="Component lab">
+        <span class="project-top"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3.5 6.5h6l2 2h9v9.8a1.2 1.2 0 0 1-1.2 1.2H4.7a1.2 1.2 0 0 1-1.2-1.2z"/><path d="M3.5 9h17"/></svg><span class="project-name">Component lab</span></span>
+        <span class="project-subtitle">Map keyboard shortcuts</span>
+      </button>
+    </div>
+    <div class="drawer-foot"><span class="group-heading">Workspace · Local</span></div>
+  </aside>
+
+  <main class="workspace" data-od-id="chat-canvas">
+    <header class="titlebar" data-od-id="title-bar">
+      <div class="tabs">
+        <div class="tab" id="active-tab" data-od-id="active-tab"><span id="tab-label">New chat</span><button class="tab-close" id="close-tab" aria-label="Close tab">
+          <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" aria-hidden="true"><path d="m4 4 8 8M12 4l-8 8"/></svg>
+        </button></div>
+        <button class="new-tab" id="new-tab" aria-label="New tab" title="New tab"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" aria-hidden="true"><path d="M12 5v14M5 12h14"/></svg></button>
+      </div>
+      <div class="drag-region" aria-hidden="true"></div>
+      <div class="window-controls" aria-label="Window controls">
+        <button class="window-control" aria-label="Minimize window" title="Minimize"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.2"><path d="M3 8h10"/></svg></button>
+        <button class="window-control" aria-label="Maximize window" title="Maximize"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.2"><rect x="3.5" y="3.5" width="9" height="9"/></svg></button>
+        <button class="window-control close" aria-label="Close window" title="Close"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.2"><path d="m4 4 8 8M12 4l-8 8"/></svg></button>
+      </div>
+    </header>
+
+    <section class="canvas" data-od-id="empty-state">
+      <div class="hero" id="hero">
+        <div class="hero-mark" aria-hidden="true">
+          <svg viewBox="0 0 48 48" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="m24 5 16 9.5v19L24 43 8 33.5v-19z"/><path d="m16.5 19 7.5-4.3 7.5 4.3v10l-7.5 4.3-7.5-4.3z"/><path d="M24 14.7V5M31.5 19 40 14.5M16.5 19 8 14.5"/></svg>
+        </div>
+        <h1 data-od-id="hero-heading">What can I help build?</h1>
+        <p class="hero-note">Start with a task, or pick up where you left off.</p>
+        <div class="quick-actions">
+          <button class="quick-pill" id="quick-project" data-od-id="quick-project"><span aria-hidden="true">+</span> New project</button>
+          <span class="quick-pill local" aria-label="Local workspace">
+            <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" aria-hidden="true"><circle cx="8" cy="8" r="5.5"/><path d="M2.8 6h10.4M2.8 10h10.4M8 2.5a9 9 0 0 1 0 11M8 2.5a9 9 0 0 0 0 11"/></svg>Local
+          </span>
+        </div>
+      </div>
+      <div class="conversation" id="conversation" aria-live="polite"></div>
+      <div class="composer-wrap" data-od-id="composer">
+        <form class="composer" id="composer-form">
+          <textarea id="prompt" rows="2" aria-label="Message" placeholder="Ask anything, or describe what you want to build…"></textarea>
+          <div class="composer-row">
+            <button class="compose-icon" type="button" id="attach" aria-label="Attach files" title="Attach files">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m8.5 12.5 6.7-6.7a3.5 3.5 0 0 1 5 5l-8.7 8.7a5 5 0 0 1-7.1-7.1l8.2-8.2"/></svg>
+            </button>
+            <input type="file" id="file-input" hidden multiple>
+            <span id="file-label" style="color:var(--muted);font-size:11px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap"></span>
+            <span class="composer-spacer"></span>
+            <div class="model-wrap">
+              <button class="model-button" id="model-button" type="button" aria-haspopup="listbox" aria-expanded="false" data-od-id="model-selector">
+                <span id="model-label">Claude Sonnet</span><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m4 6 4 4 4-4"/></svg>
+              </button>
+              <div class="model-menu" id="model-menu" role="listbox" aria-label="Choose model">
+                <button type="button" class="model-option chosen" role="option" aria-selected="true">Claude Sonnet</button>
+                <button type="button" class="model-option" role="option" aria-selected="false">Claude Opus</button>
+                <button type="button" class="model-option" role="option" aria-selected="false">GPT-4.1</button>
+              </div>
+            </div>
+            <button class="send-button" type="submit" aria-label="Send message" title="Send">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 19V5M6 11l6-6 6 6"/></svg>
+            </button>
+          </div>
+        </form>
+      </div>
+      <div class="notice" id="notice" role="status" aria-live="polite"></div>
+    </section>
+  </main>
+</div>
+
+<div class="modal-backdrop" id="modal-backdrop" role="presentation">
+  <div class="modal" role="dialog" aria-modal="true" aria-labelledby="modal-title">
+    <h2 id="modal-title">Create a project</h2>
+    <p>Choose a name for your local workspace.</p>
+    <input id="project-name-input" placeholder="Project name" aria-label="Project name">
+    <div class="modal-actions">
+      <button id="cancel-project" type="button">Cancel</button>
+      <button id="confirm-project" class="confirm" type="button">Create project</button>
+    </div>
+  </div>
+</div>
+<script>
+(() => {
+  const $ = (id) => document.getElementById(id);
+  const notice = $('notice');
+  let noticeTimer;
+  function tell(message) {
+    notice.textContent = message;
+    notice.classList.add('show');
+    clearTimeout(noticeTimer);
+    noticeTimer = setTimeout(() => notice.classList.remove('show'), 2200);
+  }
+  function resetChat() {
+    $('prompt').value = '';
+    $('conversation').replaceChildren();
+    $('conversation').style.display = 'none';
+    $('hero').style.display = 'flex';
+    $('tab-label').textContent = 'New chat';
+    $('prompt').focus();
+  }
+  $('new-chat').addEventListener('click', resetChat);
+  $('new-tab').addEventListener('click', resetChat);
+  $('close-tab').addEventListener('click', resetChat);
+  document.querySelectorAll('.project').forEach((project) => project.addEventListener('click', () => {
+    document.querySelector('.project.selected')?.classList.remove('selected');
+    project.classList.add('selected');
+    $('tab-label').textContent = project.dataset.project;
+    $('hero').style.display = 'flex';
+    $('conversation').style.display = 'none';
+  }));
+  const backdrop = $('modal-backdrop');
+  function openProject() { backdrop.classList.add('open'); $('project-name-input').value = ''; $('project-name-input').focus(); }
+  $('new-project').addEventListener('click', openProject);
+  $('quick-project').addEventListener('click', openProject);
+  $('cancel-project').addEventListener('click', () => backdrop.classList.remove('open'));
+  $('confirm-project').addEventListener('click', () => {
+    const name = $('project-name-input').value.trim();
+    if (!name) { $('project-name-input').focus(); return; }
+    const project = document.createElement('button');
+    project.type = 'button'; project.className = 'project'; project.dataset.project = name;
+    project.innerHTML = '<span class="project-top"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" aria-hidden="true"><path d="M3.5 6.5h6l2 2h9v9.8a1.2 1.2 0 0 1-1.2 1.2H4.7a1.2 1.2 0 0 1-1.2-1.2zM3.5 9h17"/></svg><span class="project-name"></span></span><span class="project-subtitle">New project</span>';
+    project.querySelector('.project-name').textContent = name;
+    $('project-list').prepend(project);
+    project.addEventListener('click', () => { document.querySelector('.project.selected')?.classList.remove('selected'); project.classList.add('selected'); $('tab-label').textContent = name; });
+    backdrop.classList.remove('open');
+    tell('Project created');
+  });
+  $('project-name-input').addEventListener('keydown', (event) => { if (event.key === 'Enter') $('confirm-project').click(); if (event.key === 'Escape') backdrop.classList.remove('open'); });
+  $('attach').addEventListener('click', () => $('file-input').click());
+  $('file-input').addEventListener('change', (event) => { $('file-label').textContent = [...event.target.files].map((file) => file.name).join(', '); });
+  const modelButton = $('model-button'), modelMenu = $('model-menu');
+  modelButton.addEventListener('click', () => { const open = modelMenu.classList.toggle('open'); modelButton.setAttribute('aria-expanded', String(open)); });
+  document.querySelectorAll('.model-option').forEach((option) => option.addEventListener('click', () => {
+    $('model-label').textContent = option.textContent;
+    document.querySelector('.model-option.chosen')?.classList.remove('chosen');
+    option.classList.add('chosen');
+    document.querySelectorAll('.model-option').forEach((item) => item.setAttribute('aria-selected', String(item === option)));
+    modelMenu.classList.remove('open'); modelButton.setAttribute('aria-expanded', 'false');
+  }));
+  document.addEventListener('click', (event) => { if (!event.target.closest('.model-wrap')) { modelMenu.classList.remove('open'); modelButton.setAttribute('aria-expanded', 'false'); } });
+  $('composer-form').addEventListener('submit', (event) => {
+    event.preventDefault();
+    const text = $('prompt').value.trim();
+    if (!text) { $('prompt').focus(); return; }
+    const message = document.createElement('div'); message.className = 'message'; message.textContent = text;
+    $('conversation').append(message);
+    $('conversation').style.display = 'block'; $('hero').style.display = 'none';
+    $('tab-label').textContent = text.length > 20 ? `${text.slice(0, 20)}…` : text;
+    $('prompt').value = ''; $('file-label').textContent = '';
+    tell('Message added to this prototype');
+  });
+  $('settings-button').addEventListener('click', () => tell('Settings are not connected in this prototype'));
+  document.querySelectorAll('.window-control').forEach((button) => button.addEventListener('click', () => tell(`${button.title} is handled by the desktop shell`)));
+  document.addEventListener('keydown', (event) => { if (event.key === 'Escape') { backdrop.classList.remove('open'); modelMenu.classList.remove('open'); modelButton.setAttribute('aria-expanded', 'false'); } });
+  console.assert(document.querySelectorAll('.project').length >= 3, 'Project list should render');
+})();
+</script>
+</body>
+</html>

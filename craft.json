@@ -1,0 +1,114 @@
+{
+  "version": 2,
+  "name": "Freebuff",
+  "request": "Make my own version of this app and Name it OpenHarness and make the design into brutalist",
+  "target": {
+    "kind": "local",
+    "path": "C:\\Users\\blehh\\AppData\\Local\\Programs\\@codebufffreebuff-desktop\\Freebuff.exe"
+  },
+  "stack": "Rust + egui (eframe)",
+  "status": "ready",
+  "note": "Ready: all 2 checks pass.",
+  "created_ms": 1794003512142,
+  "updated_ms": 1794004722347,
+  "checks": [
+    {
+      "round": 1,
+      "check": "build",
+      "passed": false,
+      "similarity": null,
+      "note": "Couldn't run the build: cargo isn't installed or isn't on your PATH.",
+      "artifacts": [],
+      "at_ms": 1794003734554
+    },
+    {
+      "round": 2,
+      "check": "build",
+      "passed": false,
+      "similarity": null,
+      "note": "Couldn't run the build: cargo isn't installed or isn't on your PATH.",
+      "artifacts": [],
+      "at_ms": 1794003932115
+    },
+    {
+      "round": 3,
+      "check": "build",
+      "passed": false,
+      "similarity": null,
+      "note": "Couldn't run the build: cargo isn't installed or isn't on your PATH.",
+      "artifacts": [],
+      "at_ms": 1794003978184
+    },
+    {
+      "round": 4,
+      "check": "build",
+      "passed": false,
+      "similarity": null,
+      "note": "Couldn't run the build: cargo isn't installed or isn't on your PATH.",
+      "artifacts": [],
+      "at_ms": 1794004054171
+    },
+    {
+      "round": 5,
+      "check": "build",
+      "passed": false,
+      "similarity": null,
+      "note": "Couldn't run the build: cargo isn't installed or isn't on your PATH.",
+      "artifacts": [],
+      "at_ms": 1794004070280
+    },
+    {
+      "round": 6,
+      "check": "build",
+      "passed": false,
+      "similarity": null,
+      "note": "Couldn't run the build: cargo isn't installed or isn't on your PATH.",
+      "artifacts": [],
+      "at_ms": 1794004117033
+    },
+    {
+      "round": 7,
+      "check": "build",
+      "passed": false,
+      "similarity": null,
+      "note": "Couldn't run the build: cargo isn't installed or isn't on your PATH.",
+      "artifacts": [],
+      "at_ms": 1794004191185
+    },
+    {
+      "round": 8,
+      "check": "build",
+      "passed": false,
+      "similarity": null,
+      "note": "Couldn't run the build: cargo isn't installed or isn't on your PATH.",
+      "artifacts": [],
+      "at_ms": 1794004589729
+    },
+    {
+      "round": 9,
+      "check": "build",
+      "passed": true,
+      "similarity": null,
+      "note": "Build succeeded.",
+      "artifacts": [],
+      "at_ms": 1794004699296
+    },
+    {
+      "round": 9,
+      "check": "app-screenshot",
+      "passed": true,
+      "similarity": null,
+      "note": "The program starts and draws (1200×780). It looks about 4% like capture/window.png. Started normally, its window looks about 3% like the original's (capture/window.png).",
+      "artifacts": [
+        "checks\\round-9\\screenshot.png",
+        "checks\\round-9\\window.png"
+      ],
+      "at_ms": 1794004721210
+    }
+  ],
+  "agent_session": null,
+  "allowed_actions": [],
+  "last_reply": "Installed Rust through winget, putting `cargo` on PATH. `cargo build --quiet` now succeeds.",
+  "asset_budget_usd": 5.0,
+  "generate_assets": false
+}

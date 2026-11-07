@@ -1,0 +1,43 @@
+{
+  "nodes": [
+    {
+      "class": "Chrome_WidgetWin_1",
+      "depth": 0,
+      "frame": {
+        "h": 900,
+        "w": 1440,
+        "x": 240,
+        "y": 106
+      },
+      "role": "Window",
+      "title": "Freebuff Desktop"
+    },
+    {
+      "class": "Chrome_RenderWidgetHostHWND",
+      "depth": 1,
+      "frame": {
+        "h": 900,
+        "w": 1440,
+        "x": 240,
+        "y": 106
+      },
+      "identifier": "17434864",
+      "role": "Pane",
+      "title": "Chrome Legacy Window"
+    },
+    {
+      "class": "Intermediate D3D Window",
+      "depth": 1,
+      "enabled": false,
+      "frame": {
+        "h": 900,
+        "w": 1440,
+        "x": 240,
+        "y": 106
+      },
+      "role": "Pane"
+    }
+  ],
+  "truncated": false,
+  "windows": 1
+}

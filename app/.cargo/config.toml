@@ -1,0 +1,2 @@
+[build]
+# Keep cargo/rustc discovery stable for wrapper scripts

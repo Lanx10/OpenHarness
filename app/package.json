@@ -1,0 +1,13 @@
+{
+  "name": "OpenHarness Brutalist Workspace",
+  "version": "1.0.0",
+  "default_profile": {
+    "python": {
+      "pip": "venv",
+      "venv": ".venv"
+    }
+  },
+  "scripts": {
+    "build": "C:\\Users\\blehh\\.rustup\\toolchains\\stable-x86_64-pc-windows-msvc\\bin\\cargo.exe build"
+  }
+}

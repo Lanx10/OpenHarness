@@ -1,0 +1,39 @@
+{
+  "revision": 3,
+  "brief": {
+    "question": "Does the existing OpenHarness build satisfy name, brutalist design, screenshot option?",
+    "purpose": "Rebuild Freebuff-style desktop app as OpenHarness with brutalist design",
+    "targets": [
+      "app/",
+      "capture/README.md",
+      "capture/ui-tree.json"
+    ],
+    "constraints": [
+      "Clean room: do not open, list, read, run or decompile target files",
+      "Screenshot must be produced via --screenshot flag",
+      "Brutalist design, name OpenHarness"
+    ],
+    "done_when": "App builds and --screenshot produces non-blank PNG"
+  },
+  "plan": [
+    {
+      "title": "Review existing app",
+      "status": "done",
+      "why": "Existing Rust UI already implements requested name and style"
+    },
+    {
+      "title": "Build and capture screenshot",
+      "status": "done",
+      "why": "Cargo build and screenshot run succeeded"
+    },
+    {
+      "title": "Review remaining unknowns",
+      "status": "todo",
+      "why": "No original visual image inspected; rebuild check unavailable"
+    }
+  ],
+  "hypotheses": [],
+  "findings": [],
+  "handoff": "Verified existing OpenHarness Rust/egui app: builds clean after removing float warnings, screenshot at app/shots/now.png generated successfully, exit 0. Next: visual similarity check if original screenshot becomes available.",
+  "updated": "2026-11-06T22:36:19Z"
+}

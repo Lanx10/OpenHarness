@@ -1,0 +1,443 @@
+{
+  "nodes": [
+    {
+      "class": "Window Class",
+      "depth": 0,
+      "frame": {
+        "h": 819,
+        "w": 1216,
+        "x": 182,
+        "y": 214
+      },
+      "role": "Window",
+      "title": "OPENHARNESS // BRUTALIST RUNNER"
+    },
+    {
+      "depth": 1,
+      "frame": {
+        "h": 23,
+        "w": 1200,
+        "x": 190,
+        "y": 222
+      },
+      "identifier": "TitleBar",
+      "role": "TitleBar",
+      "title": "OPENHARNESS // BRUTALIST RUNNER"
+    },
+    {
+      "depth": 2,
+      "frame": {
+        "h": 22,
+        "w": 22,
+        "x": 190,
+        "y": 222
+      },
+      "identifier": "SystemMenuBar",
+      "role": "MenuBar",
+      "title": "System Menu Bar"
+    },
+    {
+      "depth": 3,
+      "frame": {
+        "h": 22,
+        "w": 22,
+        "x": 190,
+        "y": 222
+      },
+      "identifier": "Item 1",
+      "role": "MenuItem",
+      "title": "System"
+    },
+    {
+      "depth": 2,
+      "frame": {
+        "h": 30,
+        "w": 47,
+        "x": 1251,
+        "y": 215
+      },
+      "identifier": "Minimize",
+      "role": "Button",
+      "title": "Minimize"
+    },
+    {
+      "depth": 2,
+      "frame": {
+        "h": 30,
+        "w": 46,
+        "x": 1298,
+        "y": 215
+      },
+      "identifier": "Maximize",
+      "role": "Button",
+      "title": "Maximize"
+    },
+    {
+      "depth": 2,
+      "frame": {
+        "h": 30,
+        "w": 47,
+        "x": 1344,
+        "y": 215
+      },
+      "identifier": "Close",
+      "role": "Button",
+      "title": "Close"
+    },
+    {
+      "depth": 1,
+      "frame": {
+        "h": 21,
+        "w": 151,
+        "x": 202,
+        "y": 257
+      },
+      "role": "Text",
+      "title": "⬛ OPENHARNESS",
+      "value": "⬛ OPENHARNESS"
+    },
+    {
+      "depth": 1,
+      "frame": {
+        "h": 14,
+        "w": 196,
+        "x": 375,
+        "y": 260
+      },
+      "role": "Text",
+      "title": "[DEV-HARNESS // V1.0-BRUTAL]",
+      "value": "[DEV-HARNESS // V1.0-BRUTAL]"
+    },
+    {
+      "depth": 1,
+      "frame": {
+        "h": 15,
+        "w": 224,
+        "x": 1154,
+        "y": 260
+      },
+      "role": "Text",
+      "title": "STATE: READY // HARNESS IDLE",
+      "value": "STATE: READY // HARNESS IDLE"
+    },
+    {
+      "depth": 1,
+      "frame": {
+        "h": 14,
+        "w": 196,
+        "x": 936,
+        "y": 260
+      },
+      "role": "Text",
+      "title": "CLAUDE-3.7-SONNET-HARNESS-V1",
+      "value": "CLAUDE-3.7-SONNET-HARNESS-V1"
+    },
+    {
+      "depth": 1,
+      "frame": {
+        "h": 21,
+        "w": 121,
+        "x": 200,
+        "y": 300
+      },
+      "role": "Text",
+      "title": "PROJECT TREE",
+      "value": "PROJECT TREE"
+    },
+    {
+      "depth": 1,
+      "frame": {
+        "h": 15,
+        "w": 104,
+        "x": 200,
+        "y": 343
+      },
+      "role": "Text",
+      "title": "▾ [ROOT] src/",
+      "value": "▾ [ROOT] src/"
+    },
+    {
+      "depth": 1,
+      "frame": {
+        "h": 15,
+        "w": 104,
+        "x": 200,
+        "y": 366
+      },
+      "role": "Text",
+      "title": "  ├── main.rs",
+      "value": "  ├── main.rs"
+    },
+    {
+      "depth": 1,
+      "frame": {
+        "h": 15,
+        "w": 128,
+        "x": 200,
+        "y": 389
+      },
+      "role": "Text",
+      "title": "  ├── harness.rs",
+      "value": "  ├── harness.rs"
+    },
+    {
+      "depth": 1,
+      "frame": {
+        "h": 15,
+        "w": 120,
+        "x": 200,
+        "y": 412
+      },
+      "role": "Text",
+      "title": "  ├── runner.rs",
+      "value": "  ├── runner.rs"
+    },
+    {
+      "depth": 1,
+      "frame": {
+        "h": 15,
+        "w": 128,
+        "x": 200,
+        "y": 435
+      },
+      "role": "Text",
+      "title": "  └── sandbox.rs",
+      "value": "  └── sandbox.rs"
+    },
+    {
+      "depth": 1,
+      "frame": {
+        "h": 15,
+        "w": 80,
+        "x": 200,
+        "y": 458
+      },
+      "role": "Text",
+      "title": "▾ [CONFIG]",
+      "value": "▾ [CONFIG]"
+    },
+    {
+      "depth": 1,
+      "frame": {
+        "h": 15,
+        "w": 128,
+        "x": 200,
+        "y": 481
+      },
+      "role": "Text",
+      "title": "  ├── Cargo.toml",
+      "value": "  ├── Cargo.toml"
+    },
+    {
+      "depth": 1,
+      "frame": {
+        "h": 15,
+        "w": 200,
+        "x": 200,
+        "y": 504
+      },
+      "role": "Text",
+      "title": "  └── harness.config.json",
+      "value": "  └── harness.config.json"
+    },
+    {
+      "depth": 1,
+      "frame": {
+        "h": 21,
+        "w": 70,
+        "x": 200,
+        "y": 541
+      },
+      "role": "Text",
+      "title": "METRICS",
+      "value": "METRICS"
+    },
+    {
+      "depth": 1,
+      "frame": {
+        "h": 15,
+        "w": 128,
+        "x": 200,
+        "y": 570
+      },
+      "role": "Text",
+      "title": "MEM_USED: 142 MB",
+      "value": "MEM_USED: 142 MB"
+    },
+    {
+      "depth": 1,
+      "frame": {
+        "h": 15,
+        "w": 128,
+        "x": 200,
+        "y": 593
+      },
+      "role": "Text",
+      "title": "TOKENS:   12,410",
+      "value": "TOKENS:   12,410"
+    },
+    {
+      "depth": 1,
+      "frame": {
+        "h": 15,
+        "w": 144,
+        "x": 200,
+        "y": 616
+      },
+      "role": "Text",
+      "title": "CALLS:    38 / 100",
+      "value": "CALLS:    38 / 100"
+    },
+    {
+      "depth": 1,
+      "frame": {
+        "h": 15,
+        "w": 144,
+        "x": 200,
+        "y": 639
+      },
+      "role": "Text",
+      "title": "SANDBOX:  ENFORCED",
+      "value": "SANDBOX:  ENFORCED"
+    },
+    {
+      "depth": 1,
+      "frame": {
+        "h": 735,
+        "w": 10,
+        "x": 465,
+        "y": 290
+      },
+      "role": "Custom"
+    },
+    {
+      "depth": 1,
+      "frame": {
+        "h": 18,
+        "w": 204,
+        "x": 484,
+        "y": 304
+      },
+      "role": "Text",
+      "title": "AGENT RUNNER & CONSOLE",
+      "value": "AGENT RUNNER & CONSOLE"
+    },
+    {
+      "depth": 1,
+      "frame": {
+        "h": 14,
+        "w": 245,
+        "x": 484,
+        "y": 344
+      },
+      "role": "Text",
+      "title": "[00:00:01] OPENHARNESS CORE BOOT OK",
+      "value": "[00:00:01] OPENHARNESS CORE BOOT OK"
+    },
+    {
+      "depth": 1,
+      "frame": {
+        "h": 14,
+        "w": 385,
+        "x": 484,
+        "y": 366
+      },
+      "role": "Text",
+      "title": "[00:00:01] CLEAN ROOM CONTEXT LOADED: 42 FILES TARGETED",
+      "value": "[00:00:01] CLEAN ROOM CONTEXT LOADED: 42 FILES TARGETED"
+    },
+    {
+      "depth": 1,
+      "frame": {
+        "h": 14,
+        "w": 462,
+        "x": 484,
+        "y": 388
+      },
+      "role": "Text",
+      "title": "[00:00:02] AGENT SANDBOX: RESTRICTED FS / NETWORK ISOLATION ACTIVE",
+      "value": "[00:00:02] AGENT SANDBOX: RESTRICTED FS / NETWORK ISOLATION ACTIVE"
+    },
+    {
+      "depth": 1,
+      "frame": {
+        "h": 14,
+        "w": 294,
+        "x": 484,
+        "y": 410
+      },
+      "role": "Text",
+      "title": "[00:00:03] HARNESS LISTEN ON STDIO IPC BUS",
+      "value": "[00:00:03] HARNESS LISTEN ON STDIO IPC BUS"
+    },
+    {
+      "depth": 1,
+      "frame": {
+        "h": 21,
+        "w": 214,
+        "x": 484,
+        "y": 456
+      },
+      "role": "Text",
+      "title": "DIRECT HARNESS PROMPT",
+      "value": "DIRECT HARNESS PROMPT"
+    },
+    {
+      "depth": 1,
+      "frame": {
+        "h": 59,
+        "w": 892,
+        "x": 484,
+        "y": 485
+      },
+      "role": "Edit",
+      "value": "Refactor auth system to use pure session tokens with strict validation"
+    },
+    {
+      "depth": 1,
+      "frame": {
+        "h": 26,
+        "w": 163,
+        "x": 484,
+        "y": 552
+      },
+      "role": "Button",
+      "title": "EXECUTE HARNESS TASK"
+    },
+    {
+      "depth": 1,
+      "frame": {
+        "h": 26,
+        "w": 120,
+        "x": 655,
+        "y": 552
+      },
+      "role": "Button",
+      "title": "CLEAR CONSOLE"
+    },
+    {
+      "depth": 1,
+      "frame": {
+        "h": 26,
+        "w": 151,
+        "x": 783,
+        "y": 552
+      },
+      "role": "Button",
+      "title": "KILL PROCESS (SIGKILL)"
+    },
+    {
+      "class": "Winit Thread Event Target",
+      "depth": 0,
+      "frame": {
+        "h": 16,
+        "w": 16,
+        "x": 0,
+        "y": 0
+      },
+      "role": "Pane"
+    }
+  ],
+  "truncated": false,
+  "windows": 2
+}
