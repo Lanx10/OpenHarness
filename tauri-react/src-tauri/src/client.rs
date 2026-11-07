@@ -13,45 +13,7 @@ pub async fn query_llm(
         .build()
         .map_err(|e| e.to_string())?;
 
-    let canonical_provider = match provider {
-        "Anthropic" => "Anthropic-compatible",
-        "OpenAI" => "OpenAI-compatible",
-        other => other,
-    };
-
-    match canonical_provider {
-        "Anthropic-compatible" => {
-            let key = api_key.ok_or("Anthropic API key is required")?;
-            let url = base_url.unwrap_or("https://api.anthropic.com/v1/messages");
-            let body = serde_json::json!({
-                "model": model_id,
-                "max_tokens": 2048,
-                "messages": [{"role": "user", "content": prompt}]
-            });
-            let res = client
-                .post(url)
-                .header("x-api-key", key)
-                .header("anthropic-version", "2023-06-01")
-                .header("content-type", "application/json")
-                .json(&body)
-                .send()
-                .await
-                .map_err(|e| format!("Network request failed: {}", e))?;
-
-            if !res.status().is_success() {
-                let err_text = res.text().await.unwrap_or_default();
-                return Err(format!("Anthropic API error: {}", err_text));
-            }
-
-            let json: Value = res
-                .json()
-                .await
-                .map_err(|e| format!("Failed to parse response JSON: {}", e))?;
-            let content = json["content"][0]["text"]
-                .as_str()
-                .unwrap_or("No content in response");
-            Ok(content.to_string())
-        }
+    match provider {
         "Ollama" => {
             let default_url = "http://localhost:11434/api/chat";
             let url = base_url.unwrap_or(default_url);
@@ -83,19 +45,14 @@ pub async fn query_llm(
                 .unwrap_or("No reply from Ollama");
             Ok(content.to_string())
         }
-        // OpenAI-compatible, OpenRouter, Google AI Studio
         _ => {
             let key = api_key.ok_or_else(|| format!("API key is required for {}", provider))?;
-            let url = if let Some(custom) = base_url {
-                custom.to_string()
-            } else if provider == "OpenRouter" {
-                "https://openrouter.ai/api/v1/chat/completions".to_string()
-            } else if provider == "Google AI Studio" {
-                "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions"
-                    .to_string()
-            } else {
-                "https://api.openai.com/v1/chat/completions".to_string()
+            let default_url = match provider {
+                "OpenRouter" => "https://openrouter.ai/api/v1/chat/completions",
+                "Google AI Studio" => "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions",
+                _ => return Err(format!("Unsupported provider: {}", provider)),
             };
+            let url = base_url.unwrap_or(default_url);
 
             let body = serde_json::json!({
                 "model": model_id,
@@ -103,7 +60,7 @@ pub async fn query_llm(
             });
 
             let res = client
-                .post(&url)
+                .post(url)
                 .header("Authorization", format!("Bearer {}", key))
                 .header("content-type", "application/json")
                 .json(&body)

@@ -10,10 +10,10 @@ import {apiDeleteProvider, apiListProviders, apiSaveProvider, type ProviderInfo}
 type SettingsPageProps = {onClose: () => void; initialSection?: string};
 type Provider = {name: string; icon: string; tone: string};
 
-const providers: Provider[] = []; // Reserved for integrations not yet implemented.
+const providers: Provider[] = [];
 
 const sections = ['Model Providers', 'Update'];
-const providerOptions = ['OpenRouter', 'OpenAI-compatible', 'Anthropic-compatible', 'Google AI Studio', 'Ollama'];
+const providerOptions = ['OpenRouter', 'Google AI Studio', 'Ollama'];
 
 function ProviderForm({onBack, onSaved}: {onBack: () => void; onSaved: (provider: ProviderInfo) => void}) {
   const [provider, setProvider] = useState(providerOptions[0]);
@@ -171,7 +171,8 @@ export function SettingsPage({onClose, initialSection = 'Model Providers'}: Sett
         <button type="button" className="settings-gear active" aria-label="Settings" title="Settings" onClick={onClose}><svg viewBox="0 0 20 20" width="18" height="18" fill="currentColor" aria-hidden="true"><path fillRule="evenodd" d="M8.34 1.804A1 1 0 0 1 9.32 1h1.36a1 1 0 0 1 .98.804l.295 1.473c.497.144.971.342 1.409.582l1.304-.75a1 1 0 0 1 1.225.216l.962.962a1 1 0 0 1 .216 1.225l-.75 1.304c.24.438.438.912.582 1.409l1.473.295a1 1 0 0 1 .804.98v1.36a1 1 0 0 1-.804.98l-1.473.295a6.95 6.95 0 0 1-.582 1.409l.75 1.304a1 1 0 0 1-.216 1.225l-.962.962a1 1 0 0 1-1.225.216l-1.304-.75a6.97 6.97 0 0 1-1.409.582l-.295 1.473a1 1 0 0 1-.98.804H9.32a1 1 0 0 1-.98-.804l-.295-1.473a6.97 6.97 0 0 1-1.409-.582l-1.304.75a1 1 0 0 1-1.225-.216l-.962-.962a1 1 0 0 1-.216-1.225l.75-1.304a6.95 6.95 0 0 1-.582-1.409l-1.473-.295A1 1 0 0 1 1 10.68V9.32a1 1 0 0 1 .804-.98l1.473-.295c.144-.497.342-.971.582-1.409l-.75-1.304a1 1 0 0 1 .216-1.225l.962-.962a1 1 0 0 1 1.225-.216l1.304.75c.438-.24.912-.438 1.409-.582l.295-1.473ZM10 13a3 3 0 1 0 0-6 3 3 0 0 0 0 6Z" clipRule="evenodd"/></svg></button>
       </aside>
       <aside className="settings-nav">
-        <div className="settings-nav-header"><h2>Settings</h2><button className="settings-close" type="button" aria-label="Close settings" onClick={onClose}><XMarkIcon width={16}/></button></div>
+        <div className="settings-brand"><span className="settings-brand-mark" aria-hidden="true">OH</span><span className="settings-brand-name">OpenHarness</span></div>
+        <div className="settings-nav-header"><h2>Settings</h2><button className="settings-close" type="button" aria-label="Close settings" title="Close settings" onClick={onClose}><XMarkIcon width={16}/></button></div>
         <label className="settings-search"><MagnifyingGlassIcon width={15}/><input value={search} onChange={event => setSearch(event.target.value)} placeholder="Search settings" aria-label="Search settings"/></label>
         <nav>{ visibleSections.map(section => (
           <button key={section} className={activeSection === section ? 'settings-nav-item active' : 'settings-nav-item'} onClick={() => {setSelectedSection(section); setProviderView('list');}}>{section}</button>
@@ -190,13 +191,14 @@ export function SettingsPage({onClose, initialSection = 'Model Providers'}: Sett
             </section>
           </div>
         </> : <>
-          <div className="settings-section-heading"><h1>{activeSection}</h1><span>OpenHarness preferences</span></div>
-          <section className="updates-card">
+          <div className="settings-section-heading"><h1>OpenHarness updates</h1><span>Desktop update preferences</span></div>
+          <section className="update-panel">
             <div className="updates-icon"><ArrowPathIcon width={20}/></div>
-            <div><h3>App updates</h3><p>{updateStatus || 'Check for the latest version of OpenHarness.'}</p></div>
-            <button className="check-updates" onClick={checkForUpdates} disabled={checkingUpdate} title="Check for updates">{checkingUpdate ? 'Checking…' : 'Check for updates'}</button>
+            <h2>App updates</h2>
+            <p>Update availability is provided by the desktop application.</p>
+            <div className="update-row"><span className="update-status">{updateStatus || 'Check for the latest version of OpenHarness.'}</span><button className="check-updates" onClick={checkForUpdates} disabled={checkingUpdate} title="Check for updates">{checkingUpdate ? 'Checking…' : 'Check for updates'}</button></div>
           </section>
-          <section className="updates-card"><InformationCircleIcon width={18} className="help-icon"/><p>Settings sync and provider integrations will be available in future updates.</p></section>
+          <section className="update-panel"><InformationCircleIcon width={18} className="help-icon"/><p>Settings sync and provider integrations will be available in future updates.</p></section>
         </>}
       </main>
     </div>

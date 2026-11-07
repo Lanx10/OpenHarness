@@ -256,12 +256,8 @@ impl AppState {
             return Err("Prompt cannot be empty".into());
         }
 
-        // ponytail: canonical provider IDs are Anthropic-compatible / OpenAI-compatible / OpenRouter / Ollama / Google AI Studio; upgrade path is to normalize at API entry.
-        let canonical_provider = match provider {
-            "Anthropic" => "Anthropic-compatible",
-            "OpenAI" => "OpenAI-compatible",
-            other => other,
-        };
+        // ponytail: canonical provider IDs are OpenRouter / Google AI Studio / Ollama; Claude and OpenAI are removed. URL normalization happens in client.rs.
+        let canonical_provider = provider;
         let key_opt = secrets::get_secret(&format!("provider_{}", canonical_provider))?;
         let saved_provider = {
             let guard = self

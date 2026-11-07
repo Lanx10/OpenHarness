@@ -8,11 +8,8 @@ type Model = {
 };
 
 const MODELS: Model[] = [
-  {id: 'claude-3-7-sonnet', name: 'Claude Sonnet', provider: 'Anthropic-compatible'},
-  {id: 'claude-3-opus', name: 'Claude Opus', provider: 'Anthropic-compatible'},
-  {id: 'gpt-4.1', name: 'GPT-4.1', provider: 'OpenAI-compatible'},
-  {id: 'deepseek-r1', name: 'DeepSeek R1', provider: 'OpenRouter'},
-  {id: 'ollama-local', name: 'Ollama (Local)', provider: 'Ollama'},
+  {id: 'deepseek/deepseek-r1', name: 'DeepSeek R1', provider: 'OpenRouter'},
+  {id: 'llama3.2', name: 'Llama 3.2 (Local)', provider: 'Ollama'},
 ];
 
 export function Composer() {

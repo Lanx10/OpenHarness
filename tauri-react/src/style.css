@@ -611,6 +611,30 @@ svg { display: block; }
   border-right: 1px solid #242622;
   background: #161716;
 }
+.settings-brand {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  margin: 1px 2px 20px;
+  font-size: 13px;
+  font-weight: 650;
+  letter-spacing: -.035em;
+}
+.settings-brand-mark {
+  width: 24px;
+  height: 24px;
+  border: 1px solid #343832;
+  background: #20231f;
+  border-radius: 6px;
+  color: var(--accent);
+  display: grid;
+  place-items: center;
+  font-size: 10px;
+  font-weight: 700;
+}
+.settings-brand-name {
+  color: var(--fg);
+}
 .settings-nav-header {
   display: flex;
   align-items: center;
@@ -788,6 +812,38 @@ svg { display: block; }
   border: 1px solid #333633;
   border-radius: 6px;
   background: transparent;
+  color: #bfc4bf;
+  font-size: 12px;
+}
+
+.update-panel {
+  border: 1px solid #2c2e2b;
+  border-radius: 11px;
+  background: #1b1d1b;
+  padding: 22px 24px;
+  max-width: 580px;
+  margin-bottom: 12px;
+}
+.update-panel h2 {
+  margin: 0 0 8px;
+  font-size: 15px;
+  font-weight: 650;
+  letter-spacing: -.03em;
+}
+.update-panel p {
+  margin: 0 0 17px;
+  color: #b0b5af;
+  font-size: 12px;
+}
+.update-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 18px;
+  padding-top: 15px;
+  border-top: 1px solid #30322f;
+}
+.update-status {
   color: #bfc4bf;
   font-size: 12px;
 }
