@@ -9,8 +9,8 @@ export function ChatWindow() {
   useEffect(() => {
     const updateProjectTab = (event: Event) => {
       const project = (event as CustomEvent<{name?: string}>).detail;
-      const tabLabel = document.getElementById('tab-label');
-      if (tabLabel) tabLabel.textContent = project?.name || 'New chat';
+      const projElem = document.getElementById('breadcrumb-project');
+      if (projElem) projElem.textContent = project?.name || 'OpenHarness';
       window.dispatchEvent(new Event('openharness:new-chat'));
     };
     const updateCheck = (event: Event) => {

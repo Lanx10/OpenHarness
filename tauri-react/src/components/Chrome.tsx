@@ -76,14 +76,11 @@ export function TitleBar({onMinimize, onToggleMaximize, onClose, updateAvailable
 
   return (
     <header className="titlebar" data-od-id="title-bar">
-      <div className="tabs">
-        <div className="tab" id="active-tab" data-od-id="active-tab">
-          <span id="tab-label">New chat</span>
-          <button className="tab-close" id="close-tab" type="button" aria-label="Close tab" onClick={() => window.dispatchEvent(new Event('openharness:new-chat'))}>
-            <XMarkIcon width={12} height={12} aria-hidden="true" />
-          </button>
-        </div>
-        <button className="new-tab" id="new-tab" type="button" aria-label="New tab" title="New tab" onClick={() => window.dispatchEvent(new Event('openharness:new-chat'))}>
+      <div className="breadcrumb" aria-live="polite">
+        <span className="breadcrumb-project" id="breadcrumb-project">OpenHarness</span>
+        <span className="breadcrumb-separator" aria-hidden="true">/</span>
+        <span className="breadcrumb-chat" id="breadcrumb-chat">New chat</span>
+        <button className="new-tab" id="new-tab" type="button" aria-label="New chat" title="New chat" onClick={() => window.dispatchEvent(new Event('openharness:new-chat'))}>
           <PlusIcon width={13} height={13} aria-hidden="true" />
         </button>
       </div>

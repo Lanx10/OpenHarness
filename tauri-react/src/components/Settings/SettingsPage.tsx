@@ -5,7 +5,7 @@ import {
   ChevronRightIcon, InformationCircleIcon, MagnifyingGlassIcon,
   QuestionMarkCircleIcon, ServerIcon, XMarkIcon, TrashIcon,
 } from '@heroicons/react/20/solid';
-import {apiDeleteProvider, apiListProviders, apiSaveProvider, type ProviderInfo} from '../../services/tauriBridge';
+import {apiDeleteProvider, apiListProviders, apiSaveProvider, apiTestProviderConnection, type ProviderInfo} from '../../services/tauriBridge';
 
 type SettingsPageProps = {onClose: () => void; initialSection?: string};
 type Provider = {name: string; icon: string; tone: string};
@@ -15,6 +15,12 @@ const providers: Provider[] = [];
 const sections = ['Model Providers', 'Update'];
 const providerOptions = ['OpenRouter', 'Google AI Studio', 'Ollama'];
 
+const providerDocs: Record<string, string> = {
+  'OpenRouter': 'https://openrouter.ai/docs/quickstart',
+  'Google AI Studio': 'https://ai.google.dev/gemini-api/docs/openai',
+  'Ollama': 'https://ollama.com/library',
+};
+
 function ProviderForm({onBack, onSaved}: {onBack: () => void; onSaved: (provider: ProviderInfo) => void}) {
   const [provider, setProvider] = useState(providerOptions[0]);
   const [apiKey, setApiKey] = useState('');
@@ -23,7 +29,25 @@ function ProviderForm({onBack, onSaved}: {onBack: () => void; onSaved: (provider
   const [customEndpoint, setCustomEndpoint] = useState(false);
   const [advanced, setAdvanced] = useState(false);
   const [saving, setSaving] = useState(false);
+  const [testing, setTesting] = useState(false);
   const [error, setError] = useState('');
+
+  const testConnection = async () => {
+    if (!apiKey.trim() || !modelId.trim()) {
+      setError('Enter an API key and Model ID before testing.');
+      return;
+    }
+    setTesting(true);
+    setError('');
+    try {
+      const result = await apiTestProviderConnection(provider, modelId.trim(), customEndpoint ? baseUrl.trim() : null, apiKey);
+      setError(result);
+    } catch (err) {
+      setError(String(err));
+    } finally {
+      setTesting(false);
+    }
+  };
 
   const saveProvider = async () => {
     if (!apiKey.trim() || !modelId.trim()) {
@@ -48,6 +72,7 @@ function ProviderForm({onBack, onSaved}: {onBack: () => void; onSaved: (provider
     try {
       const saved = await apiSaveProvider(provider, modelId.trim(), customEndpoint ? baseUrl.trim() : null, customEndpoint, apiKey);
       setApiKey('');
+      window.dispatchEvent(new Event('openharness:provider-saved'));
       onSaved(saved);
     } catch (err) {
       setError(String(err));
@@ -64,7 +89,7 @@ function ProviderForm({onBack, onSaved}: {onBack: () => void; onSaved: (provider
         <select id="provider-select" value={provider} onChange={event => {setProvider(event.target.value); setError('');}}>
           {providerOptions.map(option => <option key={option}>{option}</option>)}
         </select>
-        <a className="provider-setup" href="https://openrouter.ai/docs/quickstart" target="_blank" rel="noreferrer">Provider setup <ArrowTopRightOnSquareIcon width={13}/></a>
+        <a className="provider-setup" href={providerDocs[provider]} target="_blank" rel="noreferrer">{provider} setup <ArrowTopRightOnSquareIcon width={13}/></a>
       </div>
 
       <label className="field-label" htmlFor="provider-key">API key <QuestionMarkCircleIcon width={14} className="help-icon"/></label>
@@ -80,7 +105,11 @@ function ProviderForm({onBack, onSaved}: {onBack: () => void; onSaved: (provider
 
       <div className="provider-form-footer">
         <span role={error ? 'alert' : 'status'}>{error || 'API key saved in the OS credential store.'}</span>
-        <div><button className="save-provider" type="button" onClick={() => void saveProvider()} disabled={saving}>{saving ? 'Saving…' : 'Save provider'}</button><button className="back-button" type="button" onClick={onBack}>Back</button></div>
+        <div>
+          <button className="back-button" type="button" onClick={() => void testConnection()} disabled={testing || saving}>{testing ? 'Testing…' : 'Test connection'}</button>
+          <button className="save-provider" type="button" onClick={() => void saveProvider()} disabled={saving}>{saving ? 'Saving…' : 'Save provider'}</button>
+          <button className="back-button" type="button" onClick={onBack}>Back</button>
+        </div>
       </div>
     </div>
   );

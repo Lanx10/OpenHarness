@@ -1,6 +1,6 @@
 [package]
 name = "app"
-version = "0.1.5"
+version = "0.1.6"
 description = "OpenHarness desktop app"
 authors = ["you"]
 license = ""
@@ -29,6 +29,7 @@ tauri-plugin-process = "2"
 keyring = "2"
 reqwest = { version = "0.12", features = ["json", "stream"] }
 futures-util = "0.3"
+tokio = { version = "1", features = ["sync", "time"] }
 
 [workspace]
 

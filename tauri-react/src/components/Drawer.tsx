@@ -1,10 +1,13 @@
 import {useEffect, useState} from 'react';
-import {PlusIcon, FolderIcon, XMarkIcon} from '@heroicons/react/20/solid';
-import {apiCreateProject, apiGetProjects, apiSelectProject, type ProjectInfo} from '../services/tauriBridge';
+import {PlusIcon, FolderIcon, XMarkIcon, PencilIcon, TrashIcon, MagnifyingGlassIcon} from '@heroicons/react/20/solid';
+import {apiCreateProject, apiGetProjects, apiSelectProject, apiRenameProject, apiDeleteProject, apiRelinkProject, type ProjectInfo} from '../services/tauriBridge';
 import {pickProjectFolder} from '../services/tauriBridge';
 
 export function Drawer() {
   const [projects, setProjects] = useState<ProjectInfo[]>([]);
+  const [search, setSearch] = useState('');
+  const [editingId, setEditingId] = useState<string | null>(null);
+  const [editingName, setEditingName] = useState('');
   const [projectModalOpen, setProjectModalOpen] = useState(false);
   const [projectName, setProjectName] = useState('');
   const [projectPath, setProjectPath] = useState<string | null>(null);
@@ -12,11 +15,18 @@ export function Drawer() {
   const [isSelecting, setIsSelecting] = useState(false);
 
   useEffect(() => {
+    const handleFocus = () => { /* focus management point */ };
+    window.addEventListener('focus', handleFocus);
+    return () => window.removeEventListener('focus', handleFocus);
+  }, []);
+
+  useEffect(() => {
     let cancelled = false;
     void apiGetProjects().then(items => {
       if (!cancelled) {
-        setProjects(items);
-        const activeProject = items.find(project => project.active);
+        const validItems = items.filter(project => !project.path || true);
+        setProjects(validItems);
+        const activeProject = validItems.find(project => project.active);
         if (activeProject) window.dispatchEvent(new CustomEvent('openharness:select-project', {detail: activeProject}));
       }
     }).catch(error => {
@@ -102,30 +112,47 @@ export function Drawer() {
           </button>
         </div>
 
+        <label className="project-search"><MagnifyingGlassIcon width={14} aria-hidden="true" /><input value={search} onChange={e => setSearch(e.target.value)} placeholder="Search projects" aria-label="Search projects"/></label>
         <p className="group-heading">Projects</p>
         <div className="project-list" id="project-list" role="list">
-          {projects.map(project => (
-            <button
-              key={project.id}
-              type="button"
-              role="listitem"
-              data-project={project.name}
-              className={`project ${project.active ? 'selected project-active' : ''}`}
-              title={project.path || project.name}
-              onClick={() => void selectProject(project)}
-            >
-              <span className="project-top">
-                <FolderIcon width={14} height={14} aria-hidden="true" />
-                <span className="project-name">{project.name}</span>
-              </span>
-              <span className="project-subtitle">{project.path ? project.path : project.subtitle}</span>
-            </button>
+          {projects.length === 0 ? (
+            <div className="empty-state" style={{padding: '16px 14px', fontSize: '12px', color: '#94a3b8'}}>
+              No projects yet. Click "+ New project" above to open a local project folder.
+            </div>
+          ) : projects.filter(p => p.name.toLowerCase().includes(search.toLowerCase())).map(project => (
+            <div key={project.id} className={`project-row ${project.active ? 'selected' : ''}`}>
+              <button
+                type="button"
+                role="listitem"
+                data-project={project.name}
+                className={`project ${project.active ? 'selected project-active' : ''}`}
+                title={project.path || project.name}
+                onClick={() => void selectProject(project)}
+              >
+                <span className="project-top">
+                  <FolderIcon width={14} height={14} aria-hidden="true" />
+                  <span className="project-name">{project.name}</span>
+                </span>
+                <span className="project-subtitle">{project.path ? project.path : project.subtitle}</span>
+              </button>
+              <div className="project-actions">
+                <button type="button" aria-label={`Rename ${project.name}`} title="Rename project" onClick={() => { setEditingId(project.id); setEditingName(project.name); }}><PencilIcon width={12}/></button>
+                <button type="button" aria-label={`Relink ${project.name} folder`} title="Relink folder" onClick={async () => { const picked = await pickProjectFolder(); if (picked) { try { setProjects(await apiRelinkProject(project.id, picked.path)); } catch (error) { setNotice(String(error)); } } }}><FolderIcon width={12}/></button>
+                <button type="button" aria-label={`Delete ${project.name}`} title="Delete project" onClick={async () => { if (!window.confirm(`Delete ${project.name}?`)) return; try { setProjects(await apiDeleteProject(project.id)); } catch (error) { setNotice(String(error)); } }}><TrashIcon width={12}/></button>
+              </div>
+              {editingId === project.id && (
+                <div className="project-edit">
+                  <input value={editingName} onChange={e => setEditingName(e.target.value)} aria-label="Project name" autoFocus onKeyDown={async e => { if (e.key === 'Enter') { try { setProjects(await apiRenameProject(project.id, editingName)); setEditingId(null); } catch (error) { setNotice(String(error)); } } if (e.key === 'Escape') setEditingId(null); }} />
+                  <button type="button" onClick={async () => { try { setProjects(await apiRenameProject(project.id, editingName)); setEditingId(null); } catch (error) { setNotice(String(error)); } }}>Save</button>
+                </div>
+              )}
+            </div>
           ))}
         </div>
         <div className="drawer-foot"><span className="group-heading">Workspace · Local</span></div>
       </aside>
 
-      <div className={`modal-backdrop ${projectModalOpen ? 'open' : ''}`} role="presentation" onMouseDown={event => { if (event.target === event.currentTarget) setProjectModalOpen(false); }}>
+      <div className={`modal-backdrop ${projectModalOpen ? 'open' : ''}`} role="presentation" onMouseDown={event => { if (event.target === event.currentTarget) setProjectModalOpen(false); }} onKeyDown={event => { if (event.key === 'Escape') setProjectModalOpen(false); }}>
         <div className="modal" role="dialog" aria-modal="true" aria-labelledby="modal-title">
           <div className="modal-header">
             <h2 id="modal-title">Open Project Folder</h2>

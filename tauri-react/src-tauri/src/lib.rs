@@ -2,6 +2,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Mutex;
+use tauri::ipc::Channel;
 use tauri::{Manager, State};
 
 mod client;
@@ -32,9 +33,25 @@ pub struct ChatResponse {
     pub provider: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChatMessage {
+    pub id: String,
+    pub role: String,
+    pub text: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChatThread {
+    pub id: String,
+    pub project_id: String,
+    pub title: String,
+    pub messages: Vec<ChatMessage>,
+}
+
 pub struct AppState {
     pub providers: Mutex<HashMap<String, ProviderInfo>>,
     pub projects: Mutex<Vec<ProjectInfo>>,
+    pub threads: Mutex<Vec<ChatThread>>,
     app_data_dir: Mutex<Option<PathBuf>>,
 }
 
@@ -43,6 +60,7 @@ impl Default for AppState {
         Self {
             providers: Mutex::new(HashMap::new()),
             projects: Mutex::new(Vec::new()),
+            threads: Mutex::new(Vec::new()),
             app_data_dir: Mutex::new(None),
         }
     }
@@ -52,6 +70,8 @@ impl Default for AppState {
 struct PersistedState {
     providers: HashMap<String, ProviderInfo>,
     projects: Vec<ProjectInfo>,
+    #[serde(default)]
+    threads: Vec<ChatThread>,
 }
 
 impl AppState {
@@ -72,6 +92,11 @@ impl AppState {
                 .clone(),
             projects: self
                 .projects
+                .lock()
+                .map_err(|e| format!("Lock failure: {}", e))?
+                .clone(),
+            threads: self
+                .threads
                 .lock()
                 .map_err(|e| format!("Lock failure: {}", e))?
                 .clone(),
@@ -107,6 +132,10 @@ impl AppState {
             .projects
             .lock()
             .map_err(|e| format!("Lock failure: {}", e))? = state.projects;
+        *self
+            .threads
+            .lock()
+            .map_err(|e| format!("Lock failure: {}", e))? = state.threads;
         Ok(())
     }
 }
@@ -192,6 +221,9 @@ impl AppState {
         name: String,
         path: Option<PathBuf>,
     ) -> Result<ProjectInfo, String> {
+        if path.as_ref().is_some_and(|candidate| !candidate.is_dir()) {
+            return Err("Project folder does not exist or is not a directory".into());
+        }
         let name = name.trim();
         if name.is_empty() {
             return Err("Project name cannot be empty".into());
@@ -242,6 +274,185 @@ impl AppState {
         drop(guard);
         self.persist()?;
         Ok(new_project)
+    }
+
+    pub fn rename_project(&self, id: &str, name: &str) -> Result<Vec<ProjectInfo>, String> {
+        let name = name.trim();
+        if name.is_empty() {
+            return Err("Project name cannot be empty".into());
+        }
+        let mut guard = self
+            .projects
+            .lock()
+            .map_err(|e| format!("Lock failure: {}", e))?;
+        let project = guard
+            .iter_mut()
+            .find(|p| p.id == id)
+            .ok_or_else(|| format!("Project not found: {}", id))?;
+        project.name = name.to_string();
+        let projects = guard.clone();
+        drop(guard);
+        self.persist()?;
+        Ok(projects)
+    }
+
+    pub fn delete_project(&self, id: &str) -> Result<Vec<ProjectInfo>, String> {
+        let mut guard = self
+            .projects
+            .lock()
+            .map_err(|e| format!("Lock failure: {}", e))?;
+        guard.retain(|p| p.id != id);
+        let mut threads = self
+            .threads
+            .lock()
+            .map_err(|e| format!("Lock failure: {}", e))?;
+        threads.retain(|thread| thread.project_id != id);
+        drop(threads);
+        let projects = guard.clone();
+        drop(guard);
+        self.persist()?;
+        Ok(projects)
+    }
+
+    pub fn relink_project(
+        &self,
+        id: &str,
+        path: Option<PathBuf>,
+    ) -> Result<Vec<ProjectInfo>, String> {
+        if path.as_ref().is_some_and(|candidate| !candidate.is_dir()) {
+            return Err("Selected folder does not exist or is not a directory".into());
+        }
+        let mut guard = self
+            .projects
+            .lock()
+            .map_err(|e| format!("Lock failure: {}", e))?;
+        let project = guard
+            .iter_mut()
+            .find(|p| p.id == id)
+            .ok_or_else(|| format!("Project not found: {}", id))?;
+        project.path = path
+            .as_ref()
+            .map(|value| value.to_string_lossy().to_string());
+        project.subtitle = project
+            .path
+            .clone()
+            .unwrap_or_else(|| "No folder selected".into());
+        let projects = guard.clone();
+        drop(guard);
+        self.persist()?;
+        Ok(projects)
+    }
+
+    pub fn list_threads(&self, project_id: Option<&str>) -> Result<Vec<ChatThread>, String> {
+        let guard = self
+            .threads
+            .lock()
+            .map_err(|e| format!("Lock failure: {}", e))?;
+        Ok(guard
+            .iter()
+            .filter(|thread| project_id.map(|id| thread.project_id == id).unwrap_or(true))
+            .cloned()
+            .collect())
+    }
+
+    pub fn create_thread(&self, project_id: &str) -> Result<ChatThread, String> {
+        let thread = ChatThread {
+            id: format!(
+                "thread-{}",
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_err(|e| e.to_string())?
+                    .as_nanos()
+            ),
+            project_id: project_id.to_string(),
+            title: "New chat".into(),
+            messages: Vec::new(),
+        };
+        let mut guard = self
+            .threads
+            .lock()
+            .map_err(|e| format!("Lock failure: {}", e))?;
+        guard.insert(0, thread.clone());
+        drop(guard);
+        self.persist()?;
+        Ok(thread)
+    }
+
+    pub fn rename_thread(&self, id: &str, title: &str) -> Result<Vec<ChatThread>, String> {
+        if title.trim().is_empty() {
+            return Err("Thread title cannot be empty".into());
+        }
+        let mut guard = self
+            .threads
+            .lock()
+            .map_err(|e| format!("Lock failure: {}", e))?;
+        let thread = guard
+            .iter_mut()
+            .find(|thread| thread.id == id)
+            .ok_or_else(|| format!("Thread not found: {}", id))?;
+        thread.title = title.trim().to_string();
+        let threads = guard.clone();
+        drop(guard);
+        self.persist()?;
+        Ok(threads)
+    }
+
+    pub fn delete_thread(&self, id: &str) -> Result<Vec<ChatThread>, String> {
+        let mut guard = self
+            .threads
+            .lock()
+            .map_err(|e| format!("Lock failure: {}", e))?;
+        guard.retain(|thread| thread.id != id);
+        let threads = guard.clone();
+        drop(guard);
+        self.persist()?;
+        Ok(threads)
+    }
+
+    pub fn get_thread(&self, id: &str) -> Result<ChatThread, String> {
+        let guard = self
+            .threads
+            .lock()
+            .map_err(|e| format!("Lock failure: {}", e))?;
+        guard
+            .iter()
+            .find(|thread| thread.id == id)
+            .cloned()
+            .ok_or_else(|| format!("Thread not found: {}", id))
+    }
+
+    pub fn append_thread_message(
+        &self,
+        thread_id: &str,
+        role: &str,
+        text: &str,
+    ) -> Result<ChatMessage, String> {
+        let message = ChatMessage {
+            id: format!(
+                "msg-{}",
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_err(|e| e.to_string())?
+                    .as_nanos()
+            ),
+            role: role.into(),
+            text: text.into(),
+        };
+        let mut guard = self
+            .threads
+            .lock()
+            .map_err(|e| format!("Lock failure: {}", e))?;
+        let thread = guard
+            .iter_mut()
+            .find(|thread| thread.id == thread_id)
+            .ok_or_else(|| format!("Thread not found: {}", thread_id))?;
+        thread.messages.push(message.clone());
+        if thread.title == "New chat" && role == "user" {
+            thread.title = text.chars().take(40).collect();
+        }
+        drop(guard);
+        self.persist()?;
+        Ok(message)
     }
 
     pub async fn chat(
@@ -356,6 +567,78 @@ fn create_project(
 }
 
 #[tauri::command]
+fn rename_project(
+    id: String,
+    name: String,
+    state: State<'_, AppState>,
+) -> Result<Vec<ProjectInfo>, String> {
+    state.rename_project(&id, &name)
+}
+
+#[tauri::command]
+fn delete_project(id: String, state: State<'_, AppState>) -> Result<Vec<ProjectInfo>, String> {
+    state.delete_project(&id)
+}
+
+#[tauri::command]
+fn relink_project(
+    id: String,
+    path: Option<String>,
+    state: State<'_, AppState>,
+) -> Result<Vec<ProjectInfo>, String> {
+    state.relink_project(&id, path.map(PathBuf::from))
+}
+
+#[tauri::command]
+fn list_threads(
+    project_id: Option<String>,
+    state: State<'_, AppState>,
+) -> Result<Vec<ChatThread>, String> {
+    state.list_threads(project_id.as_deref())
+}
+
+#[tauri::command]
+fn create_thread(project_id: String, state: State<'_, AppState>) -> Result<ChatThread, String> {
+    state.create_thread(&project_id)
+}
+
+#[tauri::command]
+fn delete_thread(id: String, state: State<'_, AppState>) -> Result<Vec<ChatThread>, String> {
+    state.delete_thread(&id)
+}
+
+#[tauri::command]
+fn rename_thread(
+    id: String,
+    title: String,
+    state: State<'_, AppState>,
+) -> Result<Vec<ChatThread>, String> {
+    state.rename_thread(&id, &title)
+}
+
+#[tauri::command]
+fn get_thread(id: String, state: State<'_, AppState>) -> Result<ChatThread, String> {
+    state.get_thread(&id)
+}
+
+#[tauri::command]
+fn append_thread_message(
+    thread_id: String,
+    role: String,
+    text: String,
+    state: State<'_, AppState>,
+) -> Result<ChatMessage, String> {
+    state.append_thread_message(&thread_id, &role, &text)
+}
+
+#[derive(Serialize, Clone)]
+struct StreamChunk {
+    text: String,
+    done: bool,
+    error: Option<String>,
+}
+
+#[tauri::command]
 async fn chat_send(
     prompt: String,
     model_id: String,
@@ -366,6 +649,117 @@ async fn chat_send(
     state
         .chat(&prompt, &model_id, &provider, project_id.as_deref())
         .await
+}
+
+#[tauri::command]
+async fn chat_send_stream(
+    prompt: String,
+    model_id: String,
+    provider: String,
+    _project_id: Option<String>,
+    thread_id: Option<String>,
+    channel: Channel<StreamChunk>,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    let trimmed = prompt.trim();
+    if trimmed.is_empty() {
+        return Err("Prompt cannot be empty".into());
+    }
+    let key = secrets::get_secret(&format!("provider_{}", provider))?;
+    let saved = state
+        .providers
+        .lock()
+        .map_err(|e| format!("Lock failure: {}", e))?
+        .get(&provider)
+        .cloned();
+    let config_url = saved.as_ref().and_then(|item| item.base_url.clone());
+    if let Some(thread_id) = thread_id.as_deref() {
+        state.append_thread_message(thread_id, "user", trimmed)?;
+    }
+    let history = if let Some(thread_id) = thread_id.as_deref() {
+        state.get_thread(thread_id)?.messages
+    } else {
+        Vec::new()
+    };
+    let context = history
+        .iter()
+        .map(|message| format!("{}: {}", message.role, message.text))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let full_prompt = if context.is_empty() {
+        trimmed.to_string()
+    } else {
+        format!("{}\nuser: {}", context, trimmed)
+    };
+    let emitter = channel.clone();
+    let result = if key.is_some() || saved.is_some() {
+        client::query_llm_stream(
+            &provider,
+            &model_id,
+            &full_prompt,
+            key.as_deref(),
+            config_url.as_deref(),
+            move |text| {
+                let _ = emitter.send(StreamChunk {
+                    text,
+                    done: false,
+                    error: None,
+                });
+            },
+        )
+        .await
+    } else {
+        let text = format!(
+            "Local OpenHarness Assistant (Model: {}):\n\nConfigure API access for {} in Settings to route requests to live inference.",
+            model_id, provider
+        );
+        let _ = channel.send(StreamChunk {
+            text: text.clone(),
+            done: false,
+            error: None,
+        });
+        Ok(text)
+    };
+    match result {
+        Ok(text) => {
+            if let Some(thread_id) = thread_id.as_deref() {
+                state.append_thread_message(thread_id, "assistant", &text)?;
+            }
+            channel
+                .send(StreamChunk {
+                    text: String::new(),
+                    done: true,
+                    error: None,
+                })
+                .map_err(|e| e.to_string())
+        }
+        Err(error) => {
+            let _ = channel.send(StreamChunk {
+                text: String::new(),
+                done: true,
+                error: Some(error.clone()),
+            });
+            Err(error)
+        }
+    }
+}
+
+#[tauri::command]
+async fn test_provider_connection(
+    provider: String,
+    model_id: String,
+    base_url: Option<String>,
+    api_key: String,
+) -> Result<String, String> {
+    client::query_llm(
+        &provider,
+        &model_id,
+        "Hello",
+        Some(&api_key),
+        base_url.as_deref(),
+    )
+    .await?;
+    Ok("Connection successful".into())
 }
 
 #[tauri::command]
@@ -401,7 +795,18 @@ pub fn run() {
             get_projects,
             select_project,
             create_project,
+            rename_project,
+            delete_project,
+            relink_project,
+            list_threads,
+            create_thread,
+            delete_thread,
+            rename_thread,
+            get_thread,
+            append_thread_message,
             chat_send,
+            chat_send_stream,
+            test_provider_connection,
             app_minimize,
             app_toggle_maximize,
             app_close,
@@ -468,5 +873,29 @@ mod tests {
 
         let projects = state.get_projects().unwrap();
         assert_eq!(projects[0].name, "Alpha Project");
+    }
+
+    #[test]
+    fn test_project_editing() {
+        let state = AppState::default();
+        let proj = state.create_project("Edit Me".into(), None).unwrap();
+        let renamed = state.rename_project(&proj.id, "Renamed").unwrap();
+        assert_eq!(renamed[0].name, "Renamed");
+        let after_delete = state.delete_project(&proj.id).unwrap();
+        assert!(after_delete.is_empty());
+    }
+
+    #[test]
+    fn test_thread_management() {
+        let state = AppState::default();
+        let proj = state.create_project("Threads".into(), None).unwrap();
+        let thread = state.create_thread(&proj.id).unwrap();
+        state
+            .append_thread_message(&thread.id, "user", "hello")
+            .unwrap();
+        let fetched = state.get_thread(&thread.id).unwrap();
+        assert_eq!(fetched.messages.len(), 1);
+        let threads = state.list_threads(Some(&proj.id)).unwrap();
+        assert_eq!(threads.len(), 1);
     }
 }

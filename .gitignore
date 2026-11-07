@@ -1,0 +1,23 @@
+# Logs/transcripts/generated
+*.log
+transcript.json
+usage.json
+feed.json
+build-activity.log
+
+# Rust build artifacts
+target/
+Cargo.lock
+
+# Frontend build artifacts
+tauri-react/dist/
+tauri-react/node_modules/
+node_modules/
+
+# OS/IDE
+.DS_Store
+Thumbs.db
+.env
+.env.local
+*.key
+*.tmp

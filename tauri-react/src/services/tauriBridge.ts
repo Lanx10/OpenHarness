@@ -1,4 +1,4 @@
-import { invoke, isTauri } from '@tauri-apps/api/core';
+import { Channel, invoke, isTauri } from '@tauri-apps/api/core';
 import { open as openDialog } from '@tauri-apps/plugin-dialog';
 import { getCurrentWindow } from '@tauri-apps/api/window';
 
@@ -109,6 +109,18 @@ export async function apiSaveProvider(
   return info;
 }
 
+export async function apiTestProviderConnection(
+  provider: string,
+  modelId: string,
+  baseUrl: string | null,
+  apiKey: string
+): Promise<string> {
+  if (isTauri()) {
+    return invoke('test_provider_connection', { provider, modelId, baseUrl, apiKey });
+  }
+  return 'Web demo: connection simulated successfully';
+}
+
 export async function apiListProviders(): Promise<ProviderInfo[]> {
   if (isTauri()) {
     return await invoke<ProviderInfo[]>('provider_list');
@@ -169,6 +181,80 @@ export async function apiCreateProject(name: string, path?: string | null): Prom
   persistStoredProjects(localProjects);
   return created;
 }
+export type StreamChunkLike = { text: string; done: boolean; error?: string | null };
+
+export async function apiChatStream(
+  prompt: string,
+  modelId: string,
+  provider: string,
+  threadId?: string,
+  onToken?: (token: string) => void,
+  onDone?: () => void,
+  onError?: (error: string) => void
+): Promise<void> {
+  if (isTauri()) {
+    const channel = new Channel<StreamChunkLike>();
+    channel.onmessage = (message) => {
+      if (message.error) onError?.(message.error);
+      if (message.text) onToken?.(message.text);
+      if (message.done) onDone?.();
+    };
+    await invoke('chat_send_stream', { prompt, modelId, provider, threadId: threadId ?? null, channel });
+    return;
+  }
+  const text = `Local OpenHarness Assistant (${modelId}):\n\nProcessing "${prompt.trim()}". Configure a provider for live inference.`;
+  onToken?.(text);
+  onDone?.();
+}
+
+export type ChatMessageLike = { id: string; role: string; text: string };
+export type ChatThreadLike = { id: string; project_id: string; title: string; messages: ChatMessageLike[] };
+
+export async function apiListThreads(projectId?: string): Promise<ChatThreadLike[]> {
+  if (isTauri()) return invoke('list_threads', { projectId: projectId ?? null });
+  return [];
+}
+
+export async function apiCreateThread(projectId: string): Promise<ChatThreadLike> {
+  if (isTauri()) return invoke('create_thread', { projectId });
+  return { id: `thread-${Date.now()}`, project_id: projectId, title: 'New chat', messages: [] };
+}
+
+export async function apiDeleteThread(id: string): Promise<ChatThreadLike[]> {
+  if (isTauri()) return invoke('delete_thread', { id });
+  return [];
+}
+
+export async function apiRenameThread(id: string, title: string): Promise<ChatThreadLike[]> {
+  if (isTauri()) return invoke('rename_thread', { id, title });
+  return [];
+}
+
+export async function apiGetThread(id: string): Promise<ChatThreadLike> {
+  if (isTauri()) return invoke('get_thread', { id });
+  return { id, project_id: 'default', title: 'Chat', messages: [] };
+}
+
+export async function apiAppendMessage(threadId: string, role: string, text: string): Promise<ChatMessageLike> {
+  if (isTauri()) return invoke('append_thread_message', { threadId, role, text });
+  return { id: `msg-${Date.now()}`, role, text };
+}
+
+export async function apiRenameProject(id: string, name: string): Promise<ProjectInfo[]> {
+  if (isTauri()) return invoke('rename_project', { id, name });
+  return [];
+}
+
+export async function apiDeleteProject(id: string): Promise<ProjectInfo[]> {
+  if (isTauri()) return invoke('delete_project', { id });
+  return [];
+}
+
+export async function apiRelinkProject(id: string, path: string | null): Promise<ProjectInfo[]> {
+  if (isTauri()) return invoke('relink_project', { id, path });
+  return [];
+}
+
 export async function apiChatSend(
   prompt: string,
   modelId: string,

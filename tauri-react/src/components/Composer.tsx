@@ -1,5 +1,6 @@
 import {useEffect, useRef, useState} from 'react';
-import {ChevronDownIcon, ArrowUpIcon} from '@heroicons/react/20/solid';
+import {ChevronDownIcon, ArrowUpIcon, PaperClipIcon} from '@heroicons/react/20/solid';
+import {apiListProviders, type ProviderInfo} from '../services/tauriBridge';
 
 type Model = {
   id: string;
@@ -7,17 +8,50 @@ type Model = {
   provider: string;
 };
 
-const MODELS: Model[] = [
-  {id: 'deepseek/deepseek-r1', name: 'DeepSeek R1', provider: 'OpenRouter'},
-  {id: 'llama3.2', name: 'Llama 3.2 (Local)', provider: 'Ollama'},
-];
+type AttachmentInfo = {
+  name: string;
+  size: number;
+  content: string;
+};
 
 export function Composer() {
   const [prompt, setPrompt] = useState('');
   const [modelPickerOpen, setModelPickerOpen] = useState(false);
-  const [selectedModel, setSelectedModel] = useState<Model>(MODELS[0]);
+  const [models, setModels] = useState<Model[]>([]);
+  const [selectedModel, setSelectedModel] = useState<Model | null>(null);
   const [projectId, setProjectId] = useState<string | null>(null);
+  const [attachments, setAttachments] = useState<AttachmentInfo[]>([]);
   const pickerRef = useRef<HTMLDivElement>(null);
+  const fileInputRef = useRef<HTMLInputElement>(null);
+
+  const loadModels = async () => {
+    try {
+      const providers: ProviderInfo[] = await apiListProviders();
+      const list: Model[] = providers.map((p) => ({id: p.model_id, name: `${p.provider} · ${p.model_id}`, provider: p.provider}));
+      const savedDefault = localStorage.getItem('openharness:default-model');
+      if (savedDefault) {
+        const parsed: Model = JSON.parse(savedDefault);
+        if (!list.some((m) => m.id === parsed.id && m.provider === parsed.provider)) {
+          list.unshift(parsed);
+        }
+      }
+      setModels(list);
+      if (list.length && !selectedModel) {
+        const match = savedDefault ? list.find((m) => m.id === JSON.parse(savedDefault).id && m.provider === JSON.parse(savedDefault).provider) : null;
+        setSelectedModel(match || list[0]);
+      }
+    } catch {
+      setModels([]);
+    }
+  };
+
+  useEffect(() => { void loadModels(); }, []);
+  useEffect(() => {
+    const refresh = () => { void loadModels(); };
+    window.addEventListener('openharness:provider-saved', refresh);
+    return () => window.removeEventListener('openharness:provider-saved', refresh);
+  }, []);
+
   useEffect(() => {
     const handleSelectProject = (event: Event) => {
       const project = (event as CustomEvent<{id?: string}>).detail;
@@ -49,12 +83,49 @@ export function Composer() {
     return () => window.removeEventListener('openharness:set-prompt', setText);
   }, []);
 
+  const handleFiles = async (files: FileList | null) => {
+    if (!files) return;
+    const next: AttachmentInfo[] = [];
+    for (const file of Array.from(files)) {
+      if (file.size > 256 * 1024) {
+        toastError(`Attachment too large: ${file.name}`);
+        continue;
+      }
+      try {
+        const content = await new Promise<string>((resolve, reject) => {
+          const reader = new FileReader();
+          reader.onload = () => resolve(String(reader.result || ''));
+          reader.onerror = () => reject(reader.error);
+          reader.readAsText(file);
+        });
+        next.push({ name: file.name, size: file.size, content: `[${file.name}]\n${content}` });
+      } catch {
+        toastError(`Could not read: ${file.name}`);
+      }
+    }
+    if (next.length) setAttachments(prev => [...prev, ...next]);
+  };
+
+  const toastError = (message: string) => {
+    const notice = document.getElementById('notice');
+    if (notice) notice.textContent = message;
+  };
+
+  const removeAttachment = (index: number) => {
+    setAttachments(prev => prev.filter((_, i) => i !== index));
+  };
+
   const send = () => {
     const text = prompt.trim();
-    if (!text) return;
-    const detail = {text, modelId: selectedModel.id, provider: selectedModel.provider, projectId};
+    if (!text && attachments.length === 0) return;
+    const combined = attachments.length ? `${attachments.map(a => a.content).join('\n\n')}\n\n${text}` : text;
+    const model = selectedModel;
+    if (!model) return;
+    const detail = {text: combined, modelId: model.id, provider: model.provider, projectId, attachments: attachments.map(a => a.content)};
     window.dispatchEvent(new CustomEvent('openharness:send-message', {detail}));
     setPrompt('');
+    setAttachments([]);
+    localStorage.setItem('openharness:default-model', JSON.stringify(model));
   };
 
   return (
@@ -65,7 +136,19 @@ export function Composer() {
         e.preventDefault();
         send();
       }}
+      onDragOver={(e) => { e.preventDefault(); }}
+      onDrop={(e) => { e.preventDefault(); void handleFiles(e.dataTransfer.files); }}
     >
+      {attachments.length > 0 && (
+        <div className="attachments" aria-label="Attachments">
+          {attachments.map((item, index) => (
+            <span key={`${item.name}:${index}`} className="attachment-chip">
+              <span title={item.name}>{item.name} · {Math.max(1, Math.ceil(item.size / 1024))} KB</span>
+              <button type="button" onClick={() => removeAttachment(index)} aria-label={`Remove ${item.name}`} title="Remove attachment">×</button>
+            </span>
+          ))}
+        </div>
+      )}
       <textarea
         id="prompt"
         rows={2}
@@ -81,7 +164,10 @@ export function Composer() {
         }}
       />
       <div className="composer-row">
-        {/* ponytail: attachment UI removed because file contents are not sent; add back with actual content/path handling. */}
+        <input ref={fileInputRef} type="file" multiple style={{display:'none'}} onChange={(e) => { void handleFiles(e.target.files); e.target.value = ''; }} />
+        <button className="model-button" type="button" aria-label="Attach files" onClick={() => fileInputRef.current?.click()}>
+          <PaperClipIcon width={16} height={16} aria-hidden="true" />
+        </button>
         <span className="composer-spacer" />
         <div ref={pickerRef} className="model-wrap">
           <button
@@ -92,15 +178,15 @@ export function Composer() {
             aria-expanded={modelPickerOpen}
             onClick={() => setModelPickerOpen((open) => !open)}
           >
-            <span id="model-label">{selectedModel.name}</span>
+            <span id="model-label">{selectedModel ? selectedModel.name : 'No models configured'}</span>
             <ChevronDownIcon width={12} height={12} aria-hidden="true" />
           </button>
           <div className={`model-menu ${modelPickerOpen ? 'open' : ''}`} id="model-menu" role="listbox" aria-label="Choose model">
-            {MODELS.map((m) => {
-              const isChosen = m.id === selectedModel.id;
+            {models.length === 0 ? <div className="model-option">Add a provider in Settings</div> : models.map((m) => {
+              const isChosen = selectedModel?.id === m.id && selectedModel?.provider === m.provider;
               return (
                 <button
-                  key={m.id}
+                  key={`${m.provider}:${m.id}`}
                   type="button"
                   className={`model-option ${isChosen ? 'chosen' : ''}`}
                   role="option"
@@ -108,6 +194,7 @@ export function Composer() {
                   onClick={() => {
                     setSelectedModel(m);
                     setModelPickerOpen(false);
+                    localStorage.setItem('openharness:default-model', JSON.stringify(m));
                   }}
                 >
                   {m.name}
