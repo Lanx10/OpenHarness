@@ -52,6 +52,6 @@ jobs:
           tagName: ${{ github.ref_name }}
           releaseName: OpenHarness ${{ github.ref_name }}
           releaseBody: 'OpenHarness desktop release ${{ github.ref_name }}'
-          releaseDraft: true
+          releaseDraft: false
           prerelease: false
           args: ${{ matrix.args }}

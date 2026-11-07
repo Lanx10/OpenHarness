@@ -147,15 +147,21 @@ export function SettingsPage({onClose, initialSection = 'Model Providers'}: Sett
       const {relaunch} = await import('@tauri-apps/plugin-process');
       const update = await check();
       if (!update) {
-        setUpdateStatus(`You are on the latest version.`);
+        let currentVer = '';
+        try {
+          const {getVersion} = await import('@tauri-apps/api/app');
+          currentVer = await getVersion();
+        } catch {}
+        setUpdateStatus(currentVer ? `You are on the latest version (v${currentVer}).` : 'You are on the latest version.');
         return;
       }
-      setUpdateStatus(`Updating to v${update.version}…`);
+      setUpdateStatus(`Update available: v${update.version} (current: v${update.currentVersion}). Downloading…`);
       await update.downloadAndInstall((event) => {
         if (event.event === 'Progress') {
-          setUpdateStatus(`Downloading… ${Math.round((event.data?.chunkLength ?? 0) / 1024)} KB received`);
+          setUpdateStatus(`Downloading v${update.version}… ${Math.round((event.data?.chunkLength ?? 0) / 1024)} KB received`);
         }
       });
+      setUpdateStatus(`Update v${update.version} installed. Relaunching…`);
       await relaunch();
     } catch (error) {
       setUpdateStatus(`Could not check for updates: ${String(error)}`);
