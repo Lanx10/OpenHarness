@@ -1,4 +1,5 @@
 import {useEffect, useState} from 'react';
+import {isTauri} from '@tauri-apps/api/core';
 import {
   ArrowPathIcon, ArrowTopRightOnSquareIcon,
   ChevronRightIcon, InformationCircleIcon, MagnifyingGlassIcon,
@@ -9,10 +10,7 @@ import {apiDeleteProvider, apiListProviders, apiSaveProvider, type ProviderInfo}
 type SettingsPageProps = {onClose: () => void; initialSection?: string};
 type Provider = {name: string; icon: string; tone: string};
 
-const providers: Provider[] = [
-  {name: 'Claude Code', icon: '✳', tone: 'orange'},
-  {name: 'Codex', icon: '✦', tone: 'blue'},
-];
+const providers: Provider[] = []; // Reserved for integrations not yet implemented.
 
 const sections = ['Model Providers', 'Update'];
 const providerOptions = ['OpenRouter', 'OpenAI-compatible', 'Anthropic-compatible', 'Google AI Studio', 'Ollama'];
@@ -32,12 +30,16 @@ function ProviderForm({onBack, onSaved}: {onBack: () => void; onSaved: (provider
       setError('Enter an API key and Model ID before saving.');
       return;
     }
-    if (customEndpoint && baseUrl) {
+    if (customEndpoint) {
+      if (!baseUrl.trim()) {
+        setError('Enter an endpoint URL when custom endpoint is enabled.');
+        return;
+      }
       try {
         const parsed = new URL(baseUrl);
         if (!['http:', 'https:'].includes(parsed.protocol) || !parsed.hostname) throw new Error('bad URL');
       } catch {
-        setError('API base URL must be a valid http(s) URL.');
+        setError('Endpoint URL must be a valid http(s) URL.');
         return;
       }
     }
@@ -74,7 +76,7 @@ function ProviderForm({onBack, onSaved}: {onBack: () => void; onSaved: (provider
       <button className="advanced-toggle" type="button" aria-expanded={advanced} onClick={() => setAdvanced(value => !value)}>
         <ChevronRightIcon width={14} className={advanced ? 'rotate' : ''}/> Advanced settings
       </button>
-      {advanced && <div className="advanced-panel"><label>API base URL<input className="wide-input" value={baseUrl} placeholder="https://openrouter.ai/api/v1" onChange={(event) => {setBaseUrl(event.target.value); setError('');}}/></label><label className="check-row"><input type="checkbox" checked={customEndpoint} onChange={(event) => setCustomEndpoint(event.target.checked)}/> Send requests through a custom endpoint</label></div>}
+      {advanced && <div className="advanced-panel"><label>Full API endpoint URL<input className="wide-input" value={baseUrl} placeholder="https://openrouter.ai/api/v1/chat/completions" onChange={(event) => {setBaseUrl(event.target.value); setError('');}}/></label><label className="check-row"><input type="checkbox" checked={customEndpoint} onChange={(event) => setCustomEndpoint(event.target.checked)}/> Send requests through a custom endpoint</label></div>}
 
       <div className="provider-form-footer">
         <span role={error ? 'alert' : 'status'}>{error || 'API key saved in the OS credential store.'}</span>
@@ -123,6 +125,7 @@ export function SettingsPage({onClose, initialSection = 'Model Providers'}: Sett
   }, []);
 
   const visibleSections = sections.filter(section => section.toLowerCase().includes(search.toLowerCase()));
+  const activeSection = visibleSections.includes(selectedSection) ? selectedSection : (visibleSections[0] ?? 'Model Providers');
   const updateProviders = async () => {
     try {
       setSavedProviders(await apiListProviders());
@@ -136,6 +139,10 @@ export function SettingsPage({onClose, initialSection = 'Model Providers'}: Sett
     setCheckingUpdate(true);
     setUpdateStatus('Checking for updates…');
     try {
+      if (!isTauri()) {
+        setUpdateStatus('Updates are available only in the desktop app.');
+        return;
+      }
       const {check} = await import('@tauri-apps/plugin-updater');
       const {relaunch} = await import('@tauri-apps/plugin-process');
       const update = await check();
@@ -146,7 +153,7 @@ export function SettingsPage({onClose, initialSection = 'Model Providers'}: Sett
       setUpdateStatus(`Updating to v${update.version}…`);
       await update.downloadAndInstall((event) => {
         if (event.event === 'Progress') {
-          setUpdateStatus(`Downloading… ${Math.round((event.data?.chunkLength ?? 0) / 1024) + ' KB received'} KB`);
+          setUpdateStatus(`Downloading… ${Math.round((event.data?.chunkLength ?? 0) / 1024)} KB received`);
         }
       });
       await relaunch();
@@ -167,11 +174,11 @@ export function SettingsPage({onClose, initialSection = 'Model Providers'}: Sett
         <div className="settings-nav-header"><h2>Settings</h2><button className="settings-close" type="button" aria-label="Close settings" onClick={onClose}><XMarkIcon width={16}/></button></div>
         <label className="settings-search"><MagnifyingGlassIcon width={15}/><input value={search} onChange={event => setSearch(event.target.value)} placeholder="Search settings" aria-label="Search settings"/></label>
         <nav>{ visibleSections.map(section => (
-          <button key={section} className={selectedSection === section ? 'settings-nav-item active' : 'settings-nav-item'} onClick={() => {setSelectedSection(section); setProviderView('list');}}>{section}</button>
+          <button key={section} className={activeSection === section ? 'settings-nav-item active' : 'settings-nav-item'} onClick={() => {setSelectedSection(section); setProviderView('list');}}>{section}</button>
         ))}</nav>
       </aside>
       <main className="settings-content">
-        {selectedSection === 'Model Providers' ? <>
+        {activeSection === 'Model Providers' ? <>
           <h1>Model Providers</h1>
           <div className="providers-card">
             <div className="provider-sources">
@@ -183,7 +190,7 @@ export function SettingsPage({onClose, initialSection = 'Model Providers'}: Sett
             </section>
           </div>
         </> : <>
-          <div className="settings-section-heading"><h1>{selectedSection}</h1><span>OpenHarness preferences</span></div>
+          <div className="settings-section-heading"><h1>{activeSection}</h1><span>OpenHarness preferences</span></div>
           <section className="updates-card">
             <div className="updates-icon"><ArrowPathIcon width={20}/></div>
             <div><h3>App updates</h3><p>{updateStatus || 'Check for the latest version of OpenHarness.'}</p></div>

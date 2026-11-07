@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Mutex;
-use tauri::State;
+use tauri::{Manager, State};
 
 mod client;
 mod secrets;
@@ -35,6 +35,7 @@ pub struct ChatResponse {
 pub struct AppState {
     pub providers: Mutex<HashMap<String, ProviderInfo>>,
     pub projects: Mutex<Vec<ProjectInfo>>,
+    app_data_dir: Mutex<Option<PathBuf>>,
 }
 
 impl Default for AppState {
@@ -42,7 +43,71 @@ impl Default for AppState {
         Self {
             providers: Mutex::new(HashMap::new()),
             projects: Mutex::new(Vec::new()),
+            app_data_dir: Mutex::new(None),
         }
+    }
+}
+
+#[derive(Serialize, Deserialize, Default)]
+struct PersistedState {
+    providers: HashMap<String, ProviderInfo>,
+    projects: Vec<ProjectInfo>,
+}
+
+impl AppState {
+    fn persist(&self) -> Result<(), String> {
+        let path = self
+            .app_data_dir
+            .lock()
+            .map_err(|e| format!("Lock failure: {}", e))?
+            .clone();
+        let Some(dir) = path else {
+            return Ok(());
+        };
+        let state = PersistedState {
+            providers: self
+                .providers
+                .lock()
+                .map_err(|e| format!("Lock failure: {}", e))?
+                .clone(),
+            projects: self
+                .projects
+                .lock()
+                .map_err(|e| format!("Lock failure: {}", e))?
+                .clone(),
+        };
+        std::fs::create_dir_all(&dir)
+            .map_err(|e| format!("Could not create app data directory: {}", e))?;
+        let path = dir.join("state.json");
+        let temp = dir.join("state.json.tmp");
+        let bytes = serde_json::to_vec(&state)
+            .map_err(|e| format!("Could not serialize app state: {}", e))?;
+        std::fs::write(&temp, bytes).map_err(|e| format!("Could not write app state: {}", e))?;
+        std::fs::rename(&temp, &path).map_err(|e| format!("Could not replace app state: {}", e))?;
+        Ok(())
+    }
+
+    fn load(&self, dir: PathBuf) -> Result<(), String> {
+        *self
+            .app_data_dir
+            .lock()
+            .map_err(|e| format!("Lock failure: {}", e))? = Some(dir.clone());
+        let path = dir.join("state.json");
+        let state = match std::fs::read(path) {
+            Ok(bytes) => serde_json::from_slice::<PersistedState>(&bytes)
+                .map_err(|e| format!("Could not parse app state: {}", e))?,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => PersistedState::default(),
+            Err(error) => return Err(format!("Could not read app state: {}", error)),
+        };
+        *self
+            .providers
+            .lock()
+            .map_err(|e| format!("Lock failure: {}", e))? = state.providers;
+        *self
+            .projects
+            .lock()
+            .map_err(|e| format!("Lock failure: {}", e))? = state.projects;
+        Ok(())
     }
 }
 
@@ -74,6 +139,8 @@ impl AppState {
             .lock()
             .map_err(|e| format!("Lock failure: {}", e))?;
         guard.insert(provider, info.clone());
+        drop(guard);
+        self.persist()?;
 
         Ok(info)
     }
@@ -87,12 +154,14 @@ impl AppState {
     }
 
     pub fn delete_provider(&self, provider: &str) -> Result<(), String> {
-        let _ = secrets::delete_secret(&format!("provider_{}", provider));
+        secrets::delete_secret(&format!("provider_{}", provider))?;
         let mut guard = self
             .providers
             .lock()
             .map_err(|e| format!("Lock failure: {}", e))?;
         guard.remove(provider);
+        drop(guard);
+        self.persist()?;
         Ok(())
     }
 
@@ -112,7 +181,10 @@ impl AppState {
         for p in guard.iter_mut() {
             p.active = p.id == id;
         }
-        Ok(guard.clone())
+        let projects = guard.clone();
+        drop(guard);
+        self.persist()?;
+        Ok(projects)
     }
 
     pub fn create_project(
@@ -125,7 +197,14 @@ impl AppState {
             return Err("Project name cannot be empty".into());
         }
         let path_value = path.as_ref().map(|p| p.to_string_lossy().to_string());
-        let id = name.to_lowercase().replace(' ', "-");
+        let id = name
+            .to_lowercase()
+            .replace(
+                |ch: char| ch.is_whitespace() || ch == '/' || ch == '\\',
+                "-",
+            )
+            .trim_matches('-')
+            .to_string();
         let new_project = ProjectInfo {
             id: id.clone(),
             name: name.to_string(),
@@ -137,16 +216,31 @@ impl AppState {
             .projects
             .lock()
             .map_err(|e| format!("Lock failure: {}", e))?;
+        let next_id = if id.is_empty() {
+            format!("project-{}", guard.len() + 1)
+        } else {
+            id.clone()
+        };
+        let id = if guard.iter().any(|project| project.id == next_id) {
+            format!("{}-{}", next_id, guard.len() + 1)
+        } else {
+            next_id
+        };
+        let mut new_project = new_project;
+        new_project.id = id;
+        // ponytail: supports only path-based dedupe; full rename/delete requires API additions. project name changes and canonical path split should be editable.
         if guard
             .iter()
-            .any(|p| p.id == id || p.path.as_deref() == path_value.as_deref())
+            .any(|project| project.path.as_deref() == path_value.as_deref() && path_value.is_some())
         {
-            return Err("A project for this folder is already loaded".into());
+            return Err("A project for this folder is already loaded.".into());
         }
-        for p in guard.iter_mut() {
-            p.active = false;
+        for project in guard.iter_mut() {
+            project.active = false;
         }
         guard.insert(0, new_project.clone());
+        drop(guard);
+        self.persist()?;
         Ok(new_project)
     }
 
@@ -155,25 +249,38 @@ impl AppState {
         prompt: &str,
         model_id: &str,
         provider: &str,
-        _project_id: Option<&str>,
+        project_id: Option<&str>,
     ) -> Result<ChatResponse, String> {
         let trimmed = prompt.trim();
         if trimmed.is_empty() {
             return Err("Prompt cannot be empty".into());
         }
 
-        let key_opt = secrets::get_secret(&format!("provider_{}", provider))?;
+        // ponytail: canonical provider IDs are Anthropic-compatible / OpenAI-compatible / OpenRouter / Ollama / Google AI Studio; upgrade path is to normalize at API entry.
+        let canonical_provider = match provider {
+            "Anthropic" => "Anthropic-compatible",
+            "OpenAI" => "OpenAI-compatible",
+            other => other,
+        };
+        let key_opt = secrets::get_secret(&format!("provider_{}", canonical_provider))?;
         let saved_provider = {
             let guard = self
                 .providers
                 .lock()
                 .map_err(|e| format!("Lock failure: {}", e))?;
-            guard.get(provider).cloned()
+            guard.get(canonical_provider).cloned()
         };
 
         let reply = if key_opt.is_some() || saved_provider.is_some() {
             let base_url = saved_provider.as_ref().and_then(|p| p.base_url.as_deref());
-            client::query_llm(provider, model_id, trimmed, key_opt.as_deref(), base_url).await?
+            client::query_llm(
+                canonical_provider,
+                model_id,
+                trimmed,
+                key_opt.as_deref(),
+                base_url,
+            )
+            .await?
         } else {
             format!(
                 "Local OpenHarness Assistant (Model: {}):\n\nI understand you want to work on: \"{}\". Configure API access for {} in Settings to route requests to live inference.",
@@ -181,17 +288,25 @@ impl AppState {
             )
         };
 
+        // ponytail: only the first active project gets the subtitle update; upgrade path is project_id-aware subtitle routing.
         if let Ok(mut guard) = self.projects.lock() {
-            for proj in guard.iter_mut() {
-                if proj.active {
-                    let snippet = if trimmed.len() > 24 {
-                        format!("💬 {}...", &trimmed[..24])
-                    } else {
-                        format!("💬 {}", trimmed)
-                    };
-                    proj.subtitle = snippet;
-                    break;
-                }
+            let target_id = project_id.map(str::to_owned).or_else(|| {
+                guard
+                    .iter()
+                    .find(|project| project.active)
+                    .map(|project| project.id.clone())
+            });
+            if let Some(project) = guard
+                .iter_mut()
+                .find(|project| Some(project.id.as_str()) == target_id.as_deref())
+            {
+                let mut chars = trimmed.chars();
+                let snippet: String = chars.by_ref().take(24).collect();
+                project.subtitle = if chars.next().is_some() {
+                    format!("💬 {}...", snippet)
+                } else {
+                    format!("💬 {}", snippet)
+                };
             }
         }
 
@@ -296,6 +411,11 @@ pub fn run() {
             app_close,
         ])
         .setup(|app| {
+            let app_dir = app
+                .path()
+                .app_data_dir()
+                .map_err(|error| error.to_string())?;
+            app.state::<AppState>().load(app_dir)?;
             if cfg!(debug_assertions) {
                 app.handle().plugin(
                     tauri_plugin_log::Builder::default()

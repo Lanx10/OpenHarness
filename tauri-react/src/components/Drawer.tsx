@@ -14,7 +14,11 @@ export function Drawer() {
   useEffect(() => {
     let cancelled = false;
     void apiGetProjects().then(items => {
-      if (!cancelled) setProjects(items);
+      if (!cancelled) {
+        setProjects(items);
+        const activeProject = items.find(project => project.active);
+        if (activeProject) window.dispatchEvent(new CustomEvent('openharness:select-project', {detail: activeProject}));
+      }
     }).catch(error => {
       if (!cancelled) setNotice(`Could not load projects: ${String(error)}`);
     });

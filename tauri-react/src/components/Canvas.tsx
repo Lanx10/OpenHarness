@@ -3,7 +3,7 @@ import {PlusIcon, ComputerDesktopIcon} from '@heroicons/react/20/solid';
 import {Composer} from './Composer';
 import {apiChatSend, type ChatResponse} from '../services/tauriBridge';
 
-type Message = {role: 'user'|'assistant'; text: string; status?: 'thinking'|'done'|'error'};
+type Message = {id: number; role: 'user'|'assistant'; text: string; status?: 'thinking'|'done'|'error'}
 
 export function Hero() {
   return (
@@ -36,12 +36,16 @@ export function Canvas() {
       const text = String(detail?.text ?? '').trim();
       if (!text) return;
       const id = ++requestId;
-      setMessages(prev => [...prev, {role: 'user', text}, {role: 'assistant', text: '', status: 'thinking'}]);
+      const placeholderId = id + Number.MAX_SAFE_INTEGER / 2;
+      setMessages(prev => [...prev, {id, role: 'user', text}, {id: placeholderId, role: 'assistant', text: '', status: 'thinking'}]);
+      const patchPlaceholder = (replacement: Message) => {
+        setMessages(prev => prev.map(message => message.id === placeholderId ? replacement : message));
+      };
       try {
         const response: ChatResponse = await apiChatSend(text, detail.modelId, detail.provider, detail.projectId);
-        setMessages(prev => id === requestId ? [...prev.slice(0, -1), {role: 'assistant', text: response.text, status: 'done'}] : prev);
+        patchPlaceholder({id: placeholderId, role: 'assistant', text: response.text, status: 'done'});
       } catch (error) {
-        setMessages(prev => id === requestId ? [...prev.slice(0, -1), {role: 'assistant', text: String(error), status: 'error'}] : prev);
+        patchPlaceholder({id: placeholderId, role: 'assistant', text: String(error), status: 'error'});
       }
     };
     const clear = () => { requestId += 1; setMessages([]); };
@@ -64,8 +68,8 @@ export function Canvas() {
     <main className="canvas">
       {empty ? <Hero/> : null}
       <section className="conversation" aria-live="polite" ref={conversationRef} hidden={empty}>
-        {messages.map((message, index) => (
-          <article key={index} className={message.role === 'user' ? 'message user' : 'message assistant'}>
+        {messages.map((message) => (
+          <article key={message.id} className={message.role === 'user' ? 'message user' : 'message assistant'}>
             <p>{message.status === 'thinking' ? 'Thinking…' : message.text}</p>
           </article>
         ))}

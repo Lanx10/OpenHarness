@@ -10,7 +10,13 @@ pub fn save_secret(account: &str, secret: &str) -> Result<(), String> {
     let entry = Entry::new(SERVICE_NAME, account).map_err(|e| e.to_string())?;
     entry
         .set_password(secret)
-        .map_err(|e| format!("OS credential store write failed: {}", e))
+        .map_err(|e| format!("OS credential store write failed: {}", e))?;
+    if let Ok(mut store) = MEMORY_STORE.write() {
+        store
+            .get_or_insert_with(HashMap::new)
+            .insert(account.to_string(), secret.to_string());
+    }
+    Ok(())
 }
 
 pub fn get_secret(account: &str) -> Result<Option<String>, String> {

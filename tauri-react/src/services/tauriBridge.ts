@@ -45,8 +45,41 @@ export type ChatResponse = {
   provider: string;
 };
 
-let localProjects: ProjectInfo[] = [];
-let localProviders: ProviderInfo[] = [];
+const PROJECTS_STORAGE_KEY = 'openharness:projects';
+const PROVIDERS_STORAGE_KEY = 'openharness:providers';
+
+function loadStoredProjects(): ProjectInfo[] {
+  try {
+    const raw = localStorage.getItem(PROJECTS_STORAGE_KEY);
+    return raw ? JSON.parse(raw) : [];
+  } catch {
+    return [];
+  }
+}
+
+function persistStoredProjects(projects: ProjectInfo[]): void {
+  try {
+    localStorage.setItem(PROJECTS_STORAGE_KEY, JSON.stringify(projects));
+  } catch {}
+}
+
+function loadStoredProviders(): ProviderInfo[] {
+  try {
+    const raw = localStorage.getItem(PROVIDERS_STORAGE_KEY);
+    return raw ? JSON.parse(raw) : [];
+  } catch {
+    return [];
+  }
+}
+
+function persistStoredProviders(providers: ProviderInfo[]): void {
+  try {
+    localStorage.setItem(PROVIDERS_STORAGE_KEY, JSON.stringify(providers));
+  } catch {}
+}
+
+let localProjects: ProjectInfo[] = loadStoredProjects();
+let localProviders: ProviderInfo[] = loadStoredProviders();
 
 export async function apiSaveProvider(
   provider: string,
@@ -72,6 +105,7 @@ export async function apiSaveProvider(
     has_key: true,
   };
   localProviders = localProviders.filter((p) => p.provider !== provider).concat(info);
+  persistStoredProviders(localProviders);
   return info;
 }
 
@@ -88,6 +122,7 @@ export async function apiDeleteProvider(provider: string): Promise<void> {
     return;
   }
   localProviders = localProviders.filter((p) => p.provider !== provider);
+  persistStoredProviders(localProviders);
 }
 
 export async function apiGetProjects(): Promise<ProjectInfo[]> {
@@ -102,6 +137,7 @@ export async function apiSelectProject(id: string): Promise<ProjectInfo[]> {
     return await invoke<ProjectInfo[]>('select_project', { id });
   }
   localProjects = localProjects.map((p) => ({ ...p, active: p.id === id }));
+  persistStoredProjects(localProjects);
   return [...localProjects];
 }
 
@@ -130,6 +166,7 @@ export async function apiCreateProject(name: string, path?: string | null): Prom
   const id = name.toLowerCase().replace(/\s+/g, '-');
   const created: ProjectInfo = { id, name, subtitle: path ? `📁 ${path}` : 'No chats yet', path: path ?? null, active: true };
   localProjects = [created, ...localProjects.map((p) => ({ ...p, active: false }))];
+  persistStoredProjects(localProjects);
   return created;
 }
 export async function apiChatSend(

@@ -13,7 +13,13 @@ pub async fn query_llm(
         .build()
         .map_err(|e| e.to_string())?;
 
-    match provider {
+    let canonical_provider = match provider {
+        "Anthropic" => "Anthropic-compatible",
+        "OpenAI" => "OpenAI-compatible",
+        other => other,
+    };
+
+    match canonical_provider {
         "Anthropic-compatible" => {
             let key = api_key.ok_or("Anthropic API key is required")?;
             let url = base_url.unwrap_or("https://api.anthropic.com/v1/messages");

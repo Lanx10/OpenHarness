@@ -1,5 +1,5 @@
 import {useEffect, useRef, useState} from 'react';
-import {PaperClipIcon, ChevronDownIcon, ArrowUpIcon} from '@heroicons/react/20/solid';
+import {ChevronDownIcon, ArrowUpIcon} from '@heroicons/react/20/solid';
 
 type Model = {
   id: string;
@@ -8,9 +8,9 @@ type Model = {
 };
 
 const MODELS: Model[] = [
-  {id: 'claude-3-7-sonnet', name: 'Claude Sonnet', provider: 'Anthropic'},
-  {id: 'claude-3-opus', name: 'Claude Opus', provider: 'Anthropic'},
-  {id: 'gpt-4.1', name: 'GPT-4.1', provider: 'OpenAI'},
+  {id: 'claude-3-7-sonnet', name: 'Claude Sonnet', provider: 'Anthropic-compatible'},
+  {id: 'claude-3-opus', name: 'Claude Opus', provider: 'Anthropic-compatible'},
+  {id: 'gpt-4.1', name: 'GPT-4.1', provider: 'OpenAI-compatible'},
   {id: 'deepseek-r1', name: 'DeepSeek R1', provider: 'OpenRouter'},
   {id: 'ollama-local', name: 'Ollama (Local)', provider: 'Ollama'},
 ];
@@ -19,9 +19,16 @@ export function Composer() {
   const [prompt, setPrompt] = useState('');
   const [modelPickerOpen, setModelPickerOpen] = useState(false);
   const [selectedModel, setSelectedModel] = useState<Model>(MODELS[0]);
-  const [attachedFiles, setAttachedFiles] = useState<string[]>([]);
+  const [projectId, setProjectId] = useState<string | null>(null);
   const pickerRef = useRef<HTMLDivElement>(null);
-  const fileInputRef = useRef<HTMLInputElement>(null);
+  useEffect(() => {
+    const handleSelectProject = (event: Event) => {
+      const project = (event as CustomEvent<{id?: string}>).detail;
+      setProjectId(project?.id ?? null);
+    };
+    window.addEventListener('openharness:select-project', handleSelectProject);
+    return () => window.removeEventListener('openharness:select-project', handleSelectProject);
+  }, []);
 
   useEffect(() => {
     if (!modelPickerOpen) return;
@@ -48,10 +55,9 @@ export function Composer() {
   const send = () => {
     const text = prompt.trim();
     if (!text) return;
-    const detail = {text, modelId: selectedModel.id, provider: selectedModel.provider};
+    const detail = {text, modelId: selectedModel.id, provider: selectedModel.provider, projectId};
     window.dispatchEvent(new CustomEvent('openharness:send-message', {detail}));
     setPrompt('');
-    setAttachedFiles([]);
   };
 
   return (
@@ -78,30 +84,7 @@ export function Composer() {
         }}
       />
       <div className="composer-row">
-        <button
-          className="compose-icon"
-          type="button"
-          id="attach"
-          aria-label="Attach files"
-          title="Attach files"
-          onClick={() => fileInputRef.current?.click()}
-        >
-          <PaperClipIcon width={16} height={16} aria-hidden="true" />
-        </button>
-        <input
-          ref={fileInputRef}
-          type="file"
-          id="file-input"
-          hidden
-          multiple
-          onChange={(e) => {
-            const files = Array.from(e.target.files || []).map((f) => f.name);
-            setAttachedFiles(files);
-          }}
-        />
-        <span id="file-label" style={{color: 'var(--muted)', fontSize: '11px', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap'}}>
-          {attachedFiles.join(', ')}
-        </span>
+        {/* ponytail: attachment UI removed because file contents are not sent; add back with actual content/path handling. */}
         <span className="composer-spacer" />
         <div ref={pickerRef} className="model-wrap">
           <button
