@@ -21,9 +21,9 @@ export function OpenHarness() {
     const checkUpdates = async () => {
       try {
         const {check} = await import('@tauri-apps/plugin-updater');
-      const update = await check();
-      window.dispatchEvent(new CustomEvent('openharness:update-availability', {detail: !!update}));
-    } catch {}
+        const update = await check();
+        window.dispatchEvent(new CustomEvent('openharness:update-availability', {detail: !!update}));
+      } catch {}
     };
     void checkUpdates();
     window.addEventListener('keydown', closeOnEscape);
