@@ -62,10 +62,10 @@ function renderMarkdown(text: string) {
   });
 }
 
-export function Hero({style}: {style?: React.CSSProperties}) {
+export function Hero({style, className}: {style?: React.CSSProperties; className?: string}) {
   const [localDetail, setLocalDetail] = useState('Open Settings → Providers to add OpenRouter, Google AI Studio, or Ollama.');
   return (
-    <section className="hero" aria-hidden="false" style={style}>
+    <section className={`hero ${className || ''}`} aria-hidden="false" style={style}>
       <div className="hero-mark" aria-hidden="true">
         <img src="/appicon/openharness-desktop-mark-only-512-v2.svg" alt="OpenHarness" width={38} height={38} style={{display: 'block'}} />
       </div>
@@ -513,37 +513,42 @@ export function Canvas() {
 
   const empty = messages.length === 0;
   return (
-    <div style={{display: 'flex', width: '100%', height: '100%', overflow: 'hidden'}}>
+    <div className="canvas-layout">
       {threadsCollapsed ? (
-        <aside aria-label="Chat threads collapsed" style={{width: '40px', minWidth: '40px', flex: '0 0 40px', display: 'flex', flexDirection: 'column', alignItems: 'center', background: 'var(--bg)', borderRight: '1px solid var(--border)', padding: '12px 4px', overflow: 'hidden'}}>
-          <button type="button" className="collapse-toggle-btn" onClick={toggleThreads} aria-label="Expand threads sidebar" title="Expand threads sidebar" style={{background: 'transparent', border: 0, color: 'var(--muted)', cursor: 'pointer', display: 'grid', placeItems: 'center', padding: '4px', borderRadius: 4}}>
+        <aside className="thread-sidebar thread-sidebar-collapsed" aria-label="Chat threads collapsed">
+          <button type="button" className="collapse-toggle-btn thread-toggle" onClick={toggleThreads} aria-label="Expand threads sidebar" title="Expand threads sidebar">
             <ChevronRightIcon width={14} height={14} />
           </button>
         </aside>
       ) : (
-        <aside aria-label="Chat threads" style={{width: '206px', minWidth: '180px', flex: '0 0 206px', display: 'flex', flexDirection: 'column', background: 'var(--bg)', borderRight: '1px solid var(--border)', overflow: 'hidden'}}>
-          <div style={{padding: '12px 10px 8px', display: 'flex', flexDirection: 'column', gap: 6}}>
-            <div style={{display: 'flex', justifyContent: 'space-between', alignItems: 'center'}}>
-              <span style={{fontSize: 10, letterSpacing: '0.08em', textTransform: 'uppercase', color: 'var(--muted)', fontFamily: 'var(--font-mono)'}}>Threads</span>
-              <button type="button" className="collapse-toggle-btn" onClick={toggleThreads} aria-label="Collapse threads sidebar" title="Collapse threads sidebar" style={{background: 'transparent', border: 0, color: 'var(--muted)', cursor: 'pointer', display: 'grid', placeItems: 'center', padding: '2px 4px', borderRadius: 4}}>
+        <aside className="thread-sidebar" aria-label="Chat threads">
+          <div className="thread-sidebar-header">
+            <div className="thread-sidebar-title-row">
+              <span className="thread-sidebar-title">Threads</span>
+              <button type="button" className="collapse-toggle-btn thread-toggle" onClick={toggleThreads} aria-label="Collapse threads sidebar" title="Collapse threads sidebar">
                 <ChevronLeftIcon width={14} height={14} />
               </button>
             </div>
-            <button type="button" className="new-thread-btn" onClick={() => window.dispatchEvent(new Event('openharness:new-chat'))} style={{width: '100%', border: '1px solid var(--accent)', background: 'var(--accent)', color: 'var(--accent-fg)', borderRadius: 5, padding: '6px 8px', fontSize: 11.5, textAlign: 'center', fontWeight: 650, cursor: 'pointer', transition: 'background .14s, border-color .14s'}} aria-label="New thread">+ New thread</button>
+            <button type="button" className="new-thread-btn" onClick={() => window.dispatchEvent(new Event('openharness:new-chat'))} aria-label="New thread">+ New thread</button>
           </div>
-          <ul style={{listStyle: 'none', margin: 0, padding: 8, display: 'grid', gap: 3, overflow: 'auto', flex: 1}}>
+          <ul className="thread-list">
             {threads.map(thread => (
-              <li key={thread.id} style={{display: 'flex', gap: 2, alignItems: 'center'}}>
-                <button type="button" style={{flex: 1, textAlign: 'left', border: '1px solid', borderColor: thread.id === threadId ? 'rgba(204, 255, 0, 0.28)' : 'transparent', borderLeft: thread.id === threadId ? '2px solid var(--accent)' : '1px solid transparent', background: thread.id === threadId ? '#151813' : 'transparent', color: thread.id === threadId ? 'var(--fg)' : 'var(--muted)', padding: '5px 8px', borderRadius: 5, fontSize: 11.5, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap'}} onClick={() => window.dispatchEvent(new CustomEvent('openharness:open-thread', {detail: thread.id}))}>{thread.title}</button>
-                <button type="button" style={{width: 24, height: 26, border: 0, background: 'transparent', color: '#888e86', fontSize: 13}} aria-label={`Delete ${thread.title}`} onClick={() => window.dispatchEvent(new CustomEvent('openharness:delete-thread', {detail: thread.id}))}>×</button>
+              <li key={thread.id} className="thread-row">
+                <button type="button" className={`thread-item ${thread.id === threadId ? 'thread-item-active' : ''}`} onClick={() => window.dispatchEvent(new CustomEvent('openharness:open-thread', {detail: thread.id}))}>{thread.title}</button>
+                <button type="button" className="thread-delete" aria-label={`Delete ${thread.title}`} onClick={() => window.dispatchEvent(new CustomEvent('openharness:delete-thread', {detail: thread.id}))}>×</button>
               </li>
             ))}
           </ul>
-          {!threads.length && <p style={{color: '#868b86', fontSize: 12, padding: '8px 14px 14px', margin: 0}}>No chats saved yet.</p>}
+          {!threads.length && <p className="thread-empty">No chats saved yet.</p>}
         </aside>
       )}
-      <main className={`canvas ${activeTool === 'files' ? 'canvas-files-open' : ''}`} style={{paddingBottom: activeTool === 'terminal' ? 0 : undefined}}>
-        {workspaceStatus && <div aria-label="Git repository status" title={workspaceStatus} style={{position: 'absolute', top: 8, left: 8, zIndex: 2, display: 'flex', alignItems: 'center', gap: 8, fontSize: 10, color: 'var(--muted)', background: 'var(--panel)', padding: '4px 8px', borderRadius: 6}}><span style={{maxWidth: 280, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap'}}>{workspaceStatus}</span><button type="button" onClick={() => void refreshGitContext()} aria-label="Refresh git status and diff" title="Refresh git context" style={{fontSize: 10}}>Refresh</button></div>}
+      <main className={`canvas ${activeTool === 'files' ? 'canvas-files-open' : ''} ${activeTool === 'terminal' ? 'canvas-terminal-open' : ''}`} style={{'--terminal-height': `${terminalHeight}px`} as React.CSSProperties}>
+        {workspaceStatus && (
+          <div className="git-status-badge" aria-label="Git repository status" title={workspaceStatus}>
+            <span>{workspaceStatus}</span>
+            <button type="button" onClick={() => void refreshGitContext()} aria-label="Refresh git status and diff" title="Refresh git context">Refresh</button>
+          </div>
+        )}
         {activeTool && activeTool !== 'terminal' && activeTool !== 'files' && <section className="workspace-tool-panel" aria-label={`${activeTool} panel`}>
           <div className="workspace-tool-header">
             <div className="workspace-tool-title">{activeTool === 'browser' ? <GlobeAltIcon width={16} height={16}/> : <span aria-hidden="true">⑂</span>}{activeTool === 'browser' ? 'Browser' : 'Git diff'}</div>
@@ -554,33 +559,69 @@ export function Canvas() {
             {activeTool === 'git' && <div className="git-panel"><strong>{workspaceStatus || 'No Git status available.'}</strong><pre className="git-output">{gitDiff || 'Working tree clean; no diff to show.'}</pre></div>}
           </div>
         </section>}
-        {stopHandle && <button className="stop-generation" type="button" onClick={stopGenerating} title="Stop generation" aria-label="Stop generation" style={{bottom: activeTool === 'terminal' ? `${terminalHeight + 138}px` : undefined}}><ArrowDownTrayIcon width={14} aria-hidden="true" style={{transform: 'rotate(180deg)'}}/></button>}
-        {empty ? <Hero style={{transform: activeTool === 'terminal' ? `translateY(-${terminalHeight / 2}px)` : undefined}}/> : null}
-        <section className="conversation" aria-live="polite" ref={conversationRef} hidden={empty} style={{paddingBottom: activeTool === 'terminal' ? `${terminalHeight + 132}px` : undefined}}>
-          {messages.map(message => <MessageView key={message.id} message={message} onCopy={() => copyMessage(message)} onDelete={() => deleteMessage(message.id)} onRegenerate={() => regenerateMessage(message.id)} onSaveEdit={text => void saveMessageEdit(message.id, text)} />)}
+        {stopHandle && (
+          <button className="stop-generation" type="button" onClick={stopGenerating} title="Stop generation" aria-label="Stop generation">
+            <ArrowDownTrayIcon width={14} aria-hidden="true" />
+          </button>
+        )}
+        {empty && <Hero className={activeTool === 'terminal' ? 'hero-above-terminal' : undefined} />}
+        <section className="conversation" aria-live="polite" ref={conversationRef} hidden={empty}>
+          {messages.map(message => (
+            <MessageView key={message.id} message={message} onCopy={() => copyMessage(message)} onDelete={() => deleteMessage(message.id)} onRegenerate={() => regenerateMessage(message.id)} onSaveEdit={text => void saveMessageEdit(message.id, text)} />
+          ))}
         </section>
-        <div className="composer-wrap" style={{bottom: activeTool === 'terminal' ? `${terminalHeight + 8}px` : undefined}}>
+        <div className="composer-wrap">
           <Composer />
-          {approval && <div role="alertdialog" aria-modal="true" aria-labelledby="tool-approval-title" style={{position: 'absolute', inset: 0, zIndex: 20, display: 'grid', placeItems: 'center', background: 'rgba(0,0,0,0.72)', padding: 24}}>
-            <div style={{maxWidth: 560, width: '100%', background: 'var(--panel)', border: '1px solid var(--border)', borderRadius: 10, padding: 20}}>
-              <h2 id="tool-approval-title" style={{marginTop: 0}}>Approve workspace operation</h2><p><strong>{approval.tool}</strong> requests:</p>
-              <pre style={{maxHeight: 220, overflow: 'auto', whiteSpace: 'pre-wrap'}}>{JSON.stringify(approval.arguments, null, 2)}</pre>
-              <div style={{display: 'flex', justifyContent: 'flex-end', gap: 8}}><button type="button" onClick={() => void approveToolCall(false)}>Reject</button><button type="button" className="confirm" onClick={() => void approveToolCall(true)}>Approve once</button></div>
+          {approval && (
+            <div className="approval-backdrop" role="alertdialog" aria-modal="true" aria-labelledby="tool-approval-title">
+              <div className="approval-dialog">
+                <h2 id="tool-approval-title">Approve workspace operation</h2>
+                <p><strong>{approval.tool}</strong> requests:</p>
+                <pre>{JSON.stringify(approval.arguments, null, 2)}</pre>
+                <div className="approval-actions">
+                  <button type="button" onClick={() => void approveToolCall(false)}>Reject</button>
+                  <button type="button" className="confirm" onClick={() => void approveToolCall(true)}>Approve once</button>
+                </div>
+              </div>
             </div>
-          </div>}
+          )}
         </div>
-        {activeTool === 'terminal' && <section className="terminal-panel" aria-label="Terminal bottom panel" style={{height: `${terminalHeight}px`}}>
-          <div className="terminal-resizer" onPointerDown={resizeTerminal} role="separator" aria-orientation="horizontal" aria-label="Resize terminal panel" />
-          <div className="terminal-header"><div className="terminal-tabs" role="tablist" aria-label="Terminal sessions">
-            {terminalTabs.map(tab => <button key={tab.id} type="button" role="tab" aria-selected={tab.id === activeTerminalId} className={tab.id === activeTerminalId ? 'terminal-tab active' : 'terminal-tab'} onClick={() => setActiveTerminalId(tab.id)}>{tab.label} {tab.status === 'exited' ? '· exited' : ''}</button>)}
-            <button type="button" className="terminal-tab terminal-new" onClick={() => void createTerminal('powershell')} disabled={terminalBusy}>+ PowerShell</button>
-            <button type="button" className="terminal-tab terminal-new" onClick={() => void createTerminal('cmd')} disabled={terminalBusy}>+ Command Prompt</button>
-          </div><button type="button" className="workspace-tool-close" aria-label="Close terminal panel" onClick={() => setActiveTool(null)}>×</button></div>
-          <pre className="terminal-output" ref={terminalOutputRef} tabIndex={0} aria-label="Terminal output">{terminalTabs.find(tab => tab.id === activeTerminalId)?.output || 'No terminal sessions. Use + PowerShell or + Command Prompt.'}</pre>
-          {(() => { const active = terminalTabs.find(tab => tab.id === activeTerminalId); return active && active.status === 'running' ? <form className="terminal-input-row" onSubmit={sendTerminalInput}>
-            <input ref={terminalInputRef} value={terminalCommand} onChange={e => setTerminalCommand(e.target.value)} aria-label="Terminal command" placeholder={active.shell === 'cmd' ? 'Command Prompt' : 'PowerShell'} autoComplete="off" spellCheck={false}/><button type="submit" aria-label="Send terminal command">Send</button><button type="button" aria-label="Close active terminal" onClick={() => void closeTerminal(active.id)}>Close</button>
-          </form> : active ? <div className="terminal-input-row"><span>Session ended.</span><button type="button" onClick={() => void closeTerminal(active.id)}>Close</button></div> : null; })()}
-        </section>}
+        {activeTool === 'terminal' && (
+          <section className="terminal-panel" aria-label="Terminal bottom panel" style={{height: `${terminalHeight}px`}}>
+            <div className="terminal-resizer" onPointerDown={resizeTerminal} role="separator" aria-orientation="horizontal" aria-label="Resize terminal panel" />
+            <div className="terminal-header">
+              <div className="terminal-tabs" role="tablist" aria-label="Terminal sessions">
+                {terminalTabs.map(tab => (
+                  <button key={tab.id} type="button" role="tab" aria-selected={tab.id === activeTerminalId} className={tab.id === activeTerminalId ? 'terminal-tab active' : 'terminal-tab'} onClick={() => setActiveTerminalId(tab.id)}>
+                    {tab.label} {tab.status === 'exited' ? '· exited' : ''}
+                  </button>
+                ))}
+                <button type="button" className="terminal-tab terminal-new" onClick={() => void createTerminal('powershell')} disabled={terminalBusy}>+ PowerShell</button>
+                <button type="button" className="terminal-tab terminal-new" onClick={() => void createTerminal('cmd')} disabled={terminalBusy}>+ Command Prompt</button>
+              </div>
+              <button type="button" className="workspace-tool-close" aria-label="Close terminal panel" onClick={() => setActiveTool(null)}>×</button>
+            </div>
+            <pre className="terminal-output" ref={terminalOutputRef} tabIndex={0} aria-label="Terminal output">{terminalTabs.find(tab => tab.id === activeTerminalId)?.output || 'No terminal sessions. Use + PowerShell or + Command Prompt.'}</pre>
+            {(() => {
+              const active = terminalTabs.find(tab => tab.id === activeTerminalId);
+              if (active?.status === 'running') {
+                return (
+                  <form className="terminal-input-row" onSubmit={sendTerminalInput}>
+                    <input ref={terminalInputRef} value={terminalCommand} onChange={e => setTerminalCommand(e.target.value)} aria-label="Terminal command" placeholder={active.shell === 'cmd' ? 'Command Prompt' : 'PowerShell'} autoComplete="off" spellCheck={false} />
+                    <button type="submit" aria-label="Send terminal command">Send</button>
+                    <button type="button" aria-label="Close active terminal" onClick={() => void closeTerminal(active.id)}>Close</button>
+                  </form>
+                );
+              }
+              return active ? (
+                <div className="terminal-input-row">
+                  <span>Session ended.</span>
+                  <button type="button" onClick={() => void closeTerminal(active.id)}>Close</button>
+                </div>
+              ) : null;
+            })()}
+          </section>
+        )}
         {activeTool === 'files' && <aside className="file-panel" aria-label="Files panel" style={{width: `${filePanelWidth}px`}}>
           <div className="file-panel-header"><span className="workspace-tool-title"><DocumentTextIcon width={16} height={16}/>Files{projectName ? ` · ${projectName}` : ''}</span><button type="button" className="workspace-tool-close" aria-label="Close files panel" onClick={() => setActiveTool(null)}>×</button></div>
           <div className="file-panel-body"><div className="file-panel-resizer" onPointerDown={resizeFilePanel} role="separator" aria-orientation="vertical" aria-label="Resize files panel"/><WorkspaceFiles key={projectId ?? 'no-project'} projectId={projectId}/></div>
