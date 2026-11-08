@@ -11,7 +11,6 @@ export function ChatWindow() {
       const project = (event as CustomEvent<{name?: string}>).detail;
       const projElem = document.getElementById('breadcrumb-project');
       if (projElem) projElem.textContent = project?.name || 'OpenHarness';
-      window.dispatchEvent(new Event('openharness:new-chat'));
     };
     const updateCheck = (event: Event) => {
       setUpdateAvailable(Boolean((event as CustomEvent<boolean>).detail));

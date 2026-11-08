@@ -6,12 +6,12 @@ import {SettingsPage} from './components/Settings/SettingsPage';
 
 export function OpenHarness() {
   const [settingsOpen, setSettingsOpen] = useState(false);
-  const [initialSection, setInitialSection] = useState('Model Providers');
+  const [initialSection, setInitialSection] = useState('Providers');
 
   useEffect(() => {
     const openSettings = (event?: Event) => {
       const section = (event as CustomEvent<{section?: string}>)?.detail?.section;
-      if (section) setInitialSection(section);
+      if (section) setInitialSection(section === 'Model Providers' ? 'Providers' : section);
       setSettingsOpen(true);
     };
     const closeOnEscape = (event: KeyboardEvent) => {

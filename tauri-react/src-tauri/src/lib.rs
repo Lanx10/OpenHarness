@@ -1,11 +1,17 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::io::{Read, Write};
 use std::path::PathBuf;
-use std::sync::Mutex;
+use std::process::{Child, ChildStdin, Command, Stdio};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 use tauri::ipc::Channel;
-use tauri::{Manager, State};
+use tauri::{Emitter, Manager, State};
+use tokio::sync::oneshot;
 
 mod client;
+mod harness;
 mod secrets;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -38,6 +44,8 @@ pub struct ChatMessage {
     pub id: String,
     pub role: String,
     pub text: String,
+    #[serde(default)]
+    pub attachments: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -53,6 +61,15 @@ pub struct AppState {
     pub projects: Mutex<Vec<ProjectInfo>>,
     pub threads: Mutex<Vec<ChatThread>>,
     app_data_dir: Mutex<Option<PathBuf>>,
+    pub streams: Mutex<HashMap<String, oneshot::Sender<()>>>,
+    next_stream_id: AtomicU64,
+    pub pending_approvals: Arc<Mutex<PendingApprovals>>,
+    terminals: Arc<Mutex<HashMap<String, Arc<Mutex<TerminalSession>>>>>,
+}
+
+struct TerminalSession {
+    child: Child,
+    stdin: ChildStdin,
 }
 
 impl Default for AppState {
@@ -62,7 +79,35 @@ impl Default for AppState {
             projects: Mutex::new(Vec::new()),
             threads: Mutex::new(Vec::new()),
             app_data_dir: Mutex::new(None),
+            streams: Mutex::new(HashMap::new()),
+            next_stream_id: AtomicU64::new(1),
+            pending_approvals: Arc::new(Mutex::new(PendingApprovals::default())),
+            terminals: Arc::new(Mutex::new(HashMap::new())),
         }
+    }
+}
+
+impl AppState {
+    pub fn project_root(&self, project_id: &str) -> Result<PathBuf, String> {
+        let projects = self
+            .projects
+            .lock()
+            .map_err(|e| format!("Lock failure: {}", e))?;
+        let project = projects
+            .iter()
+            .find(|p| p.id == project_id)
+            .ok_or_else(|| format!("Project not found: {}", project_id))?;
+        let path = project
+            .path
+            .as_deref()
+            .ok_or_else(|| "Project has no folder selected".to_string())?;
+        let root = PathBuf::from(path)
+            .canonicalize()
+            .map_err(|e| format!("Project folder is unavailable: {}", e))?;
+        if !root.is_dir() {
+            return Err("Project folder is not a directory".into());
+        }
+        Ok(root)
     }
 }
 
@@ -149,25 +194,43 @@ impl AppState {
         custom_endpoint: bool,
         api_key: String,
     ) -> Result<ProviderInfo, String> {
-        if provider.trim().is_empty() || model_id.trim().is_empty() || api_key.trim().is_empty() {
+        let provider = provider.trim();
+        let model_id = model_id.trim();
+        let base_url = if custom_endpoint {
+            base_url
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty())
+        } else {
+            None
+        };
+        let validated_base_url = match base_url.as_deref() {
+            Some(value) => Some(client::validated_endpoint_for_test(provider, Some(value))?),
+            None => None,
+        };
+        let has_key = !api_key.trim().is_empty();
+        if provider.is_empty() || model_id.is_empty() || (provider != "Ollama" && !has_key) {
             return Err("Provider, model ID, and API key are required".into());
         }
 
-        secrets::save_secret(&format!("provider_{}", provider), &api_key)?;
+        if has_key {
+            secrets::save_secret(&format!("provider_{}", provider), &api_key)?;
+        } else {
+            secrets::delete_secret(&format!("provider_{}", provider))?;
+        }
 
         let info = ProviderInfo {
-            provider: provider.clone(),
-            model_id,
-            base_url,
+            provider: provider.to_string(),
+            model_id: model_id.to_string(),
+            base_url: validated_base_url,
             custom_endpoint,
-            has_key: true,
+            has_key,
         };
 
         let mut guard = self
             .providers
             .lock()
             .map_err(|e| format!("Lock failure: {}", e))?;
-        guard.insert(provider, info.clone());
+        guard.insert(provider.to_string(), info.clone());
         drop(guard);
         self.persist()?;
 
@@ -427,6 +490,16 @@ impl AppState {
         role: &str,
         text: &str,
     ) -> Result<ChatMessage, String> {
+        self.append_thread_message_with_attachments(thread_id, role, text, &[])
+    }
+
+    pub fn append_thread_message_with_attachments(
+        &self,
+        thread_id: &str,
+        role: &str,
+        text: &str,
+        attachments: &[String],
+    ) -> Result<ChatMessage, String> {
         let message = ChatMessage {
             id: format!(
                 "msg-{}",
@@ -437,6 +510,7 @@ impl AppState {
             ),
             role: role.into(),
             text: text.into(),
+            attachments: attachments.to_vec(),
         };
         let mut guard = self
             .threads
@@ -453,6 +527,52 @@ impl AppState {
         drop(guard);
         self.persist()?;
         Ok(message)
+    }
+
+    pub fn edit_thread_message(
+        &self,
+        thread_id: &str,
+        message_id: &str,
+        new_text: &str,
+    ) -> Result<ChatMessage, String> {
+        let mut guard = self
+            .threads
+            .lock()
+            .map_err(|e| format!("Lock failure: {}", e))?;
+        let thread = guard
+            .iter_mut()
+            .find(|thread| thread.id == thread_id)
+            .ok_or_else(|| format!("Thread not found: {}", thread_id))?;
+        let message = thread
+            .messages
+            .iter_mut()
+            .find(|msg| msg.id == message_id)
+            .ok_or_else(|| format!("Message not found: {}", message_id))?;
+        message.text = new_text.trim().to_string();
+        let updated = message.clone();
+        drop(guard);
+        self.persist()?;
+        Ok(updated)
+    }
+
+    pub fn delete_thread_message(
+        &self,
+        thread_id: &str,
+        message_id: &str,
+    ) -> Result<Vec<ChatMessage>, String> {
+        let mut guard = self
+            .threads
+            .lock()
+            .map_err(|e| format!("Lock failure: {}", e))?;
+        let thread = guard
+            .iter_mut()
+            .find(|thread| thread.id == thread_id)
+            .ok_or_else(|| format!("Thread not found: {}", thread_id))?;
+        thread.messages.retain(|msg| msg.id != message_id);
+        let remaining = thread.messages.clone();
+        drop(guard);
+        self.persist()?;
+        Ok(remaining)
     }
 
     pub async fn chat(
@@ -480,10 +600,11 @@ impl AppState {
 
         let reply = if key_opt.is_some() || saved_provider.is_some() {
             let base_url = saved_provider.as_ref().and_then(|p| p.base_url.as_deref());
+            let messages = vec![client::ModelMessage::new("user", trimmed)];
             client::query_llm(
                 canonical_provider,
                 model_id,
-                trimmed,
+                &messages,
                 key_opt.as_deref(),
                 base_url,
             )
@@ -622,13 +743,38 @@ fn get_thread(id: String, state: State<'_, AppState>) -> Result<ChatThread, Stri
 }
 
 #[tauri::command]
+fn edit_thread_message(
+    thread_id: String,
+    message_id: String,
+    text: String,
+    state: State<'_, AppState>,
+) -> Result<ChatMessage, String> {
+    state.edit_thread_message(&thread_id, &message_id, &text)
+}
+
+#[tauri::command]
+fn delete_thread_message(
+    thread_id: String,
+    message_id: String,
+    state: State<'_, AppState>,
+) -> Result<Vec<ChatMessage>, String> {
+    state.delete_thread_message(&thread_id, &message_id)
+}
+
+#[tauri::command]
 fn append_thread_message(
     thread_id: String,
     role: String,
     text: String,
+    attachments: Option<Vec<String>>,
     state: State<'_, AppState>,
 ) -> Result<ChatMessage, String> {
-    state.append_thread_message(&thread_id, &role, &text)
+    state.append_thread_message_with_attachments(
+        &thread_id,
+        &role,
+        &text,
+        attachments.as_deref().unwrap_or(&[]),
+    )
 }
 
 #[derive(Serialize, Clone)]
@@ -636,6 +782,319 @@ struct StreamChunk {
     text: String,
     done: bool,
     error: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    approval: Option<ApprovalRequest>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ApprovalRequest {
+    pub id: String,
+    pub tool: String,
+    pub arguments: serde_json::Value,
+}
+
+#[derive(Debug)]
+struct ApprovalDecision {
+    allowed: bool,
+    response: Option<String>,
+}
+
+#[derive(Default)]
+pub struct PendingApprovals {
+    next_id: u64,
+    waiting: HashMap<String, tokio::sync::oneshot::Sender<ApprovalDecision>>,
+}
+
+const MAX_AGENT_ITERATIONS: usize = 12;
+const MAX_AGENT_RESPONSE_BYTES: usize = 1_000_000;
+const MAX_COMMAND_BYTES: usize = 16_384;
+const MAX_TOOL_OUTPUT_BYTES: usize = 200_000;
+
+fn clamp_string(value: String, max_chars: usize) -> String {
+    value.chars().take(max_chars).collect()
+}
+
+fn requires_approval(tool: &str) -> bool {
+    matches!(tool, "write_file" | "run_command")
+}
+
+fn validate_tool_call(call: &harness::ToolCall) -> Result<(), String> {
+    match call.name.as_str() {
+        "read_file" => {
+            let path = call.arguments["path"]
+                .as_str()
+                .ok_or("read_file requires a path")?;
+            if path.len() > 4096 {
+                return Err("File path exceeds 4096 bytes".to_string());
+            }
+        }
+        "write_file" => {
+            let path = call.arguments["path"]
+                .as_str()
+                .ok_or("write_file requires a path")?;
+            let content = call.arguments["content"]
+                .as_str()
+                .ok_or("write_file requires content")?;
+            if path.len() > 4096 || content.len() > 2_000_000 {
+                return Err("Write path or content exceeds the allowed size".to_string());
+            }
+        }
+        "list_dir" => {
+            if call.arguments["path"].as_str().unwrap_or("").len() > 4096 {
+                return Err("Directory path exceeds 4096 bytes".to_string());
+            }
+        }
+        "grep_search" => {
+            let query = call.arguments["query"]
+                .as_str()
+                .ok_or("grep_search requires a query")?;
+            if query.len() > 1024 {
+                return Err("Search query exceeds 1024 bytes".to_string());
+            }
+        }
+        "run_command" => {
+            let command = call.arguments["command"]
+                .as_str()
+                .ok_or("run_command requires a command")?;
+            if command.len() > MAX_COMMAND_BYTES {
+                return Err(format!("Command exceeds {} bytes", MAX_COMMAND_BYTES));
+            }
+        }
+        "git_status" | "git_diff" | "git_log" | "git_branch" => {}
+        other => return Err(format!("Unknown tool: {}", other)),
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_agent_loop(
+    provider: String,
+    model_id: String,
+    key: Option<String>,
+    base_url: Option<String>,
+    project_root: PathBuf,
+    initial_messages: Vec<client::ModelMessage>,
+    emitter: Channel<StreamChunk>,
+    approvals: Arc<Mutex<PendingApprovals>>,
+    attachments: Vec<String>,
+) -> Result<String, String> {
+    let tool_hint = format!("\n\n{}", harness::ToolDispatcher::build_system_prompt());
+    let mut messages = initial_messages;
+    for attachment in attachments {
+        messages.push(client::ModelMessage::new("user", &attachment));
+    }
+    if let Some(first_user) = messages.iter_mut().find(|m| m.role == "user") {
+        first_user.content.push_str(&tool_hint);
+    }
+
+    let mut final_text = String::new();
+    for _iteration in 0..MAX_AGENT_ITERATIONS {
+        let token_emitter = emitter.clone();
+        let result = client::query_llm_stream(
+            &provider,
+            &model_id,
+            &messages,
+            key.as_deref(),
+            base_url.as_deref(),
+            move |text| {
+                // Hide executable tool protocol from chat; show only final prose.
+                if !text.contains("<tool_call>") && !text.contains("</tool_call>") {
+                    let _ = token_emitter.send(StreamChunk {
+                        text,
+                        done: false,
+                        error: None,
+                        approval: None,
+                    });
+                }
+            },
+        )
+        .await?;
+
+        if result.len() > MAX_AGENT_RESPONSE_BYTES {
+            return Err("Model response exceeded the maximum allowed size".to_string());
+        }
+
+        let calls = harness::ToolDispatcher::parse_tool_calls(&result);
+        if calls.is_empty() {
+            return Ok(if result.trim().is_empty() {
+                final_text
+            } else {
+                result
+            });
+        }
+
+        let mut assistant_content = result.clone();
+        messages.push(client::ModelMessage::new("assistant", &assistant_content));
+        for call in calls {
+            if let Err(error) = validate_tool_call(&call) {
+                messages.push(client::ModelMessage::new(
+                    "system",
+                    &format!("Tool {} rejected: {}", call.name, error),
+                ));
+                continue;
+            }
+
+            if requires_approval(&call.name) {
+                let approval_id = {
+                    let mut pending = approvals.lock().map_err(|e| e.to_string())?;
+                    pending.next_id += 1;
+                    format!("approval-{}", pending.next_id)
+                };
+                let (sender, receiver) = tokio::sync::oneshot::channel::<ApprovalDecision>();
+                approvals
+                    .lock()
+                    .map_err(|e| e.to_string())?
+                    .waiting
+                    .insert(approval_id.clone(), sender);
+                let request = ApprovalRequest {
+                    id: approval_id.clone(),
+                    tool: call.name.clone(),
+                    arguments: call.arguments.clone(),
+                };
+                let _ = emitter.send(StreamChunk {
+                    text: String::new(),
+                    done: false,
+                    error: None,
+                    approval: Some(request),
+                });
+                let decision = receiver
+                    .await
+                    .map_err(|_| "Approval request was cancelled".to_string())?;
+                if !decision.allowed {
+                    let observation = decision
+                        .response
+                        .unwrap_or_else(|| "User declined this operation".to_string());
+                    messages.push(client::ModelMessage::new(
+                        "system",
+                        &format!("Tool {} not run: {}", call.name, observation),
+                    ));
+                    continue;
+                }
+            }
+
+            let root = project_root.clone();
+            let call_clone = call.clone();
+            let tool_result = tokio::task::spawn_blocking(move || {
+                harness::ToolDispatcher::execute_tool(&root, &call_clone, true)
+            })
+            .await
+            .map_err(|e| format!("Tool task failed: {}", e))?;
+            let mut observation = harness::ToolDispatcher::format_observation(&tool_result);
+            observation = clamp_string(observation, MAX_TOOL_OUTPUT_BYTES);
+            messages.push(client::ModelMessage::new("system", &observation));
+            assistant_content.clear();
+        }
+        final_text = result;
+    }
+
+    Err("Agent stopped after reaching the maximum tool iteration count".to_string())
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ApprovalReply {
+    id: String,
+    allowed: bool,
+    response: Option<String>,
+}
+
+#[tauri::command]
+fn respond_to_tool_approval(
+    reply: ApprovalReply,
+    state: tauri::State<'_, AppState>,
+) -> Result<(), String> {
+    let mut pending = state.pending_approvals.lock().map_err(|e| e.to_string())?;
+    let sender = pending
+        .waiting
+        .remove(&reply.id)
+        .ok_or_else(|| format!("Approval not found: {}", reply.id))?;
+    sender
+        .send(ApprovalDecision {
+            allowed: reply.allowed,
+            response: reply.response,
+        })
+        .map_err(|_| "Agent no longer waiting for approval".to_string())
+}
+
+#[tauri::command]
+fn tool_list() -> Vec<harness::ToolDefinition> {
+    harness::ToolDispatcher::list_tools()
+}
+
+#[tauri::command]
+fn workspace_read_file(
+    project_id: String,
+    path: String,
+    offset: Option<usize>,
+    limit: Option<usize>,
+    state: State<'_, AppState>,
+) -> Result<String, String> {
+    let root = state.project_root(&project_id)?;
+    harness::Sandbox::new(root)?.read_file(&path, offset, limit)
+}
+
+#[tauri::command]
+fn workspace_list_dir(
+    project_id: String,
+    path: Option<String>,
+    state: State<'_, AppState>,
+) -> Result<Vec<harness::FileEntry>, String> {
+    let root = state.project_root(&project_id)?;
+    harness::Sandbox::new(root)?.list_dir(path.as_deref())
+}
+
+#[tauri::command]
+fn workspace_grep(
+    project_id: String,
+    query: String,
+    pattern: Option<String>,
+    state: State<'_, AppState>,
+) -> Result<Vec<harness::GrepMatch>, String> {
+    let root = state.project_root(&project_id)?;
+    harness::Sandbox::new(root)?.grep(&query, pattern.as_deref())
+}
+
+#[tauri::command]
+#[allow(dead_code)]
+fn workspace_run_command(
+    project_id: String,
+    command: String,
+    timeout_secs: Option<u64>,
+    state: State<'_, AppState>,
+) -> Result<harness::CommandResult, String> {
+    let root = state.project_root(&project_id)?;
+    harness::ExecutionEngine::run_command(&root, &command, timeout_secs)
+}
+
+#[tauri::command]
+fn workspace_git_status(project_id: String, state: State<'_, AppState>) -> Result<String, String> {
+    let root = state.project_root(&project_id)?;
+    harness::GitContext::status(&root)
+}
+
+#[tauri::command]
+fn workspace_git_diff(
+    project_id: String,
+    staged: Option<bool>,
+    state: State<'_, AppState>,
+) -> Result<String, String> {
+    let root = state.project_root(&project_id)?;
+    harness::GitContext::diff(&root, staged.unwrap_or(false))
+}
+
+#[tauri::command]
+fn workspace_git_log(
+    project_id: String,
+    limit: Option<usize>,
+    state: State<'_, AppState>,
+) -> Result<String, String> {
+    let root = state.project_root(&project_id)?;
+    harness::GitContext::log(&root, limit)
+}
+
+#[tauri::command]
+fn workspace_git_branch(project_id: String, state: State<'_, AppState>) -> Result<String, String> {
+    let root = state.project_root(&project_id)?;
+    harness::GitContext::branch(&root)
 }
 
 #[tauri::command]
@@ -652,20 +1111,40 @@ async fn chat_send(
 }
 
 #[tauri::command]
+#[allow(clippy::too_many_arguments)]
 async fn chat_send_stream(
     prompt: String,
     model_id: String,
     provider: String,
-    _project_id: Option<String>,
+    project_id: Option<String>,
     thread_id: Option<String>,
+    attachments: Option<Vec<String>>,
     channel: Channel<StreamChunk>,
     state: State<'_, AppState>,
-) -> Result<(), String> {
+) -> Result<String, String> {
+    let stream_id = state
+        .next_stream_id
+        .fetch_add(1, Ordering::Relaxed)
+        .to_string();
+    let (cancel_tx, mut cancel_rx) = oneshot::channel::<()>();
     let trimmed = prompt.trim();
     if trimmed.is_empty() {
         return Err("Prompt cannot be empty".into());
     }
-    let key = secrets::get_secret(&format!("provider_{}", provider))?;
+    state
+        .streams
+        .lock()
+        .map_err(|e| format!("Lock failure: {}", e))?
+        .insert(stream_id.clone(), cancel_tx);
+    let key = match secrets::get_secret(&format!("provider_{}", provider)) {
+        Ok(key) => key,
+        Err(error) => {
+            if let Ok(mut streams) = state.streams.lock() {
+                streams.remove(&stream_id);
+            }
+            return Err(error);
+        }
+    };
     let saved = state
         .providers
         .lock()
@@ -673,75 +1152,152 @@ async fn chat_send_stream(
         .get(&provider)
         .cloned();
     let config_url = saved.as_ref().and_then(|item| item.base_url.clone());
-    if let Some(thread_id) = thread_id.as_deref() {
-        state.append_thread_message(thread_id, "user", trimmed)?;
-    }
     let history = if let Some(thread_id) = thread_id.as_deref() {
         state.get_thread(thread_id)?.messages
     } else {
         Vec::new()
     };
-    let context = history
+    let attachments_from_request = attachments.clone().unwrap_or_default();
+    if let Some(thread_id) = thread_id.as_deref() {
+        state.append_thread_message_with_attachments(
+            thread_id,
+            "user",
+            trimmed,
+            &attachments_from_request,
+        )?;
+    }
+    let mut messages = history
         .iter()
-        .map(|message| format!("{}: {}", message.role, message.text))
-        .collect::<Vec<_>>()
-        .join("\n");
-    let full_prompt = if context.is_empty() {
-        trimmed.to_string()
-    } else {
-        format!("{}\nuser: {}", context, trimmed)
-    };
+        .map(|message| client::ModelMessage::new(&message.role, &message.text))
+        .collect::<Vec<_>>();
+    messages.push(client::ModelMessage::new("user", trimmed));
     let emitter = channel.clone();
-    let result = if key.is_some() || saved.is_some() {
-        client::query_llm_stream(
-            &provider,
-            &model_id,
-            &full_prompt,
-            key.as_deref(),
-            config_url.as_deref(),
-            move |text| {
+    let provider_owned = provider.clone();
+    let model_owned = model_id.clone();
+    let key_owned = key.clone();
+    let url_owned = config_url.clone();
+    let project_root_opt = project_id
+        .as_deref()
+        .and_then(|id| state.project_root(id).ok());
+    let approvals = state.pending_approvals.clone();
+    let task_state = state.inner();
+    let task = tokio::spawn(async move {
+        let attachments = attachments_from_request;
+        if let Some(root) = project_root_opt {
+            if key_owned.is_some() || saved.is_some() {
+                let result = run_agent_loop(
+                    provider_owned.clone(),
+                    model_owned.clone(),
+                    key_owned.clone(),
+                    url_owned.clone(),
+                    root,
+                    messages,
+                    emitter.clone(),
+                    approvals,
+                    attachments,
+                )
+                .await?;
+                Ok(result)
+            } else {
+                let text = format!(
+                    "Local OpenHarness Assistant (Model: {}):\n\nConfigure API access for {} in Settings to route requests to live inference.",
+                    model_owned, provider_owned
+                );
                 let _ = emitter.send(StreamChunk {
-                    text,
+                    text: text.clone(),
                     done: false,
                     error: None,
+                    approval: None,
                 });
-            },
-        )
-        .await
-    } else {
-        let text = format!(
-            "Local OpenHarness Assistant (Model: {}):\n\nConfigure API access for {} in Settings to route requests to live inference.",
-            model_id, provider
-        );
-        let _ = channel.send(StreamChunk {
-            text: text.clone(),
-            done: false,
-            error: None,
-        });
-        Ok(text)
-    };
-    match result {
-        Ok(text) => {
-            if let Some(thread_id) = thread_id.as_deref() {
-                state.append_thread_message(thread_id, "assistant", &text)?;
+                Ok(text)
             }
+        } else if key_owned.is_some() || saved.is_some() {
+            client::query_llm_stream(
+                &provider_owned,
+                &model_owned,
+                &messages,
+                key_owned.as_deref(),
+                url_owned.as_deref(),
+                move |text| {
+                    let _ = emitter.send(StreamChunk {
+                        text,
+                        done: false,
+                        error: None,
+                        approval: None,
+                    });
+                },
+            )
+            .await
+        } else {
+            let text = format!(
+                "Local OpenHarness Assistant (Model: {}):\n\nConfigure API access for {} in Settings to route requests to live inference.",
+                model_owned, provider_owned
+            );
+            let _ = emitter.send(StreamChunk {
+                text: text.clone(),
+                done: false,
+                error: None,
+                approval: None,
+            });
+            Ok(text)
+        }
+    });
+    let abort_handle = task.abort_handle();
+    let result = tokio::select! {
+        _ = &mut cancel_rx => { abort_handle.abort(); Err("Generation stopped".to_string()) }
+        joined = task => joined.map_err(|error| format!("Stream task failed: {}", error))?,
+    };
+    if let Ok(text) = &result
+        && let Some(thread_id) = thread_id.as_deref()
+    {
+        task_state.append_thread_message(thread_id, "assistant", text)?;
+    }
+    if let Ok(mut streams) = state.streams.lock() {
+        streams.remove(&stream_id);
+    }
+    match result {
+        Ok(_) => {
             channel
                 .send(StreamChunk {
                     text: String::new(),
                     done: true,
                     error: None,
+                    approval: None,
                 })
-                .map_err(|e| e.to_string())
+                .map_err(|e| e.to_string())?;
+            Ok(stream_id)
         }
         Err(error) => {
             let _ = channel.send(StreamChunk {
                 text: String::new(),
                 done: true,
                 error: Some(error.clone()),
+                approval: None,
             });
             Err(error)
         }
     }
+}
+
+#[tauri::command]
+fn cancel_chat_stream(stream_id: Option<String>, state: State<'_, AppState>) -> Result<(), String> {
+    let mut streams = state
+        .streams
+        .lock()
+        .map_err(|e| format!("Lock failure: {}", e))?;
+    if let Some(id) = stream_id.filter(|s| !s.is_empty())
+        && let Some(token) = streams.remove(&id)
+    {
+        token.send(()).ok();
+        return Ok(());
+    }
+    if streams.is_empty() {
+        return Err("Stream not found or already finished".to_string());
+    }
+    for (_, token) in streams.drain() {
+        token.send(()).ok();
+    }
+    Ok(())
 }
 
 #[tauri::command]
@@ -751,15 +1307,203 @@ async fn test_provider_connection(
     base_url: Option<String>,
     api_key: String,
 ) -> Result<String, String> {
+    let test_messages = vec![client::ModelMessage::new("user", "Hello")];
     client::query_llm(
         &provider,
         &model_id,
-        "Hello",
+        &test_messages,
         Some(&api_key),
         base_url.as_deref(),
     )
     .await?;
     Ok("Connection successful".into())
+}
+
+fn read_terminal_output(stdout: std::process::ChildStdout, app: tauri::AppHandle, id: String) {
+    std::thread::spawn(move || {
+        let mut reader = std::io::BufReader::new(stdout);
+        let mut buffer = [0u8; 4096];
+        loop {
+            match reader.read(&mut buffer) {
+                Ok(0) => break,
+                Ok(n) => {
+                    let _ = app.emit(
+                        "terminal-output",
+                        serde_json::json!({
+                            "id": id,
+                            "data": String::from_utf8_lossy(&buffer[..n]),
+                        }),
+                    );
+                }
+                Err(_) => break,
+            }
+        }
+    });
+}
+
+#[tauri::command]
+fn terminal_create(
+    project_id: Option<String>,
+    shell: Option<String>,
+    state: State<'_, AppState>,
+    app: tauri::AppHandle,
+) -> Result<String, String> {
+    let working_dir = if let Some(project_id) = project_id {
+        state.project_root(&project_id)?
+    } else {
+        std::env::current_dir().map_err(|e| e.to_string())?
+    };
+    let shell = shell.unwrap_or_else(|| "powershell".to_string());
+    let mut command = if shell.eq_ignore_ascii_case("cmd") {
+        let mut command = Command::new("cmd.exe");
+        command.arg("/D");
+        command
+    } else {
+        let mut command = Command::new("powershell.exe");
+        command.args(["-NoLogo", "-NoProfile", "-NoExit", "-Command", "-"]);
+        command
+    };
+    command
+        .current_dir(&working_dir)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = command.spawn().map_err(|e| e.to_string())?;
+    let stdin = child
+        .stdin
+        .take()
+        .ok_or_else(|| "terminal stdin unavailable".to_string())?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| "terminal stdout unavailable".to_string())?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| "terminal stderr unavailable".to_string())?;
+    let id = format!(
+        "terminal-{}",
+        state.next_stream_id.fetch_add(1, Ordering::Relaxed)
+    );
+    let app_stdout = app.clone();
+    let app_stderr = app.clone();
+    let id_stdout = id.clone();
+    let id_stderr = id.clone();
+    read_terminal_output(stdout, app_stdout, id_stdout);
+    std::thread::spawn(move || {
+        let mut reader = std::io::BufReader::new(stderr);
+        let mut buffer = [0u8; 4096];
+        loop {
+            match reader.read(&mut buffer) {
+                Ok(0) => break,
+                Ok(n) => {
+                    let _ = app_stderr.emit(
+                        "terminal-output",
+                        serde_json::json!({
+                            "id": id_stderr,
+                            "data": String::from_utf8_lossy(&buffer[..n]),
+                        }),
+                    );
+                }
+                Err(_) => break,
+            }
+        }
+    });
+    state
+        .terminals
+        .lock()
+        .map_err(|e| format!("Lock failure: {}", e))?
+        .insert(
+            id.clone(),
+            Arc::new(Mutex::new(TerminalSession { child, stdin })),
+        );
+    spawn_terminal_monitor(app, id.clone(), state.terminals.clone());
+    Ok(id)
+}
+
+fn spawn_terminal_monitor(
+    app: tauri::AppHandle,
+    id: String,
+    terminals: Arc<Mutex<HashMap<String, Arc<Mutex<TerminalSession>>>>>,
+) {
+    std::thread::spawn(move || {
+        loop {
+            std::thread::sleep(Duration::from_millis(200));
+            let session = match terminals.lock() {
+                Ok(map) => map.get(&id).cloned(),
+                Err(_) => None,
+            };
+            let Some(session) = session else { return };
+            let status = match session.lock() {
+                Ok(mut session) => session.child.try_wait(),
+                Err(_) => return,
+            };
+            match status {
+                Ok(Some(status)) => {
+                    let _ = app.emit(
+                        "terminal-exit",
+                        serde_json::json!({ "id": id.clone(), "code": status.code() }),
+                    );
+                    if let Ok(mut map) = terminals.lock() {
+                        map.remove(&id);
+                    }
+                    return;
+                }
+                Ok(None) => {}
+                Err(_) => return,
+            }
+        }
+    });
+}
+
+#[tauri::command]
+fn terminal_write(id: String, data: String, state: State<'_, AppState>) -> Result<(), String> {
+    let session = {
+        let map = state
+            .terminals
+            .lock()
+            .map_err(|e| format!("Lock failure: {}", e))?;
+        map.get(&id)
+            .cloned()
+            .ok_or_else(|| "terminal not found".to_string())?
+    };
+    let mut session = session.lock().map_err(|e| format!("Lock failure: {}", e))?;
+    session
+        .stdin
+        .write_all(data.as_bytes())
+        .map_err(|e| e.to_string())?;
+    session.stdin.flush().map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+#[tauri::command]
+fn terminal_kill(id: String, state: State<'_, AppState>) -> Result<(), String> {
+    let session = {
+        let mut map = state
+            .terminals
+            .lock()
+            .map_err(|e| format!("Lock failure: {}", e))?;
+        map.remove(&id)
+            .ok_or_else(|| "terminal not found".to_string())?
+    };
+    let mut session = session.lock().map_err(|e| format!("Lock failure: {}", e))?;
+    let _ = session.stdin.flush();
+    let _ = session.stdin.write_all(b"\r\nexit\r\n");
+    let _ = session.stdin.flush();
+    let _ = session.child.kill();
+    let _ = session.child.wait();
+    Ok(())
+}
+
+#[tauri::command]
+fn terminal_list(state: State<'_, AppState>) -> Result<Vec<String>, String> {
+    Ok(state
+        .terminals
+        .lock()
+        .map_err(|e| format!("Lock failure: {}", e))?
+        .keys()
+        .cloned()
+        .collect())
 }
 
 #[tauri::command]
@@ -790,6 +1534,10 @@ pub fn run() {
         .manage(AppState::default())
         .invoke_handler(tauri::generate_handler![
             provider_save,
+            terminal_create,
+            terminal_write,
+            terminal_kill,
+            terminal_list,
             provider_list,
             provider_delete,
             get_projects,
@@ -804,9 +1552,21 @@ pub fn run() {
             rename_thread,
             get_thread,
             append_thread_message,
+            edit_thread_message,
+            delete_thread_message,
             chat_send,
             chat_send_stream,
+            cancel_chat_stream,
             test_provider_connection,
+            tool_list,
+            respond_to_tool_approval,
+            workspace_read_file,
+            workspace_list_dir,
+            workspace_grep,
+            workspace_git_status,
+            workspace_git_diff,
+            workspace_git_log,
+            workspace_git_branch,
             app_minimize,
             app_toggle_maximize,
             app_close,
@@ -845,7 +1605,7 @@ mod tests {
     fn test_provider_flow() {
         let state = AppState::default();
         let save_res = state.save_provider(
-            "TestProvider".into(),
+            "OpenRouter".into(),
             "test-model".into(),
             Some("https://api.test.com".into()),
             true,
@@ -858,7 +1618,7 @@ mod tests {
         assert_eq!(list_res[0].model_id, "test-model");
         assert!(list_res[0].has_key);
 
-        let del_res = state.delete_provider("TestProvider");
+        let del_res = state.delete_provider("OpenRouter");
         assert!(del_res.is_ok());
         let list_after = state.list_providers().unwrap();
         assert_eq!(list_after.len(), 0);
@@ -890,12 +1650,49 @@ mod tests {
         let state = AppState::default();
         let proj = state.create_project("Threads".into(), None).unwrap();
         let thread = state.create_thread(&proj.id).unwrap();
-        state
+        let message = state
             .append_thread_message(&thread.id, "user", "hello")
             .unwrap();
         let fetched = state.get_thread(&thread.id).unwrap();
         assert_eq!(fetched.messages.len(), 1);
         let threads = state.list_threads(Some(&proj.id)).unwrap();
         assert_eq!(threads.len(), 1);
+
+        let edited = state
+            .edit_thread_message(&thread.id, &message.id, "edited text")
+            .unwrap();
+        assert_eq!(edited.text, "edited text");
+        let after_edit = state.get_thread(&thread.id).unwrap();
+        assert_eq!(after_edit.messages[0].text, "edited text");
+
+        let remaining = state
+            .delete_thread_message(&thread.id, &message.id)
+            .unwrap();
+        assert!(remaining.is_empty());
+    }
+
+    #[test]
+    fn test_endpoint_validation_security() {
+        assert!(client::validated_endpoint_for_test("Ollama", None).is_ok());
+        assert!(client::validated_endpoint_for_test("OpenRouter", None).is_ok());
+        assert!(
+            client::validated_endpoint_for_test("OpenRouter", Some("http://192.168.1.5:8000"))
+                .is_err()
+        );
+        assert!(
+            client::validated_endpoint_for_test(
+                "OpenRouter",
+                Some("https://openrouter.ai/api/v1/chat/completions")
+            )
+            .is_ok()
+        );
+        assert!(
+            client::validated_endpoint_for_test("Ollama", Some("http://localhost:11434/api/chat"))
+                .is_ok()
+        );
+        assert!(
+            client::validated_endpoint_for_test("Ollama", Some("http://127.0.0.1:11434/api/chat"))
+                .is_ok()
+        );
     }
 }

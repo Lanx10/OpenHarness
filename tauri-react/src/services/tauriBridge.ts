@@ -1,4 +1,5 @@
 import { Channel, invoke, isTauri } from '@tauri-apps/api/core';
+import { listen, type UnlistenFn } from '@tauri-apps/api/event';
 import { open as openDialog } from '@tauri-apps/plugin-dialog';
 import { getCurrentWindow } from '@tauri-apps/api/window';
 
@@ -181,25 +182,52 @@ export async function apiCreateProject(name: string, path?: string | null): Prom
   persistStoredProjects(localProjects);
   return created;
 }
-export type StreamChunkLike = { text: string; done: boolean; error?: string | null };
+export async function apiCancelChatStream(streamId?: string): Promise<void> {
+  if (isTauri()) await invoke('cancel_chat_stream', { streamId: streamId || null });
+}
+
+export type ApprovalRequestLike = {
+  id: string;
+  tool: string;
+  arguments: Record<string, unknown>;
+};
+
+export type StreamChunkLike = {
+  text: string;
+  done: boolean;
+  error?: string | null;
+  approval?: ApprovalRequestLike | null;
+};
 
 export async function apiChatStream(
   prompt: string,
   modelId: string,
   provider: string,
+  projectId?: string,
   threadId?: string,
+  attachments?: string[],
   onToken?: (token: string) => void,
   onDone?: () => void,
-  onError?: (error: string) => void
+  onError?: (error: string) => void,
+  onApproval?: (approval: ApprovalRequestLike) => void,
 ): Promise<void> {
   if (isTauri()) {
     const channel = new Channel<StreamChunkLike>();
     channel.onmessage = (message) => {
       if (message.error) onError?.(message.error);
       if (message.text) onToken?.(message.text);
+      if (message.approval) onApproval?.(message.approval);
       if (message.done) onDone?.();
     };
-    await invoke('chat_send_stream', { prompt, modelId, provider, threadId: threadId ?? null, channel });
+    await invoke('chat_send_stream', {
+      prompt,
+      modelId,
+      provider,
+      projectId: projectId ?? null,
+      threadId: threadId ?? null,
+      attachments: attachments ?? null,
+      channel,
+    });
     return;
   }
   const text = `Local OpenHarness Assistant (${modelId}):\n\nProcessing "${prompt.trim()}". Configure a provider for live inference.`;
@@ -207,7 +235,7 @@ export async function apiChatStream(
   onDone?.();
 }
 
-export type ChatMessageLike = { id: string; role: string; text: string };
+export type ChatMessageLike = { id: string; role: string; text: string; attachments?: string[] };
 export type ChatThreadLike = { id: string; project_id: string; title: string; messages: ChatMessageLike[] };
 
 export async function apiListThreads(projectId?: string): Promise<ChatThreadLike[]> {
@@ -240,6 +268,23 @@ export async function apiAppendMessage(threadId: string, role: string, text: str
   return { id: `msg-${Date.now()}`, role, text };
 }
 
+export async function apiEditMessage(
+  threadId: string,
+  messageId: string,
+  text: string
+): Promise<ChatMessageLike> {
+  if (isTauri()) return invoke('edit_thread_message', { threadId, messageId, text });
+  return { id: messageId, role: 'user', text };
+}
+
+export async function apiDeleteMessage(
+  threadId: string,
+  messageId: string
+): Promise<ChatMessageLike[]> {
+  if (isTauri()) return invoke('delete_thread_message', { threadId, messageId });
+  return [];
+}
+
 export async function apiRenameProject(id: string, name: string): Promise<ProjectInfo[]> {
   if (isTauri()) return invoke('rename_project', { id, name });
   return [];
@@ -253,6 +298,73 @@ export async function apiDeleteProject(id: string): Promise<ProjectInfo[]> {
 export async function apiRelinkProject(id: string, path: string | null): Promise<ProjectInfo[]> {
   if (isTauri()) return invoke('relink_project', { id, path });
   return [];
+}
+
+export async function apiWorkspaceReadFile(projectId: string, path: string, offset?: number, limit?: number): Promise<string> {
+  if (!isTauri()) throw new Error('Workspace tools require the desktop app');
+  return invoke('workspace_read_file', { projectId, path, offset: offset ?? null, limit: limit ?? null });
+}
+
+export async function apiWorkspaceListDir(projectId: string, path?: string): Promise<FileEntryLike[]> {
+  if (!isTauri()) throw new Error('Workspace tools require the desktop app');
+  return invoke('workspace_list_dir', { projectId, path: path ?? null });
+}
+
+export async function apiWorkspaceGrep(projectId: string, query: string, pattern?: string): Promise<GrepMatchLike[]> {
+  if (!isTauri()) throw new Error('Workspace tools require the desktop app');
+  return invoke('workspace_grep', { projectId, query, pattern: pattern ?? null });
+}
+
+export async function apiGitStatus(projectId: string): Promise<string> {
+  if (!isTauri()) throw new Error('Git context requires the desktop app');
+  return invoke('workspace_git_status', { projectId });
+}
+
+export async function apiGitDiff(projectId: string, staged = false): Promise<string> {
+  if (!isTauri()) throw new Error('Git context requires the desktop app');
+  return invoke('workspace_git_diff', { projectId, staged });
+}
+
+export async function apiGitLog(projectId: string, limit = 10): Promise<string> {
+  if (!isTauri()) throw new Error('Git context requires the desktop app');
+  return invoke('workspace_git_log', { projectId, limit });
+}
+
+export type FileEntryLike = {name: string; path: string; is_dir: boolean; size: number};
+export type GrepMatchLike = {file: string; line_number: number; line_text: string};
+
+export async function apiTerminalCreate(projectId: string | null, shell: 'powershell' | 'cmd'): Promise<string> {
+  if (!isTauri()) throw new Error('Terminal requires the desktop app');
+  return invoke('terminal_create', { projectId, shell });
+}
+
+export async function apiTerminalWrite(id: string, data: string): Promise<void> {
+  if (!isTauri()) throw new Error('Terminal requires the desktop app');
+  await invoke('terminal_write', { id, data });
+}
+
+export async function apiTerminalKill(id: string): Promise<void> {
+  if (!isTauri()) return;
+  await invoke('terminal_kill', { id });
+}
+
+export async function apiListenTerminalOutput(handler: (id: string, data: string) => void): Promise<UnlistenFn> {
+  if (!isTauri()) return () => {};
+  return listen<{id: string; data: string}>('terminal-output', event => handler(event.payload.id, event.payload.data));
+}
+
+export async function apiListenTerminalExit(handler: (id: string, code: number | null) => void): Promise<UnlistenFn> {
+  if (!isTauri()) return () => {};
+  return listen<{id: string; code: number | null}>('terminal-exit', event => handler(event.payload.id, event.payload.code));
+}
+
+export async function apiRespondToToolApproval(
+  id: string,
+  allowed: boolean,
+  response?: string,
+): Promise<void> {
+  if (!isTauri()) throw new Error('Tool approval requires the desktop app');
+  await invoke('respond_to_tool_approval', { reply: { id, allowed, response: response ?? null } });
 }
 
 export async function apiChatSend(

@@ -153,7 +153,7 @@ export function Composer() {
         id="prompt"
         rows={2}
         aria-label="Message"
-        placeholder="Ask anything, or describe what you want to build…"
+        placeholder="Message OpenHarness…  (Enter to send, Shift+Enter for a new line)"
         value={prompt}
         onChange={(e) => setPrompt(e.target.value)}
         onKeyDown={(e) => {
@@ -165,7 +165,7 @@ export function Composer() {
       />
       <div className="composer-row">
         <input ref={fileInputRef} type="file" multiple style={{display:'none'}} onChange={(e) => { void handleFiles(e.target.files); e.target.value = ''; }} />
-        <button className="model-button" type="button" aria-label="Attach files" onClick={() => fileInputRef.current?.click()}>
+        <button className="model-button" type="button" aria-label="Attach files" title="Attach files" onClick={() => fileInputRef.current?.click()}>
           <PaperClipIcon width={16} height={16} aria-hidden="true" />
         </button>
         <span className="composer-spacer" />

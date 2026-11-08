@@ -1,18 +1,14 @@
-import {useEffect, useState} from 'react';
+import {useEffect, useRef, useState} from 'react';
 import {isTauri} from '@tauri-apps/api/core';
 import {
   ArrowPathIcon, ArrowTopRightOnSquareIcon,
-  ChevronRightIcon, InformationCircleIcon, MagnifyingGlassIcon,
-  QuestionMarkCircleIcon, ServerIcon, XMarkIcon, TrashIcon,
+  MagnifyingGlassIcon, ServerIcon, XMarkIcon, TrashIcon,
 } from '@heroicons/react/20/solid';
-import {apiDeleteProvider, apiListProviders, apiSaveProvider, apiTestProviderConnection, type ProviderInfo} from '../../services/tauriBridge';
+import {apiDeleteProvider, apiListProviders, apiSaveProvider, type ProviderInfo} from '../../services/tauriBridge';
 
 type SettingsPageProps = {onClose: () => void; initialSection?: string};
-type Provider = {name: string; icon: string; tone: string};
 
-const providers: Provider[] = [];
-
-const sections = ['Model Providers', 'Update'];
+const sections = ['Providers', 'Update'];
 const providerOptions = ['OpenRouter', 'Google AI Studio', 'Ollama'];
 
 const providerDocs: Record<string, string> = {
@@ -21,7 +17,7 @@ const providerDocs: Record<string, string> = {
   'Ollama': 'https://ollama.com/library',
 };
 
-function ProviderForm({onBack, onSaved}: {onBack: () => void; onSaved: (provider: ProviderInfo) => void}) {
+function ProviderForm({onBack, onSaved}: {onBack: () => void; onSaved: () => void}) {
   const [provider, setProvider] = useState(providerOptions[0]);
   const [apiKey, setApiKey] = useState('');
   const [modelId, setModelId] = useState('');
@@ -29,29 +25,11 @@ function ProviderForm({onBack, onSaved}: {onBack: () => void; onSaved: (provider
   const [customEndpoint, setCustomEndpoint] = useState(false);
   const [advanced, setAdvanced] = useState(false);
   const [saving, setSaving] = useState(false);
-  const [testing, setTesting] = useState(false);
   const [error, setError] = useState('');
 
-  const testConnection = async () => {
-    if (!apiKey.trim() || !modelId.trim()) {
-      setError('Enter an API key and Model ID before testing.');
-      return;
-    }
-    setTesting(true);
-    setError('');
-    try {
-      const result = await apiTestProviderConnection(provider, modelId.trim(), customEndpoint ? baseUrl.trim() : null, apiKey);
-      setError(result);
-    } catch (err) {
-      setError(String(err));
-    } finally {
-      setTesting(false);
-    }
-  };
-
   const saveProvider = async () => {
-    if (!apiKey.trim() || !modelId.trim()) {
-      setError('Enter an API key and Model ID before saving.');
+    if ((provider !== 'Ollama' && !apiKey.trim()) || !modelId.trim()) {
+      setError(provider === 'Ollama' ? 'Enter a Model ID before saving.' : 'Enter an API key and Model ID before saving.');
       return;
     }
     if (customEndpoint) {
@@ -70,10 +48,10 @@ function ProviderForm({onBack, onSaved}: {onBack: () => void; onSaved: (provider
     setSaving(true);
     setError('');
     try {
-      const saved = await apiSaveProvider(provider, modelId.trim(), customEndpoint ? baseUrl.trim() : null, customEndpoint, apiKey);
+      await apiSaveProvider(provider, modelId.trim(), customEndpoint ? baseUrl.trim() : null, customEndpoint, apiKey);
       setApiKey('');
       window.dispatchEvent(new Event('openharness:provider-saved'));
-      onSaved(saved);
+      onSaved();
     } catch (err) {
       setError(String(err));
     } finally {
@@ -83,31 +61,30 @@ function ProviderForm({onBack, onSaved}: {onBack: () => void; onSaved: (provider
 
   return (
     <div className="provider-form">
-      <div className="provider-form-header"><ServerIcon width={19}/><strong>API providers</strong><QuestionMarkCircleIcon width={15} className="help-icon"/></div>
+      <div className="provider-form-header"><ServerIcon width={19}/><strong>Add provider</strong></div>
       <label className="field-label" htmlFor="provider-select">Provider</label>
       <div className="provider-select-row">
         <select id="provider-select" value={provider} onChange={event => {setProvider(event.target.value); setError('');}}>
           {providerOptions.map(option => <option key={option}>{option}</option>)}
         </select>
-        <a className="provider-setup" href={providerDocs[provider]} target="_blank" rel="noreferrer">{provider} setup <ArrowTopRightOnSquareIcon width={13}/></a>
+        <a className="provider-setup" href={providerDocs[provider]} target="_blank" rel="noreferrer">Docs <ArrowTopRightOnSquareIcon width={13}/></a>
       </div>
-
-      <label className="field-label" htmlFor="provider-key">API key <QuestionMarkCircleIcon width={14} className="help-icon"/></label>
-      <input id="provider-key" type="password" value={apiKey} onChange={event => {setApiKey(event.target.value); setError('');}} placeholder="Paste your API key" autoComplete="new-password" spellCheck={false}/>
-
-      <label className="field-label" htmlFor="provider-model">Model ID <QuestionMarkCircleIcon width={14} className="help-icon"/></label>
-      <input className="wide-input" id="provider-model" value={modelId} onChange={event => {setModelId(event.target.value); setError('');}} placeholder="provider/model-name" autoComplete="off"/>
-
-      <button className="advanced-toggle" type="button" aria-expanded={advanced} onClick={() => setAdvanced(value => !value)}>
-        <ChevronRightIcon width={14} className={advanced ? 'rotate' : ''}/> Advanced settings
-      </button>
-      {advanced && <div className="advanced-panel"><label>Full API endpoint URL<input className="wide-input" value={baseUrl} placeholder="https://openrouter.ai/api/v1/chat/completions" onChange={(event) => {setBaseUrl(event.target.value); setError('');}}/></label><label className="check-row"><input type="checkbox" checked={customEndpoint} onChange={(event) => setCustomEndpoint(event.target.checked)}/> Send requests through a custom endpoint</label></div>}
-
+      <label className="field-label" htmlFor="model-id">Model ID</label>
+      <input id="model-id" value={modelId} onChange={event => setModelId(event.target.value)} placeholder="e.g. google/gemini-2.5-flash-lite" />
+      <label className="field-label" htmlFor="api-key">API key</label>
+      <input id="api-key" type="password" value={apiKey} onChange={event => setApiKey(event.target.value)} placeholder="Paste your API key" />
+      <button className="advanced-toggle" type="button" aria-expanded={advanced} onClick={() => setAdvanced(value => !value)}>Advanced endpoint settings {advanced ? '▾' : '▸'}</button>
+      {advanced && (
+        <div className="advanced-panel">
+          <label><input type="checkbox" checked={customEndpoint} onChange={event => setCustomEndpoint(event.target.checked)} /> Use custom endpoint</label>
+          <label>Endpoint URL<input value={baseUrl} onChange={event => setBaseUrl(event.target.value)} placeholder="https://…" disabled={!customEndpoint} /></label>
+        </div>
+      )}
+      {error && <div role="alert" className="provider-form-error">{error}</div>}
       <div className="provider-form-footer">
-        <span role={error ? 'alert' : 'status'}>{error || 'API key saved in the OS credential store.'}</span>
+        <span>Keys are stored through your operating system&rsquo;s secure credential store.</span>
         <div>
-          <button className="back-button" type="button" onClick={() => void testConnection()} disabled={testing || saving}>{testing ? 'Testing…' : 'Test connection'}</button>
-          <button className="save-provider" type="button" onClick={() => void saveProvider()} disabled={saving}>{saving ? 'Saving…' : 'Save provider'}</button>
+          <button className="save-provider" type="button" onClick={() => void saveProvider()} disabled={saving}>{saving ? 'Saving…' : 'Save'}</button>
           <button className="back-button" type="button" onClick={onBack}>Back</button>
         </div>
       </div>
@@ -116,28 +93,49 @@ function ProviderForm({onBack, onSaved}: {onBack: () => void; onSaved: (provider
 }
 
 function ProviderList({items, onAdd, onDelete}: {items: ProviderInfo[]; onAdd: () => void; onDelete: (provider: string) => void}) {
+  const [pending, setPending] = useState<string | null>(null);
+  if (items.length === 0) {
+    return (
+      <div className="provider-emptystate">
+        <p>No providers configured yet.</p>
+        <button type="button" className="save-provider" onClick={onAdd}>Add provider</button>
+      </div>
+    );
+  }
   return (
     <div className="provider-list">
-      {items.length === 0 ? <h3>No API providers yet <QuestionMarkCircleIcon width={14} className="help-icon"/></h3> : items.map((item) => (
+      {items.map((item) => (
         <div className="saved-provider" key={item.provider}>
-          <div><strong>{item.provider}</strong><small>{item.model_id}{item.has_key ? ' · Key secured' : ' · Missing key'}</small></div>
-          <button type="button" className="iconbtn" aria-label={`Remove ${item.provider}`} onClick={() => onDelete(item.provider)}><TrashIcon width={16}/></button>
+          <div>
+            <strong>{item.provider}</strong>
+            <small>{item.model_id}{item.has_key ? ' · Key secured' : ' · Missing key'}</small>
+          </div>
+          {pending === item.provider ? (
+            <div className="provider-delete-confirm">
+              <span>Remove?</span>
+              <button type="button" onClick={() => { void (async () => { await onDelete(item.provider); setPending(null); })(); }}>Remove</button>
+              <button type="button" className="back-button" onClick={() => setPending(null)}>Cancel</button>
+            </div>
+          ) : (
+            <button type="button" className="iconbtn" aria-label={`Remove ${item.provider}`} onClick={() => setPending(item.provider)}><TrashIcon width={16}/></button>
+          )}
         </div>
       ))}
-      <button className="add-provider" onClick={onAdd}>Add provider</button>
+      <button className="add-provider" onClick={onAdd}>+ Add provider</button>
     </div>
   );
 }
 
-export function SettingsPage({onClose, initialSection = 'Model Providers'}: SettingsPageProps) {
+export function SettingsPage({onClose, initialSection = 'Providers'}: SettingsPageProps) {
   const [selectedSection, setSelectedSection] = useState(initialSection);
   const [providerView, setProviderView] = useState<'list' | 'form'>('list');
   const [search, setSearch] = useState('');
-  const [selectedSource, setSelectedSource] = useState('API providers');
   const [savedProviders, setSavedProviders] = useState<ProviderInfo[]>([]);
   const [providerError, setProviderError] = useState('');
   const [updateStatus, setUpdateStatus] = useState('');
   const [checkingUpdate, setCheckingUpdate] = useState(false);
+  const closeRef = useRef<HTMLButtonElement | null>(null);
+  const openerRef = useRef<Element | null>(null);
 
   useEffect(() => {
     const closeOnEscape = (event: KeyboardEvent) => {
@@ -148,13 +146,24 @@ export function SettingsPage({onClose, initialSection = 'Model Providers'}: Sett
   }, [onClose]);
 
   useEffect(() => {
+    openerRef.current = document.activeElement;
+    const close = closeRef.current;
+    if (close) close.focus();
+    return () => {
+      if (openerRef.current && 'focus' in openerRef.current) (openerRef.current as HTMLElement).focus();
+    };
+  }, []);
+
+  useEffect(() => {
     let cancelled = false;
     apiListProviders().then(items => { if (!cancelled) setSavedProviders(items); }).catch(error => { if (!cancelled) setProviderError(String(error)); });
     return () => { cancelled = true; };
   }, []);
 
   const visibleSections = sections.filter(section => section.toLowerCase().includes(search.toLowerCase()));
-  const activeSection = visibleSections.includes(selectedSection) ? selectedSection : (visibleSections[0] ?? 'Model Providers');
+  const activeSection = visibleSections.includes(selectedSection) ? selectedSection : (visibleSections[0] ?? '');
+  const noResults = search.trim() !== '' && visibleSections.length === 0;
+
   const updateProviders = async () => {
     try {
       setSavedProviders(await apiListProviders());
@@ -200,42 +209,50 @@ export function SettingsPage({onClose, initialSection = 'Model Providers'}: Sett
   };
 
   return (
-    <div className="settings-page" role="dialog" aria-modal="true" aria-label="OpenHarness settings">
-      <aside className="settings-rail">
-        <button type="button" className="settings-home" aria-label="Home" title="Home" onClick={() => {onClose(); window.dispatchEvent(new Event('openharness:home'));}}><svg viewBox="0 0 20 20" width="17" height="17" fill="currentColor" aria-hidden="true"><path d="M10 2.8 2.5 9v8a.8.8 0 0 0 .8.8h4.3v-5.2h4.8v5.2h4.3a.8.8 0 0 0 .8-.8V9L10 2.8Z"/></svg></button>
-        <button type="button" className="settings-gear active" aria-label="Settings" title="Settings" onClick={onClose}><svg viewBox="0 0 20 20" width="18" height="18" fill="currentColor" aria-hidden="true"><path fillRule="evenodd" d="M8.34 1.804A1 1 0 0 1 9.32 1h1.36a1 1 0 0 1 .98.804l.295 1.473c.497.144.971.342 1.409.582l1.304-.75a1 1 0 0 1 1.225.216l.962.962a1 1 0 0 1 .216 1.225l-.75 1.304c.24.438.438.912.582 1.409l1.473.295a1 1 0 0 1 .804.98v1.36a1 1 0 0 1-.804.98l-1.473.295a6.95 6.95 0 0 1-.582 1.409l.75 1.304a1 1 0 0 1-.216 1.225l-.962.962a1 1 0 0 1-1.225.216l-1.304-.75a6.97 6.97 0 0 1-1.409.582l-.295 1.473a1 1 0 0 1-.98.804H9.32a1 1 0 0 1-.98-.804l-.295-1.473a6.97 6.97 0 0 1-1.409-.582l-1.304.75a1 1 0 0 1-1.225-.216l-.962-.962a1 1 0 0 1-.216-1.225l.75-1.304a6.95 6.95 0 0 1-.582-1.409l-1.473-.295A1 1 0 0 1 1 10.68V9.32a1 1 0 0 1 .804-.98l1.473-.295c.144-.497.342-.971.582-1.409l-.75-1.304a1 1 0 0 1 .216-1.225l.962-.962a1 1 0 0 1 1.225-.216l1.304.75c.438-.24.912-.438 1.409-.582l.295-1.473ZM10 13a3 3 0 1 0 0-6 3 3 0 0 0 0 6Z" clipRule="evenodd"/></svg></button>
-      </aside>
+    <div className="settings-modal-backdrop" onClick={onClose}>
+      <div className="settings-page settings-modal" role="dialog" aria-modal="true" aria-label="Settings" onClick={e => e.stopPropagation()}>
+      <button ref={closeRef} className="settings-close settings-modal-close" type="button" aria-label="Close settings" title="Close settings" onClick={onClose}><XMarkIcon width={16}/></button>
       <aside className="settings-nav">
-        <div className="settings-brand"><span className="settings-brand-mark" aria-hidden="true">OH</span><span className="settings-brand-name">OpenHarness</span></div>
-        <div className="settings-nav-header"><h2>Settings</h2><button className="settings-close" type="button" aria-label="Close settings" title="Close settings" onClick={onClose}><XMarkIcon width={16}/></button></div>
+        <div className="settings-nav-header"><h2>Settings</h2></div>
         <label className="settings-search"><MagnifyingGlassIcon width={15}/><input value={search} onChange={event => setSearch(event.target.value)} placeholder="Search settings" aria-label="Search settings"/></label>
-        <nav>{ visibleSections.map(section => (
-          <button key={section} className={activeSection === section ? 'settings-nav-item active' : 'settings-nav-item'} onClick={() => {setSelectedSection(section); setProviderView('list');}}>{section}</button>
-        ))}</nav>
+        <nav>
+          {noResults ? <p className="settings-nav-empty">No matching settings.</p>
+            : visibleSections.map(section => (
+              <button key={section} className={activeSection === section ? 'settings-nav-item active' : 'settings-nav-item'} onClick={() => {setSelectedSection(section); setProviderView('list');}}>
+                {section}
+                {section === 'Providers' && savedProviders.length > 0 && <span className="nav-count">{savedProviders.length}</span>}
+              </button>
+            ))}
+        </nav>
       </aside>
       <main className="settings-content">
-        {activeSection === 'Model Providers' ? <>
-          <h1>Model Providers</h1>
+        {activeSection === 'Providers' ? <>
+          <section className="settings-section-heading"><h1>Providers</h1><p>Connect a service to choose which models power your conversations.</p></section>
           <div className="providers-card">
-            <div className="provider-sources">
-              {providers.map(item => <button className="provider-source disabled-source" key={item.name} type="button" disabled><span className={`source-logo ${item.tone}`}>{item.icon}</span><span className="source-label"><strong>{item.name}</strong><small><i/> Not connected</small></span></button>)}
-              <button className={`provider-source api-source ${selectedSource === 'API providers' ? 'selected' : ''}`} onClick={() => setSelectedSource('API providers')}><ServerIcon width={17}/><span className="source-label"><strong>API providers</strong><small><i/> {savedProviders.length ? `${savedProviders.length} configured` : 'None added'}</small></span><ChevronRightIcon width={15}/></button>
-            </div>
             <section className="provider-detail">
-              {providerView === 'list' ? <><div className="detail-title"><ServerIcon width={18}/><strong>API providers</strong><QuestionMarkCircleIcon width={14} className="help-icon"/></div><ProviderList items={savedProviders} onAdd={() => setProviderView('form')} onDelete={async provider => {await apiDeleteProvider(provider); await updateProviders();}}/><span role="alert">{providerError}</span></> : <ProviderForm onBack={() => setProviderView('list')} onSaved={async () => {await updateProviders(); setProviderView('list');}}/>}
+              {providerView === 'list' ? <>
+                <ProviderList items={savedProviders} onAdd={() => setProviderView('form')} onDelete={async provider => {await apiDeleteProvider(provider); await updateProviders(); window.dispatchEvent(new Event('openharness:provider-saved'));}}/>
+                {providerError && <span role="alert" className="provider-error">{providerError}</span>}
+              </> : <ProviderForm onBack={() => setProviderView('list')} onSaved={async () => {await updateProviders(); setProviderView('list');}}/>}
             </section>
           </div>
-        </> : <>
-          <div className="settings-section-heading"><h1>OpenHarness updates</h1><span>Desktop update preferences</span></div>
+        </> : activeSection === 'Update' ? <>
+          <section className="settings-section-heading"><h1>Updates</h1><p>Desktop application updater</p></section>
           <section className="update-panel">
-            <div className="updates-icon"><ArrowPathIcon width={20}/></div>
-            <h2>App updates</h2>
-            <p>Update availability is provided by the desktop application.</p>
-            <div className="update-row"><span className="update-status">{updateStatus || 'Check for the latest version of OpenHarness.'}</span><button className="check-updates" onClick={checkForUpdates} disabled={checkingUpdate} title="Check for updates">{checkingUpdate ? 'Checking…' : 'Check for updates'}</button></div>
+            <div className="updates-row">
+              <div className="updates-icon"><ArrowPathIcon width={18}/></div>
+              <div className="updates-copy"><h2>App updates</h2><p>Update availability is provided by the desktop application.</p></div>
+            </div>
+            <div className="update-row">
+              <span className="update-status">{updateStatus || 'Check for the latest version of OpenHarness.'}</span>
+              <button className="check-updates" onClick={checkForUpdates} disabled={checkingUpdate} title="Check for updates">{checkingUpdate ? 'Checking…' : 'Check for updates'}</button>
+            </div>
           </section>
-          <section className="update-panel"><InformationCircleIcon width={18} className="help-icon"/><p>Settings sync and provider integrations will be available in future updates.</p></section>
-        </>}
+        </> : (
+          <section className="settings-section-heading"><h1>Providers</h1><p>Section not found.</p></section>
+        )}
       </main>
+      </div>
     </div>
   );
 }

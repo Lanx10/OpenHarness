@@ -2,25 +2,113 @@ use futures_util::StreamExt;
 use serde_json::Value;
 use std::time::Duration;
 
+#[derive(Clone, Debug)]
+pub struct ModelMessage {
+    pub role: String,
+    pub content: String,
+}
+
+impl ModelMessage {
+    pub fn new(role: &str, content: &str) -> Self {
+        Self {
+            role: match role {
+                "assistant" => "assistant",
+                "system" => "system",
+                _ => "user",
+            }
+            .to_string(),
+            content: content.to_string(),
+        }
+    }
+}
+
+const MAX_ERROR_BODY_CHARS: usize = 512;
+const MAX_RESPONSE_BYTES: usize = 1_000_000;
+
+fn safe_error_body(body: &str) -> String {
+    body.chars().take(MAX_ERROR_BODY_CHARS).collect()
+}
+
+fn messages_json(messages: &[ModelMessage]) -> Vec<Value> {
+    messages
+        .iter()
+        .map(|message| serde_json::json!({"role": message.role, "content": message.content}))
+        .collect()
+}
+
+fn endpoint_url(provider: &str, custom: Option<&str>) -> Result<String, String> {
+    let default_url = match provider {
+        "Ollama" => "http://localhost:11434/api/chat",
+        "OpenRouter" => "https://openrouter.ai/api/v1/chat/completions",
+        "Google AI Studio" => {
+            "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions"
+        }
+        _ => return Err(format!("Unsupported provider: {}", provider)),
+    };
+    let Some(url) = custom else {
+        return Ok(default_url.to_string());
+    };
+    let parsed = reqwest::Url::parse(url).map_err(|_| format!("Invalid endpoint URL: {}", url))?;
+    let host = parsed
+        .host_str()
+        .ok_or_else(|| "Endpoint URL must include a host".to_string())?;
+    let private_or_local = match host.parse::<std::net::IpAddr>() {
+        Ok(std::net::IpAddr::V4(ip)) => {
+            let octets = ip.octets();
+            ip.is_loopback()
+                || ip.is_multicast()
+                || octets[0] == 10
+                || octets[0] == 127
+                || (octets[0] == 172 && (16..=31).contains(&octets[1]))
+                || (octets[0] == 192 && octets[1] == 168)
+                || (octets[0] == 169 && octets[1] == 254)
+        }
+        Ok(std::net::IpAddr::V6(ip)) => {
+            ip.is_loopback()
+                || ip.is_multicast()
+                || ip.is_unique_local()
+                || ip.is_unicast_link_local()
+        }
+        Err(_) => host == "localhost" || host.ends_with(".local"),
+    };
+    match parsed.scheme() {
+        "http" if private_or_local && provider == "Ollama" => Ok(parsed.to_string()),
+        "https" => match (private_or_local, provider == "Ollama") {
+            (true, false) => {
+                Err("Non-Ollama providers cannot use private or internal endpoints".to_string())
+            }
+            _ => Ok(parsed.to_string()),
+        },
+        _ => Err(format!(
+            "Endpoint URL must use HTTPS; Ollama local endpoints may use HTTP. Provided: {}",
+            parsed
+        )),
+    }
+}
+
+pub fn validated_endpoint_for_test(provider: &str, custom: Option<&str>) -> Result<String, String> {
+    endpoint_url(provider, custom)
+}
+
 pub async fn query_llm(
     provider: &str,
     model_id: &str,
-    prompt: &str,
+    messages: &[ModelMessage],
     api_key: Option<&str>,
     base_url: Option<&str>,
 ) -> Result<String, String> {
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(45))
+        .redirect(reqwest::redirect::Policy::none())
         .build()
         .map_err(|e| e.to_string())?;
 
     match provider {
         "Ollama" => {
-            let default_url = "http://localhost:11434/api/chat";
-            let url = base_url.unwrap_or(default_url);
+            let url = endpoint_url(provider, base_url)?;
             let body = serde_json::json!({
                 "model": model_id,
-                "messages": [{"role": "user", "content": prompt}],
+                "messages": messages_json(messages),
                 "stream": false
             });
             let mut req = client.post(url).json(&body);
@@ -34,7 +122,10 @@ pub async fn query_llm(
 
             if !res.status().is_success() {
                 let err_text = res.text().await.unwrap_or_default();
-                return Err(format!("Ollama returned error: {}", err_text));
+                return Err(format!(
+                    "Ollama returned error: {}",
+                    safe_error_body(&err_text)
+                ));
             }
 
             let json: Value = res
@@ -48,18 +139,10 @@ pub async fn query_llm(
         }
         _ => {
             let key = api_key.ok_or_else(|| format!("API key is required for {}", provider))?;
-            let default_url = match provider {
-                "OpenRouter" => "https://openrouter.ai/api/v1/chat/completions",
-                "Google AI Studio" => {
-                    "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions"
-                }
-                _ => return Err(format!("Unsupported provider: {}", provider)),
-            };
-            let url = base_url.unwrap_or(default_url);
-
+            let url = endpoint_url(provider, base_url)?;
             let body = serde_json::json!({
                 "model": model_id,
-                "messages": [{"role": "user", "content": prompt}]
+                "messages": messages_json(messages)
             });
 
             let res = client
@@ -73,7 +156,11 @@ pub async fn query_llm(
 
             if !res.status().is_success() {
                 let err_text = res.text().await.unwrap_or_default();
-                return Err(format!("{} returned error: {}", provider, err_text));
+                return Err(format!(
+                    "{} returned error: {}",
+                    provider,
+                    safe_error_body(&err_text)
+                ));
             }
 
             let json: Value = res
@@ -91,22 +178,23 @@ pub async fn query_llm(
 pub async fn query_llm_stream(
     provider: &str,
     model_id: &str,
-    prompt: &str,
+    messages: &[ModelMessage],
     api_key: Option<&str>,
     base_url: Option<&str>,
     on_token: impl Fn(String) + Send + Sync + 'static,
 ) -> Result<String, String> {
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(120))
+        .redirect(reqwest::redirect::Policy::none())
         .build()
         .map_err(|e| e.to_string())?;
 
     match provider {
         "Ollama" => {
-            let url = base_url.unwrap_or("http://localhost:11434/api/chat");
+            let url = endpoint_url(provider, base_url)?;
             let body = serde_json::json!({
                 "model": model_id,
-                "messages": [{"role": "user", "content": prompt}],
+                "messages": messages_json(messages),
                 "stream": true
             });
             let mut req = client.post(url).json(&body);
@@ -119,13 +207,20 @@ pub async fn query_llm_stream(
                 .map_err(|e| format!("Failed to connect to Ollama (is it running?): {}", e))?;
             if !res.status().is_success() {
                 let err_text = res.text().await.unwrap_or_default();
-                return Err(format!("Ollama returned error: {}", err_text));
+                return Err(format!(
+                    "Ollama returned error: {}",
+                    safe_error_body(&err_text)
+                ));
             }
             let mut stream = res.bytes_stream();
             let mut accumulated = String::new();
             while let Some(chunk) = stream.next().await {
                 let chunk = chunk.map_err(|e| e.to_string())?;
-                for line in String::from_utf8_lossy(&chunk).lines() {
+                if accumulated.len() + chunk.len() > MAX_RESPONSE_BYTES {
+                    return Err("Provider response exceeded the maximum allowed size".to_string());
+                }
+                let payload = String::from_utf8_lossy(&chunk);
+                for line in payload.lines() {
                     if line.trim().is_empty() {
                         continue;
                     }
@@ -149,17 +244,10 @@ pub async fn query_llm_stream(
         }
         _ => {
             let key = api_key.ok_or_else(|| format!("API key is required for {}", provider))?;
-            let default_url = match provider {
-                "OpenRouter" => "https://openrouter.ai/api/v1/chat/completions",
-                "Google AI Studio" => {
-                    "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions"
-                }
-                _ => return Err(format!("Unsupported provider: {}", provider)),
-            };
-            let url = base_url.unwrap_or(default_url);
+            let url = endpoint_url(provider, base_url)?;
             let body = serde_json::json!({
                 "model": model_id,
-                "messages": [{"role": "user", "content": prompt}],
+                "messages": messages_json(messages),
                 "stream": true
             });
             let res = client
@@ -172,14 +260,22 @@ pub async fn query_llm_stream(
                 .map_err(|e| format!("Network request failed: {}", e))?;
             if !res.status().is_success() {
                 let err_text = res.text().await.unwrap_or_default();
-                return Err(format!("{} returned error: {}", provider, err_text));
+                return Err(format!(
+                    "{} returned error: {}",
+                    provider,
+                    safe_error_body(&err_text)
+                ));
             }
             let mut stream = res.bytes_stream();
             let mut accumulated = String::new();
             let mut buffer = String::new();
             while let Some(chunk) = stream.next().await {
                 let chunk = chunk.map_err(|e| e.to_string())?;
-                buffer.push_str(&String::from_utf8_lossy(&chunk));
+                if accumulated.len() + chunk.len() > MAX_RESPONSE_BYTES {
+                    return Err("Provider response exceeded the maximum allowed size".to_string());
+                }
+                let payload = String::from_utf8_lossy(&chunk);
+                buffer.push_str(&payload);
                 while let Some(pos) = buffer.find('\n') {
                     let line = buffer[..pos].to_string();
                     buffer.drain(..=pos);

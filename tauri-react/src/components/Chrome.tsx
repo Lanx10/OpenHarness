@@ -1,12 +1,13 @@
 import {useEffect, useState} from 'react';
 import {getCurrentWindow} from '@tauri-apps/api/window';
 import {invoke, isTauri} from '@tauri-apps/api/core';
-import {XMarkIcon, PlusIcon, MinusIcon, Square2StackIcon} from '@heroicons/react/20/solid';
+import {XMarkIcon, PlusIcon, MinusIcon, Square2StackIcon, Squares2X2Icon, CommandLineIcon, GlobeAltIcon, DocumentTextIcon} from '@heroicons/react/20/solid';
 
 type Props = {onMinimize: () => void; onToggleMaximize: () => void; onClose: () => void; updateAvailable?: boolean; onOpenSettings?: () => void};
 
 export function TitleBar({onMinimize, onToggleMaximize, onClose, updateAvailable, onOpenSettings}: Props) {
   const [maximized, setMaximized] = useState(false);
+  const [toolsOpen, setToolsOpen] = useState(false);
 
   useEffect(() => {
     let unlisten: (() => void) | undefined;
@@ -86,6 +87,34 @@ export function TitleBar({onMinimize, onToggleMaximize, onClose, updateAvailable
       </div>
 
       <div className="drag-region" aria-hidden="true" data-tauri-drag-region />
+
+      <div className="window-tools-menu">
+        <button className="window-tools-trigger" type="button" aria-label="Open workspace tools" title="Workspace tools" aria-expanded={toolsOpen} aria-haspopup="menu" onClick={() => setToolsOpen(open => !open)}>
+          <Squares2X2Icon width={17} height={17} aria-hidden="true" />
+        </button>
+        {toolsOpen && <>
+          <button className="window-tools-dismiss" type="button" aria-label="Close workspace tools menu" onClick={() => setToolsOpen(false)} />
+          <div className="window-tools-popover" role="menu" aria-label="Workspace tools">
+            <button type="button" role="menuitem" onClick={() => { setToolsOpen(false); window.dispatchEvent(new CustomEvent('openharness:quick-cmd')); }}>
+              <CommandLineIcon width={17} height={17} aria-hidden="true" /><span>PowerShell terminal</span>
+            </button>
+            <button type="button" role="menuitem" onClick={() => { setToolsOpen(false); window.dispatchEvent(new CustomEvent('openharness:quick-cmdprompt')); }}>
+              <CommandLineIcon width={17} height={17} aria-hidden="true" /><span>Command Prompt</span>
+            </button>
+            <button type="button" role="menuitem" onClick={() => { setToolsOpen(false); window.dispatchEvent(new CustomEvent('openharness:quick-browser')); }}>
+              <GlobeAltIcon width={17} height={17} aria-hidden="true" /><span>Browser</span>
+            </button>
+            <button type="button" role="menuitem" onClick={() => { setToolsOpen(false); window.dispatchEvent(new CustomEvent('openharness:quick-files')); }}>
+              <DocumentTextIcon width={17} height={17} aria-hidden="true" /><span>Files</span>
+            </button>
+            <button type="button" role="menuitem" onClick={() => { setToolsOpen(false); window.dispatchEvent(new CustomEvent('openharness:quick-git')); }}>
+              <svg viewBox="0 0 16 16" width={17} height={17} fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+                <circle cx="4" cy="4" r="2" /><circle cx="4" cy="12" r="2" /><circle cx="12" cy="7" r="2" /><path d="M4 6v4M4 7.5a4.5 4.5 0 0 1 4.5-1.5H10" />
+              </svg><span>Git diff</span>
+            </button>
+          </div>
+        </>}
+      </div>
 
       <div className="window-controls" aria-label="Window controls">
         {updateAvailable && (
