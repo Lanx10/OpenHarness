@@ -211,7 +211,7 @@ impl AppState {
             None => None,
         };
         let has_key = !api_key.trim().is_empty();
-        if provider.is_empty() || model_id.is_empty() || (provider != "Ollama" && !has_key) {
+        if provider.is_empty() || model_id.is_empty() || (provider != "Ollama" && provider != "OpenAI Compatible" && !has_key) {
             return Err("Provider, model ID, and API key are required".into());
         }
 

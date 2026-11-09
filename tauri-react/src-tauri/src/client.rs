@@ -43,6 +43,7 @@ fn endpoint_url(provider: &str, custom: Option<&str>) -> Result<String, String> 
         "Google AI Studio" => {
             "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions"
         }
+        "OpenAI Compatible" => "https://api.openai.com/v1/chat/completions",
         _ => return Err(format!("Unsupported provider: {}", provider)),
     };
     let Some(url) = custom else {
@@ -72,7 +73,10 @@ fn endpoint_url(provider: &str, custom: Option<&str>) -> Result<String, String> 
         Err(_) => host == "localhost" || host.ends_with(".local"),
     };
     match parsed.scheme() {
-        "http" if private_or_local && provider == "Ollama" => Ok(parsed.to_string()),
+        "http" if private_or_local && (provider == "Ollama" || provider == "OpenAI Compatible") => {
+            Ok(parsed.to_string())
+        }
+        "https" if provider == "OpenAI Compatible" => Ok(parsed.to_string()),
         "https" => match (private_or_local, provider == "Ollama") {
             (true, false) => {
                 Err("Non-Ollama providers cannot use private or internal endpoints".to_string())
@@ -80,7 +84,7 @@ fn endpoint_url(provider: &str, custom: Option<&str>) -> Result<String, String> 
             _ => Ok(parsed.to_string()),
         },
         _ => Err(format!(
-            "Endpoint URL must use HTTPS; Ollama local endpoints may use HTTP. Provided: {}",
+            "Endpoint URL must use HTTPS; Ollama and OpenAI Compatible local endpoints may use HTTP. Provided: {}",
             parsed
         )),
     }
@@ -138,18 +142,25 @@ pub async fn query_llm(
             Ok(content.to_string())
         }
         _ => {
-            let key = api_key.ok_or_else(|| format!("API key is required for {}", provider))?;
+            let key_opt = api_key.filter(|k| !k.trim().is_empty());
+            if key_opt.is_none() && provider != "OpenAI Compatible" {
+                return Err(format!("API key is required for {}", provider));
+            }
             let url = endpoint_url(provider, base_url)?;
             let body = serde_json::json!({
                 "model": model_id,
                 "messages": messages_json(messages)
             });
 
-            let res = client
+            let mut req = client
                 .post(url)
-                .header("Authorization", format!("Bearer {}", key))
                 .header("content-type", "application/json")
-                .json(&body)
+                .json(&body);
+            if let Some(key) = key_opt {
+                req = req.header("Authorization", format!("Bearer {}", key));
+            }
+
+            let res = req
                 .send()
                 .await
                 .map_err(|e| format!("Network request failed: {}", e))?;
@@ -243,18 +254,24 @@ pub async fn query_llm_stream(
             }
         }
         _ => {
-            let key = api_key.ok_or_else(|| format!("API key is required for {}", provider))?;
+            let key_opt = api_key.filter(|k| !k.trim().is_empty());
+            if key_opt.is_none() && provider != "OpenAI Compatible" {
+                return Err(format!("API key is required for {}", provider));
+            }
             let url = endpoint_url(provider, base_url)?;
             let body = serde_json::json!({
                 "model": model_id,
                 "messages": messages_json(messages),
                 "stream": true
             });
-            let res = client
+            let mut req = client
                 .post(url)
-                .header("Authorization", format!("Bearer {}", key))
                 .header("content-type", "application/json")
-                .json(&body)
+                .json(&body);
+            if let Some(key) = key_opt {
+                req = req.header("Authorization", format!("Bearer {}", key));
+            }
+            let res = req
                 .send()
                 .await
                 .map_err(|e| format!("Network request failed: {}", e))?;

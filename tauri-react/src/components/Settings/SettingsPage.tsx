@@ -9,12 +9,13 @@ import {apiDeleteProvider, apiListProviders, apiSaveProvider, type ProviderInfo}
 type SettingsPageProps = {onClose: () => void; initialSection?: string};
 
 const sections = ['Providers', 'Update'];
-const providerOptions = ['OpenRouter', 'Google AI Studio', 'Ollama'];
+const providerOptions = ['OpenRouter', 'Google AI Studio', 'Ollama', 'OpenAI Compatible'];
 
 const providerDocs: Record<string, string> = {
   'OpenRouter': 'https://openrouter.ai/docs/quickstart',
   'Google AI Studio': 'https://ai.google.dev/gemini-api/docs/openai',
   'Ollama': 'https://ollama.com/library',
+  'OpenAI Compatible': 'https://platform.openai.com/docs/api-reference/chat/create',
 };
 
 function ProviderForm({onBack, onSaved}: {onBack: () => void; onSaved: () => void}) {
@@ -28,7 +29,7 @@ function ProviderForm({onBack, onSaved}: {onBack: () => void; onSaved: () => voi
   const [error, setError] = useState('');
 
   const saveProvider = async () => {
-    if ((provider !== 'Ollama' && !apiKey.trim()) || !modelId.trim()) {
+    if ((provider !== 'Ollama' && provider !== 'OpenAI Compatible' && !apiKey.trim()) || !modelId.trim()) {
       setError(provider === 'Ollama' ? 'Enter a Model ID before saving.' : 'Enter an API key and Model ID before saving.');
       return;
     }
@@ -64,20 +65,20 @@ function ProviderForm({onBack, onSaved}: {onBack: () => void; onSaved: () => voi
       <div className="provider-form-header"><ServerIcon width={19}/><strong>Add provider</strong></div>
       <label className="field-label" htmlFor="provider-select">Provider</label>
       <div className="provider-select-row">
-        <select id="provider-select" value={provider} onChange={event => {setProvider(event.target.value); setError('');}}>
+        <select id="provider-select" value={provider} onChange={event => { const next = event.target.value; setProvider(next); if (next === 'OpenAI Compatible') setCustomEndpoint(true); setError(''); }}>
           {providerOptions.map(option => <option key={option}>{option}</option>)}
         </select>
         <a className="provider-setup" href={providerDocs[provider]} target="_blank" rel="noreferrer">Docs <ArrowTopRightOnSquareIcon width={13}/></a>
       </div>
       <label className="field-label" htmlFor="model-id">Model ID</label>
-      <input id="model-id" value={modelId} onChange={event => setModelId(event.target.value)} placeholder="e.g. google/gemini-2.5-flash-lite" />
-      <label className="field-label" htmlFor="api-key">API key</label>
-      <input id="api-key" type="password" value={apiKey} onChange={event => setApiKey(event.target.value)} placeholder="Paste your API key" />
+      <input id="model-id" value={modelId} onChange={event => setModelId(event.target.value)} placeholder={provider === 'OpenAI Compatible' ? "e.g. gpt-4o, llama-3.3-70b, or deepseek-chat" : "e.g. google/gemini-2.5-flash-lite"} />
+      <label className="field-label" htmlFor="api-key">API key {provider === 'OpenAI Compatible' || provider === 'Ollama' ? '(optional for local endpoints)' : ''}</label>
+      <input id="api-key" type="password" value={apiKey} onChange={event => setApiKey(event.target.value)} placeholder={provider === 'OpenAI Compatible' || provider === 'Ollama' ? "Optional for local endpoints, required for remote APIs" : "Paste your API key"} />
       <button className="advanced-toggle" type="button" aria-expanded={advanced} onClick={() => setAdvanced(value => !value)}>Advanced endpoint settings {advanced ? '▾' : '▸'}</button>
       {advanced && (
         <div className="advanced-panel">
           <label><input type="checkbox" checked={customEndpoint} onChange={event => setCustomEndpoint(event.target.checked)} /> Use custom endpoint</label>
-          <label>Endpoint URL<input value={baseUrl} onChange={event => setBaseUrl(event.target.value)} placeholder="https://…" disabled={!customEndpoint} /></label>
+          <label>Endpoint URL<input value={baseUrl} onChange={event => setBaseUrl(event.target.value)} placeholder={provider === 'OpenAI Compatible' ? "https://api.openai.com/v1 or http://localhost:1234/v1" : "https://…"} disabled={!customEndpoint} /></label>
         </div>
       )}
       {error && <div role="alert" className="provider-form-error">{error}</div>}
