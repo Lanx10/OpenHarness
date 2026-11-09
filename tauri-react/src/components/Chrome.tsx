@@ -95,11 +95,8 @@ export function TitleBar({onMinimize, onToggleMaximize, onClose, updateAvailable
         {toolsOpen && <>
           <button className="window-tools-dismiss" type="button" aria-label="Close workspace tools menu" onClick={() => setToolsOpen(false)} />
           <div className="window-tools-popover" role="menu" aria-label="Workspace tools">
-            <button type="button" role="menuitem" onClick={() => { setToolsOpen(false); window.dispatchEvent(new CustomEvent('openharness:quick-cmd')); }}>
-              <CommandLineIcon width={17} height={17} aria-hidden="true" /><span>PowerShell terminal</span>
-            </button>
-            <button type="button" role="menuitem" onClick={() => { setToolsOpen(false); window.dispatchEvent(new CustomEvent('openharness:quick-cmdprompt')); }}>
-              <CommandLineIcon width={17} height={17} aria-hidden="true" /><span>Command Prompt</span>
+            <button type="button" role="menuitem" onClick={() => { setToolsOpen(false); window.dispatchEvent(new Event('openharness:quick-cmd')); }}>
+              <CommandLineIcon width={17} height={17} aria-hidden="true" /><span>Terminal</span>
             </button>
             <button type="button" role="menuitem" onClick={() => { setToolsOpen(false); window.dispatchEvent(new CustomEvent('openharness:quick-browser')); }}>
               <GlobeAltIcon width={17} height={17} aria-hidden="true" /><span>Browser</span>

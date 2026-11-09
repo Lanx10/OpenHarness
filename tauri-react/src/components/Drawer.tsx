@@ -8,7 +8,6 @@ export function Drawer() {
   const [drawerCollapsed, setDrawerCollapsed] = useState(() => {
     try { return localStorage.getItem('openharness:drawer-collapsed') === 'true'; } catch { return false; }
   });
-  const [projectsExpanded, setProjectsExpanded] = useState(true);
   const [search, setSearch] = useState('');
   const [editingId, setEditingId] = useState<string | null>(null);
   const [editingName, setEditingName] = useState('');
@@ -159,13 +158,7 @@ export function Drawer() {
         </div>
 
         <div className="actions">
-          <button
-            className="action-button new-chat-primary"
-            id="new-chat"
-            type="button"
-            data-od-id="new-chat-button"
-            onClick={() => window.dispatchEvent(new Event('openharness:new-chat'))}
-          >
+          <button className="action-button new-chat-primary" id="new-chat" type="button" data-od-id="new-chat-button" onClick={() => window.dispatchEvent(new Event('openharness:new-chat'))}>
             <PlusIcon width={14} height={14} aria-hidden="true" /> New chat
           </button>
           <button className="action-button" id="new-project" type="button" data-od-id="new-project-button" onClick={() => window.dispatchEvent(new Event('openharness:new-project'))}>
@@ -174,30 +167,8 @@ export function Drawer() {
         </div>
 
         <label className="project-search"><MagnifyingGlassIcon width={14} aria-hidden="true" /><input value={search} onChange={e => setSearch(e.target.value)} placeholder="Search projects" aria-label="Search projects"/></label>
-        <div style={{display: 'flex', alignItems: 'center', justifyContent: 'space-between', margin: '0 0 7px'}}>
-          <p className="group-heading" style={{margin: 0}}>Projects</p>
-          <button
-            type="button"
-            className="collapse-toggle-btn"
-            onClick={() => setProjectsExpanded(v => !v)}
-            aria-label={projectsExpanded ? "Collapse projects" : "Expand projects"}
-            title={projectsExpanded ? "Collapse projects" : "Expand projects"}
-            style={{
-              background: 'transparent',
-              border: 0,
-              color: 'var(--muted)',
-              cursor: 'pointer',
-              display: 'grid',
-              placeItems: 'center',
-              padding: '2px 4px',
-              borderRadius: 4
-            }}
-          >
-            {projectsExpanded ? <ChevronLeftIcon width={14} height={14} style={{transform: 'rotate(-90deg)'}} /> : <ChevronRightIcon width={14} height={14} style={{transform: 'rotate(90deg)'}} />}
-          </button>
-        </div>
-        {projectsExpanded && (
-          <div className="project-list" id="project-list" role="list">
+        <p className="group-heading projects-heading">Projects</p>
+        <div className="project-list" id="project-list" role="list">
             {projects.length === 0 ? (
               <div className="empty-state" style={{padding: '16px 14px', fontSize: '12px', color: '#94a3b8'}}>
                 No projects yet. Click "+ New project" above to open a local project folder.
@@ -209,14 +180,13 @@ export function Drawer() {
                   role="listitem"
                   data-project={project.name}
                   className={`project ${project.active ? 'selected project-active' : ''}`}
-                  title={project.path || project.name}
+                  title={project.name}
                   onClick={() => void selectProject(project)}
                 >
                   <span className="project-top">
                     <FolderIcon width={14} height={14} aria-hidden="true" />
                     <span className="project-name">{project.name}</span>
                   </span>
-                  <span className="project-subtitle">{project.path ? project.path : project.subtitle}</span>
                 </button>
                 <div className="project-actions">
                   <button type="button" aria-label={`Rename ${project.name}`} title="Rename project" onClick={() => { setEditingId(project.id); setEditingName(project.name); }}><PencilIcon width={12}/></button>
@@ -232,7 +202,6 @@ export function Drawer() {
               </div>
             ))}
           </div>
-        )}
         <div className="drawer-foot"><span className="group-heading">Workspace · Local</span></div>
         </>}
       </aside>

@@ -1,4 +1,6 @@
-# Logs/transcripts/generated
+# Build outputs and installers
+dist-installers/
+dist/
 *.log
 transcript.json
 usage.json

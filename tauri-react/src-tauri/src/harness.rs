@@ -4,6 +4,11 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
+#[cfg(target_os = "windows")]
+use std::os::windows::process::CommandExt;
+#[cfg(target_os = "windows")]
+const CREATE_NO_WINDOW: u32 = 0x08000000;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FileEntry {
     pub name: String,
@@ -397,6 +402,9 @@ impl ExecutionEngine {
             c
         };
 
+        #[cfg(target_os = "windows")]
+        cmd.creation_flags(CREATE_NO_WINDOW);
+
         cmd.current_dir(root)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
@@ -446,7 +454,10 @@ pub struct GitContext;
 
 impl GitContext {
     pub fn status(root: &Path) -> Result<String, String> {
-        let output = Command::new("git")
+        let mut output_cmd = Command::new("git");
+        #[cfg(target_os = "windows")]
+        output_cmd.creation_flags(CREATE_NO_WINDOW);
+        let output = output_cmd
             .arg("status")
             .arg("--short")
             .arg("--branch")
@@ -463,6 +474,8 @@ impl GitContext {
 
     pub fn diff(root: &Path, staged: bool) -> Result<String, String> {
         let mut cmd = Command::new("git");
+        #[cfg(target_os = "windows")]
+        cmd.creation_flags(CREATE_NO_WINDOW);
         cmd.arg("diff");
         if staged {
             cmd.arg("--staged");
@@ -482,7 +495,10 @@ impl GitContext {
 
     pub fn log(root: &Path, limit: Option<usize>) -> Result<String, String> {
         let count = limit.unwrap_or(10).clamp(1, 50);
-        let output = Command::new("git")
+        let mut cmd = Command::new("git");
+        #[cfg(target_os = "windows")]
+        cmd.creation_flags(CREATE_NO_WINDOW);
+        let output = cmd
             .arg("log")
             .arg(format!("-n{}", count))
             .arg("--oneline")
@@ -498,7 +514,10 @@ impl GitContext {
     }
 
     pub fn branch(root: &Path) -> Result<String, String> {
-        let output = Command::new("git")
+        let mut cmd = Command::new("git");
+        #[cfg(target_os = "windows")]
+        cmd.creation_flags(CREATE_NO_WINDOW);
+        let output = cmd
             .arg("branch")
             .arg("--show-current")
             .current_dir(root)

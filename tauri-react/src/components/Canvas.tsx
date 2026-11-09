@@ -1,7 +1,13 @@
 import {useEffect, useRef, useState} from 'react';
+import { SafeMarkdown } from './SafeMarkdown';
+import { MessageCrumbs } from './MessageCrumbs';
+import { upsertStep } from './stepLifecycle';
+import type { Message } from '../types/message';
 import {isTauri} from '@tauri-apps/api/core';
-import {PlusIcon, ComputerDesktopIcon, ClipboardDocumentIcon, ArrowPathIcon, ArrowDownTrayIcon, TrashIcon, ChevronLeftIcon, ChevronRightIcon, DocumentTextIcon, GlobeAltIcon} from '@heroicons/react/20/solid';
+import {PlusIcon, ComputerDesktopIcon, ClipboardDocumentIcon, ArrowPathIcon, ArrowDownTrayIcon, TrashIcon, ChevronLeftIcon, ChevronRightIcon, DocumentTextIcon, SquaresPlusIcon} from '@heroicons/react/20/solid';
 import {Composer} from './Composer';
+import {WorkspaceGitDiff, GitDiffIcon} from './WorkspaceGitDiff';
+import {BrowserSidePanel} from './BrowserSidePanel';
 import {
   apiChatStream,
   apiWorkspaceListDir,
@@ -26,7 +32,7 @@ import {
   type ApprovalRequestLike,
 } from '../services/tauriBridge';
 
-type Message = {id: string; role: 'user'|'assistant'; text: string; status?: 'thinking'|'done'|'error'; attachments?: string[]};
+
 
 function toast(message: string) {
   const notice = document.getElementById('notice');
@@ -36,31 +42,6 @@ function toast(message: string) {
   }
 }
 
-function escapeHtml(text: string) {
-  return text.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
-}
-
-function renderMarkdown(text: string) {
-  const blocks = text.split('```');
-  return blocks.map((block, index) => {
-    if (index % 2 === 1) {
-      const [first, ...rest] = block.split('\n');
-      const language = first.trim();
-      const code = rest.join('\n');
-      return (
-        <div key={index} className="code-block">
-          <div className="code-header">
-            <span>{language || 'code'}</span>
-            <button type="button" onClick={() => navigator.clipboard.writeText(code)} aria-label="Copy code">Copy</button>
-          </div>
-          <pre><code>{code}</code></pre>
-        </div>
-      );
-    }
-    const html = escapeHtml(block).replace(/\*\*(.*?)\*\*/g, '<strong>$1</strong>').replace(/`([^`]+)`/g, '<code>$1</code>').replace(/\n/g, '<br/>');
-    return <div key={index} className="markdown-block" dangerouslySetInnerHTML={{__html: html}} />;
-  });
-}
 
 export function Hero({style, className}: {style?: React.CSSProperties; className?: string}) {
   const [localDetail, setLocalDetail] = useState('Open Settings → Providers to add OpenRouter, Google AI Studio, or Ollama.');
@@ -146,12 +127,15 @@ function MessageView({message, onCopy, onDelete, onRegenerate, onSaveEdit}: Mess
   const [draft, setDraft] = useState(message.text);
   useEffect(() => setDraft(message.text), [message.text]);
   return (
-    <article className={message.role === 'user' ? 'message user' : 'message assistant'} aria-live="polite">
-      {editing ? (
-        <textarea value={draft} onChange={e => setDraft(e.target.value)} aria-label="Edit message" />
-      ) : (
-        message.status === 'thinking' ? <p>Thinking…</p> : renderMarkdown(message.text)
-      )}
+    <article className={`message ${message.role}`} aria-live={message.status === 'thinking' ? 'off' : 'polite'}>
+      <div className="message-role-label">{message.role === 'user' ? 'You' : 'OpenHarness'}</div>
+      {message.attachments?.length ? <div className="message-attachments">{message.attachments.map(file => <span className="attachment-pill" key={file}>{file}</span>)}</div> : null}
+      <div className="message-content">
+        {editing ? (
+          <textarea value={draft} onChange={e => setDraft(e.target.value)} aria-label="Edit message" />
+        ) : message.role === 'assistant' ? <SafeMarkdown content={message.text} /> : <p>{message.text}</p>}
+      </div>
+      {message.role === 'assistant' && <MessageCrumbs steps={message.steps} thinking={message.status === 'thinking' && message.steps?.every(step => step.status !== 'running')} />}
       <div className="message-actions">
         <button type="button" onClick={onCopy} aria-label="Copy"><ClipboardDocumentIcon width={12}/></button>
         {message.role === 'assistant' && <button type="button" onClick={onRegenerate} aria-label="Regenerate"><ArrowPathIcon width={12}/></button>}
@@ -194,10 +178,23 @@ export function Canvas() {
     try { const saved = Number(localStorage.getItem('openharness:file-panel-width')); return Number.isFinite(saved) && saved >= 280 && saved <= 900 ? saved : 420; }
     catch { return 420; }
   });
+  const [gitPanelWidth, setGitPanelWidth] = useState(() => {
+    try { const saved = Number(localStorage.getItem('openharness:git-panel-width')); return Number.isFinite(saved) && saved >= 280 && saved <= 900 ? saved : 420; }
+    catch { return 420; }
+  });
+   const [splitPanels, setSplitPanels] = useState(false);
+   const [browserPanelWidth, setBrowserPanelWidth] = useState(() => {
+     try { const saved = Number(localStorage.getItem('openharness:browser-panel-width')); return Number.isFinite(saved) && saved >= 340 && saved <= 1100 ? saved : 460; }
+     catch { return 460; }
+   });
   const [terminalTabs, setTerminalTabs] = useState<TerminalTab[]>([]);
+  const terminalTabsRef = useRef<TerminalTab[]>([]);
+  terminalTabsRef.current = terminalTabs;
   const [activeTerminalId, setActiveTerminalId] = useState<string | null>(null);
   const [terminalCommand, setTerminalCommand] = useState('');
   const [terminalBusy, setTerminalBusy] = useState(false);
+  const terminalCreationPending = useRef(false);
+  const nextTerminalNumber = useRef(1);
   const terminalOutputRef = useRef<HTMLPreElement | null>(null);
   const terminalInputRef = useRef<HTMLInputElement | null>(null);
   const conversationRef = useRef<HTMLElement | null>(null);
@@ -208,6 +205,10 @@ export function Canvas() {
   useEffect(() => {
     try { localStorage.setItem('openharness:file-panel-width', String(filePanelWidth)); } catch {}
   }, [filePanelWidth]);
+   useEffect(() => {
+     try { localStorage.setItem('openharness:git-panel-width', String(gitPanelWidth)); } catch {}
+   }, [gitPanelWidth]);
+  useEffect(() => { try { localStorage.setItem('openharness:browser-panel-width', String(browserPanelWidth)); } catch {} }, [browserPanelWidth]);
 
   const refreshWorkspaceGit = async (currentProjectId: string | null) => {
     if (!currentProjectId) {
@@ -253,7 +254,13 @@ export function Canvas() {
   };
 
   useEffect(() => {
-    void refreshThreads(null);
+    const applyThreadTitle = (event: Event) => {
+      const detail = (event as CustomEvent<{ threadId?: string; title?: string }>).detail;
+      if (!detail?.threadId || !detail.title) return;
+      setThreads(previous => previous.map(thread => thread.id === detail.threadId ? {...thread, title: detail.title as string} : thread));
+    };
+    window.addEventListener('openharness:thread-title-updated', applyThreadTitle);
+    return () => window.removeEventListener('openharness:thread-title-updated', applyThreadTitle);
   }, []);
 
   useEffect(() => {
@@ -263,13 +270,14 @@ export function Canvas() {
       const text = String(detail?.text ?? '').trim();
       if (!text) return;
       let currentThreadId = threadId;
-      if (!currentThreadId && projectId) {
-        try {
-          const thread = await apiCreateThread(projectId);
-          currentThreadId = thread.id;
-          if (!cancelled) { setThreadId(thread.id); setThreads(prev => [thread, ...prev]); }
-        } catch (error) { toast(`Could not create chat: ${String(error)}`); return; }
-      }
+        if (!currentThreadId && projectId) {
+          try {
+            const thread = await apiCreateThread(projectId);
+            currentThreadId = thread.id;
+            if (!cancelled) { setThreads(prev => [thread, ...prev.filter(item => item.id !== thread.id)]); }
+            setThreadId(thread.id);
+          } catch (error) { toast(`Could not create chat: ${String(error)}`); return; }
+        }
       const userMessage: Message = {id: `u-${Date.now()}`, role: 'user', text, status: 'done', attachments: detail.attachments};
       setMessages(prev => [...prev, userMessage]);
       const assistantId = `a-${Date.now()}`;
@@ -279,10 +287,10 @@ export function Canvas() {
       };
       setStopHandle(() => cancel);
       try {
-        await apiChatStream(text, detail.modelId, detail.provider, projectId ?? undefined, currentThreadId ?? undefined, detail.attachments, (token) => {
+  await apiChatStream(text, detail.modelId, detail.provider, projectId ?? undefined, currentThreadId ?? undefined, detail.attachments, (token) => {
           setMessages(prev => prev.map(message => message.id === assistantId ? {...message, text: message.text + token, status: 'thinking'} : message));
         }, () => {
-          setMessages(prev => prev.map(message => message.id === assistantId ? {...message, status: 'done'} : message));
+          setMessages(prev => prev.map(message => message.id === assistantId ? {...message, status: 'done', steps: message.steps} : message));
           void refreshWorkspaceGit(projectId ?? null);
         }, (error) => {
           const errText = String(error);
@@ -293,7 +301,9 @@ export function Canvas() {
             setMessages(prev => prev.map(message => message.id === assistantId ? {...message, text: errText, status: 'error'} : message));
             toast(errText);
           }
-        }, (approvalRequest) => setApproval(approvalRequest));
+        }, (approvalRequest) => setApproval(approvalRequest), step => {
+          setMessages(prev => prev.map(message => message.id === assistantId ? {...message, steps: upsertStep(message.steps ?? [], step), status: 'thinking'} : message));
+        });
       } catch (error) {
         const text = String(error);
         if (text.includes('Generation stopped')) {
@@ -314,12 +324,24 @@ export function Canvas() {
         }
       }
     };
-    const onNewChat = async () => {
+    const startNewThread = async () => {
       setMessages([]);
       setThreadId(null);
-      toast('New chat started');
-      if (projectId) await refreshThreads(projectId);
+      if (!projectId) {
+        toast('Select a project before starting a new thread');
+        return;
+      }
+      try {
+        const thread = await apiCreateThread(projectId);
+        if (cancelled) return;
+        setThreadId(thread.id);
+        setThreads(previous => [thread, ...previous.filter(item => item.id !== thread.id)]);
+        toast('New thread started');
+      } catch (error) {
+        toast(`Could not create thread: ${String(error)}`);
+      }
     };
+    const onNewChat = startNewThread;
     const onOpenThread = async (selectedThreadId: string) => {
       try {
         const thread = await apiGetThread(selectedThreadId);
@@ -335,8 +357,7 @@ export function Canvas() {
       setThreadId(null);
       setMessages([]);
       void refreshWorkspaceGit(nextProjectId);
-      const nextThreads = await refreshThreads(nextProjectId);
-      if (nextThreads.length) loadThreadMessages(nextThreads[0]);
+      await refreshThreads(nextProjectId);
     };
     const onDeleteThread = async (selectedThreadId: string) => {
       if (!window.confirm('Delete this chat?')) return;
@@ -344,17 +365,27 @@ export function Canvas() {
         const remaining = await apiDeleteThread(selectedThreadId);
         const filtered = projectId ? remaining.filter(t => t.project_id === projectId) : remaining;
         setThreads(filtered);
-        if (threadId === selectedThreadId) { setThreadId(null); setMessages([]); if (filtered.length) loadThreadMessages(filtered[0]); }
+                if (threadId === selectedThreadId) {
+                  setThreadId(null);
+                  setMessages([]);
+                  if (filtered.length) loadThreadMessages(filtered[0]);
+                }
       } catch (error) { toast(String(error)); }
     };
     const handleOpenThread = (event: Event) => void onOpenThread(String((event as CustomEvent<string>).detail));
     const handleDeleteThread = (event: Event) => void onDeleteThread(String((event as CustomEvent<string>).detail));
-    const handleQuickCmd = () => setActiveTool('terminal');
-    const handleQuickFiles = () => setActiveTool('files');
-    const handleQuickGit = () => { setActiveTool('git'); void refreshGitContext(); };
-    const handleQuickBrowser = () => setActiveTool('browser');
-    window.addEventListener('openharness:quick-powershell', () => void createTerminal('powershell'));
-    window.addEventListener('openharness:quick-cmdprompt', () => void createTerminal('cmd'));
+    const handleQuickCmd = () => {
+      if (terminalCreationPending.current) return;
+      const hasSessions = terminalTabsRef.current.length > 0;
+      setActiveTool(current => current === 'terminal' && hasSessions ? null : 'terminal');
+      if (!hasSessions) void createTerminal('powershell');
+    };
+    const handleQuickFiles = () => setActiveTool(current => current === 'files' ? null : 'files');
+    const handleQuickGit = () => {
+      setActiveTool(current => current === 'git' ? null : 'git');
+      void refreshGitContext();
+    };
+    const handleQuickBrowser = () => setActiveTool(current => current === 'browser' ? null : 'browser');
     window.addEventListener('openharness:quick-cmd', handleQuickCmd);
     window.addEventListener('openharness:quick-files', handleQuickFiles);
     window.addEventListener('openharness:quick-git', handleQuickGit);
@@ -374,13 +405,14 @@ export function Canvas() {
   useEffect(() => {
     let unlistenOutput: (() => void) | undefined;
     let unlistenExit: (() => void) | undefined;
+    let active = true;
     void apiListenTerminalOutput((id, data) => {
-      setTerminalTabs(previous => previous.map(tab => tab.id === id ? {...tab, output: (tab.output + data).slice(-200_000)} : tab));
-    }).then(unlisten => { unlistenOutput = unlisten; });
+      if (active) setTerminalTabs(previous => previous.map(tab => tab.id === id ? {...tab, output: (tab.output + data).slice(-200_000)} : tab));
+    }).then(unlisten => { if (active) unlistenOutput = unlisten; else unlisten(); });
     void apiListenTerminalExit((id, code) => {
-      setTerminalTabs(previous => previous.map(tab => tab.id === id ? {...tab, status: 'exited', output: `${tab.output}\\n[Process exited: ${code ?? 'unknown'}]\\n`} : tab));
-    }).then(unlisten => { unlistenExit = unlisten; });
-    return () => { unlistenOutput?.(); unlistenExit?.(); };
+      if (active) setTerminalTabs(previous => previous.map(tab => tab.id === id ? {...tab, status: 'exited', output: `${tab.output}\n[Process exited: ${code ?? 'unknown'}]\n`} : tab));
+    }).then(unlisten => { if (active) unlistenExit = unlisten; else unlisten(); });
+    return () => { active = false; unlistenOutput?.(); unlistenExit?.(); };
   }, []);
 
   useEffect(() => {
@@ -402,46 +434,63 @@ export function Canvas() {
     event.currentTarget.setPointerCapture(event.pointerId);
   };
 
-  const resizeFilePanel = (event: React.PointerEvent<HTMLDivElement>) => {
+  const resizeDockedPanel = (event: React.PointerEvent<HTMLDivElement>, currentWidth: number, setWidth: (width: number) => void) => {
     const startX = event.clientX;
-    const startWidth = filePanelWidth;
+    const startWidth = currentWidth;
+    const captured = event.currentTarget;
+
     const move = (pointer: PointerEvent) => {
       const width = Math.min(Math.max(280, startWidth + startX - pointer.clientX), Math.min(900, window.innerWidth - 320));
-      setFilePanelWidth(width);
+      setWidth(width);
     };
+
     const stop = () => {
       window.removeEventListener('pointermove', move);
       window.removeEventListener('pointerup', stop);
       window.removeEventListener('pointercancel', stop);
+      window.removeEventListener('lostpointercapture', stop);
+      if (captured && captured.hasPointerCapture?.(event.pointerId)) {
+        try { captured.releasePointerCapture(event.pointerId); } catch {}
+      }
     };
+
     window.addEventListener('pointermove', move);
-    window.addEventListener('pointerup', stop, {once: true});
-    window.addEventListener('pointercancel', stop, {once: true});
-    event.currentTarget.setPointerCapture(event.pointerId);
+    window.addEventListener('pointerup', stop, { once: true });
+    window.addEventListener('pointercancel', stop, { once: true });
+    window.addEventListener('lostpointercapture', stop, { once: true });
+    captured.setPointerCapture(event.pointerId);
   };
 
   const closeTerminal = async (id: string) => {
     try { await apiTerminalKill(id); }
     catch (error) { toast(`Terminal close failed: ${String(error)}`); }
-    setTerminalTabs(previous => previous.filter(tab => tab.id !== id));
-    if (activeTerminalId === id) setActiveTerminalId(terminalTabs.find(tab => tab.id !== id)?.id ?? null);
+    setTerminalTabs(previous => {
+      const remaining = previous.filter(tab => tab.id !== id);
+      setActiveTerminalId(current => current === id ? (remaining[0]?.id ?? null) : current);
+      return remaining;
+    });
   };
 
-  const createTerminal = async (shell: 'powershell' | 'cmd') => {
+  const createTerminal = async (shell: 'powershell' | 'cmd' = 'powershell') => {
     if (!isTauri()) {
       toast('Terminal requires the desktop app');
       return;
     }
+    if (terminalCreationPending.current) return;
+    terminalCreationPending.current = true;
     setTerminalBusy(true);
     try {
       const id = await apiTerminalCreate(projectId, shell);
-      const label = shell === 'cmd' ? 'Command Prompt' : 'PowerShell';
-      setTerminalTabs(previous => [...previous, {id, label, shell, output: '', status: 'running'}]);
+      const nextIndex = nextTerminalNumber.current++;
+      const label = nextIndex === 1 ? 'Terminal' : `Terminal ${nextIndex}`;
+      const initialOutput = shell === 'cmd' ? '' : 'PowerShell ready.\r\n';
+      setTerminalTabs(previous => [...previous, {id, label, shell, output: initialOutput, status: 'running'}]);
       setActiveTerminalId(id);
       setActiveTool('terminal');
     } catch (error) {
       toast(`Terminal failed to start: ${String(error)}`);
     } finally {
+      terminalCreationPending.current = false;
       setTerminalBusy(false);
     }
   };
@@ -451,7 +500,7 @@ export function Canvas() {
     if (!activeTerminalId || !terminalCommand.trim()) return;
     const command = terminalCommand;
     setTerminalCommand('');
-    try { await apiTerminalWrite(activeTerminalId, `${command}\\r\\n`); }
+    try { await apiTerminalWrite(activeTerminalId, `${command}\r\n`); }
     catch (error) { toast(`Terminal input failed: ${String(error)}`); }
   };
 
@@ -512,8 +561,22 @@ export function Canvas() {
   };
 
   const empty = messages.length === 0;
+  const isSideBySide = splitPanels && (activeTool === 'files' || activeTool === 'git') && window.innerWidth >= 768;
+  const availableSplitWidth = Math.max(0, window.innerWidth - 700);
+  const splitScale = isSideBySide
+    ? Math.min(1, availableSplitWidth / (filePanelWidth + gitPanelWidth))
+    : 1;
+  const filesWidth = isSideBySide ? Math.round(filePanelWidth * splitScale) : filePanelWidth;
+  const gitWidth = isSideBySide ? Math.round(gitPanelWidth * splitScale) : gitPanelWidth;
+  const activeFileWidth = isSideBySide ? filesWidth : filePanelWidth;
+  const activeGitWidth = isSideBySide ? gitWidth : gitPanelWidth;
+  const sidePanelWidth = isSideBySide
+    ? activeFileWidth + activeGitWidth
+    : activeTool === 'files' ? filePanelWidth : activeTool === 'git' ? gitPanelWidth : activeTool === 'browser' ? browserPanelWidth : 0;
+  const rightOffset = sidePanelWidth > 0 ? sidePanelWidth + 18 : 0;
+
   return (
-    <div className="canvas-layout">
+      <div className="canvas-layout">
       {threadsCollapsed ? (
         <aside className="thread-sidebar thread-sidebar-collapsed" aria-label="Chat threads collapsed">
           <button type="button" className="collapse-toggle-btn thread-toggle" onClick={toggleThreads} aria-label="Expand threads sidebar" title="Expand threads sidebar">
@@ -532,33 +595,32 @@ export function Canvas() {
             <button type="button" className="new-thread-btn" onClick={() => window.dispatchEvent(new Event('openharness:new-chat'))} aria-label="New thread">+ New thread</button>
           </div>
           <ul className="thread-list">
-            {threads.map(thread => (
+              {threads.map(thread => (
               <li key={thread.id} className="thread-row">
-                <button type="button" className={`thread-item ${thread.id === threadId ? 'thread-item-active' : ''}`} onClick={() => window.dispatchEvent(new CustomEvent('openharness:open-thread', {detail: thread.id}))}>{thread.title}</button>
-                <button type="button" className="thread-delete" aria-label={`Delete ${thread.title}`} onClick={() => window.dispatchEvent(new CustomEvent('openharness:delete-thread', {detail: thread.id}))}>×</button>
+                <button type="button" className={`thread-item ${thread.id === threadId ? 'thread-item-active' : ''}`} aria-current={thread.id === threadId ? 'page' : undefined} onClick={() => window.dispatchEvent(new CustomEvent('openharness:open-thread', {detail: thread.id}))}>{thread.title || 'New chat'}</button>
+                <button type="button" className="thread-delete" aria-label={`Delete ${thread.title || 'chat'}`} onClick={() => window.dispatchEvent(new CustomEvent('openharness:delete-thread', {detail: thread.id}))}>×</button>
               </li>
             ))}
           </ul>
           {!threads.length && <p className="thread-empty">No chats saved yet.</p>}
         </aside>
       )}
-      <main className={`canvas ${activeTool === 'files' ? 'canvas-files-open' : ''} ${activeTool === 'terminal' ? 'canvas-terminal-open' : ''}`} style={{'--terminal-height': `${terminalHeight}px`} as React.CSSProperties}>
+      <main
+        className={`canvas ${activeTool === 'terminal' ? 'canvas-terminal-open' : ''}`}
+        style={
+          {
+            '--terminal-height': `${terminalHeight}px`,
+          marginRight: rightOffset > 0 ? `${rightOffset}px` : undefined,
+          } as React.CSSProperties
+        }
+      >
         {workspaceStatus && (
           <div className="git-status-badge" aria-label="Git repository status" title={workspaceStatus}>
             <span>{workspaceStatus}</span>
             <button type="button" onClick={() => void refreshGitContext()} aria-label="Refresh git status and diff" title="Refresh git context">Refresh</button>
           </div>
         )}
-        {activeTool && activeTool !== 'terminal' && activeTool !== 'files' && <section className="workspace-tool-panel" aria-label={`${activeTool} panel`}>
-          <div className="workspace-tool-header">
-            <div className="workspace-tool-title">{activeTool === 'browser' ? <GlobeAltIcon width={16} height={16}/> : <span aria-hidden="true">⑂</span>}{activeTool === 'browser' ? 'Browser' : 'Git diff'}</div>
-            <button type="button" className="workspace-tool-close" aria-label="Close workspace tool" onClick={() => setActiveTool(null)}>×</button>
-          </div>
-          <div className="workspace-tool-body">
-            {activeTool === 'browser' && <div className="browser-empty"><GlobeAltIcon width={22} height={22}/><span>Browser tool is not configured.</span></div>}
-            {activeTool === 'git' && <div className="git-panel"><strong>{workspaceStatus || 'No Git status available.'}</strong><pre className="git-output">{gitDiff || 'Working tree clean; no diff to show.'}</pre></div>}
-          </div>
-        </section>}
+        {/* browser rendered as docked right-side panel below */}
         {stopHandle && (
           <button className="stop-generation" type="button" onClick={stopGenerating} title="Stop generation" aria-label="Stop generation">
             <ArrowDownTrayIcon width={14} aria-hidden="true" />
@@ -587,27 +649,26 @@ export function Canvas() {
           )}
         </div>
         {activeTool === 'terminal' && (
-          <section className="terminal-panel" aria-label="Terminal bottom panel" style={{height: `${terminalHeight}px`}}>
+          <section className="terminal-panel" aria-label="Terminal bottom panel" style={{height: `${terminalHeight}px`, right: '18px'}}>
             <div className="terminal-resizer" onPointerDown={resizeTerminal} role="separator" aria-orientation="horizontal" aria-label="Resize terminal panel" />
             <div className="terminal-header">
               <div className="terminal-tabs" role="tablist" aria-label="Terminal sessions">
-                {terminalTabs.map(tab => (
+                    {terminalTabs.map(tab => (
                   <button key={tab.id} type="button" role="tab" aria-selected={tab.id === activeTerminalId} className={tab.id === activeTerminalId ? 'terminal-tab active' : 'terminal-tab'} onClick={() => setActiveTerminalId(tab.id)}>
                     {tab.label} {tab.status === 'exited' ? '· exited' : ''}
                   </button>
                 ))}
-                <button type="button" className="terminal-tab terminal-new" onClick={() => void createTerminal('powershell')} disabled={terminalBusy}>+ PowerShell</button>
-                <button type="button" className="terminal-tab terminal-new" onClick={() => void createTerminal('cmd')} disabled={terminalBusy}>+ Command Prompt</button>
+                <button type="button" className="terminal-tab terminal-new" onClick={() => void createTerminal('powershell')} disabled={terminalBusy}>+ Terminal</button>
               </div>
               <button type="button" className="workspace-tool-close" aria-label="Close terminal panel" onClick={() => setActiveTool(null)}>×</button>
             </div>
-            <pre className="terminal-output" ref={terminalOutputRef} tabIndex={0} aria-label="Terminal output">{terminalTabs.find(tab => tab.id === activeTerminalId)?.output || 'No terminal sessions. Use + PowerShell or + Command Prompt.'}</pre>
+            <pre className="terminal-output" ref={terminalOutputRef} tabIndex={0} aria-label="Terminal output">{terminalTabs.find(tab => tab.id === activeTerminalId)?.output || 'No terminal sessions. Use + Terminal.'}</pre>
             {(() => {
               const active = terminalTabs.find(tab => tab.id === activeTerminalId);
               if (active?.status === 'running') {
                 return (
                   <form className="terminal-input-row" onSubmit={sendTerminalInput}>
-                    <input ref={terminalInputRef} value={terminalCommand} onChange={e => setTerminalCommand(e.target.value)} aria-label="Terminal command" placeholder={active.shell === 'cmd' ? 'Command Prompt' : 'PowerShell'} autoComplete="off" spellCheck={false} />
+                    <input ref={terminalInputRef} value={terminalCommand} onChange={e => setTerminalCommand(e.target.value)} aria-label="Terminal command" placeholder="Terminal" autoComplete="off" spellCheck={false} />
                     <button type="submit" aria-label="Send terminal command">Send</button>
                     <button type="button" aria-label="Close active terminal" onClick={() => void closeTerminal(active.id)}>Close</button>
                   </form>
@@ -622,12 +683,93 @@ export function Canvas() {
             })()}
           </section>
         )}
-        {activeTool === 'files' && <aside className="file-panel" aria-label="Files panel" style={{width: `${filePanelWidth}px`}}>
-          <div className="file-panel-header"><span className="workspace-tool-title"><DocumentTextIcon width={16} height={16}/>Files{projectName ? ` · ${projectName}` : ''}</span><button type="button" className="workspace-tool-close" aria-label="Close files panel" onClick={() => setActiveTool(null)}>×</button></div>
-          <div className="file-panel-body"><div className="file-panel-resizer" onPointerDown={resizeFilePanel} role="separator" aria-orientation="vertical" aria-label="Resize files panel"/><WorkspaceFiles key={projectId ?? 'no-project'} projectId={projectId}/></div>
-        </aside>}
-        <div className="notice" id="notice" role="status" aria-live="polite"></div>
-      </main>
+        </main>
+      {(activeTool === 'files' || activeTool === 'git') && (
+        <div className={`docked-panels-layer ${isSideBySide ? 'docked-panels-split' : ''}`}>
+          {(activeTool === 'files' || isSideBySide) && (
+            <aside className="file-panel" aria-label="Files panel" style={{width: `${activeFileWidth}px`}}>
+                <div className="file-panel-header">
+                  <div className="file-panel-tabs" role="tablist" aria-label="Workspace panels">
+                    <button type="button" role="tab" aria-selected={activeTool === 'files'} className={`file-panel-tab ${activeTool === 'files' ? 'active' : ''}`} onClick={() => setActiveTool('files')}>
+                      <DocumentTextIcon width={14} height={14} />Files
+                    </button>
+                    <button type="button" role="tab" aria-selected={activeTool === 'git'} className={`file-panel-tab ${activeTool === 'git' ? 'active' : ''}`} onClick={() => setActiveTool('git')}>
+                      <GitDiffIcon width={14} height={14} />Git
+                    </button>
+                  </div>
+                  {projectName && <span className="file-panel-project-tag">{projectName}</span>}
+                  <div className="file-panel-header-controls">
+                    <button type="button" className={`file-panel-split-toggle ${splitPanels ? 'active' : ''}`} aria-label={splitPanels ? 'Show one workspace panel' : 'Show files and Git side by side'} title={splitPanels ? 'Show one panel' : 'Split panels'} onClick={() => setSplitPanels(value => !value)}>
+                      <SquaresPlusIcon width={15} height={15} />
+                    </button>
+                    <button
+                      type="button"
+                      className="workspace-tool-close"
+                      aria-label="Close files panel"
+                      onClick={() => {
+                        if (isSideBySide) {
+                          setSplitPanels(false);
+                          setActiveTool('git');
+                        } else {
+                          setActiveTool(null);
+                        }
+                      }}
+                    >×</button>
+                  </div>
+                </div>
+                <div className="file-panel-body">
+                  <div className="file-panel-resizer" onPointerDown={(event) => resizeDockedPanel(event, activeFileWidth, setFilePanelWidth)} role="separator" aria-orientation="vertical" aria-label="Resize files panel" />
+                  <WorkspaceFiles key={projectId ?? 'no-project'} projectId={projectId} />
+                </div>
+              </aside>
+            )}
+            {(activeTool === 'git' || isSideBySide) && (
+              <aside className="file-panel git-panel" aria-label="Git changes" style={{width: `${activeGitWidth}px`}}>
+                <div className="file-panel-header">
+                  <div className="file-panel-tabs" role="tablist" aria-label="Workspace panels">
+                    <button type="button" role="tab" aria-selected={activeTool === 'files'} className={`file-panel-tab ${activeTool === 'files' ? 'active' : ''}`} onClick={() => setActiveTool('files')}>
+                      <DocumentTextIcon width={14} height={14} />Files
+                    </button>
+                    <button type="button" role="tab" aria-selected={activeTool === 'git'} className={`file-panel-tab ${activeTool === 'git' ? 'active' : ''}`} onClick={() => setActiveTool('git')}>
+                      <GitDiffIcon width={14} height={14} />Git
+                    </button>
+                  </div>
+                  {projectName && <span className="file-panel-project-tag">{projectName}</span>}
+                  <div className="file-panel-header-controls">
+                    <button type="button" className={`file-panel-split-toggle ${splitPanels ? 'active' : ''}`} aria-label={splitPanels ? 'Show one workspace panel' : 'Show files and Git side by side'} title={splitPanels ? 'Show one panel' : 'Split panels'} onClick={() => setSplitPanels(value => !value)}>
+                      <SquaresPlusIcon width={15} height={15} />
+                    </button>
+                    <button
+                      type="button"
+                      className="workspace-tool-close"
+                      aria-label="Close Git panel"
+                      onClick={() => {
+                        if (isSideBySide) {
+                          setSplitPanels(false);
+                          setActiveTool('files');
+                        } else {
+                          setActiveTool(null);
+                        }
+                      }}
+                    >×</button>
+                  </div>
+                </div>
+                <div className="file-panel-body">
+                  <div className="file-panel-resizer" onPointerDown={(event) => resizeDockedPanel(event, activeGitWidth, setGitPanelWidth)} role="separator" aria-orientation="vertical" aria-label="Resize Git panel" />
+                  <WorkspaceGitDiff key={projectId ?? 'no-project'} projectId={projectId} workspaceStatus={workspaceStatus} gitDiff={gitDiff} onRefresh={() => void refreshGitContext()} />
+                </div>
+            </aside>
+          )}
+        </div>
+      )}
+      {activeTool === 'browser' && (
+        <BrowserSidePanel
+          width={browserPanelWidth}
+          setWidth={setBrowserPanelWidth}
+          onClose={() => setActiveTool(null)}
+        />
+      )}
+      <div className="notice" id="notice" role="status" aria-live="polite"></div>
     </div>
   );
 }

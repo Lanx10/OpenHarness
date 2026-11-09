@@ -9,6 +9,9 @@ use std::time::Duration;
 use tauri::ipc::Channel;
 use tauri::{Emitter, Manager, State};
 use tokio::sync::oneshot;
+#[cfg(target_os = "windows")]
+use std::os::windows::process::CommandExt;
+const CREATE_NO_WINDOW: u32 = 0x08000000;
 
 mod client;
 mod harness;
@@ -777,6 +780,16 @@ fn append_thread_message(
     )
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StepEvent {
+    pub id: String,
+    pub kind: String,
+    pub label: String,
+    pub status: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+}
+
 #[derive(Serialize, Clone)]
 struct StreamChunk {
     text: String,
@@ -784,6 +797,8 @@ struct StreamChunk {
     error: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     approval: Option<ApprovalRequest>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    step: Option<StepEvent>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -816,6 +831,31 @@ fn clamp_string(value: String, max_chars: usize) -> String {
 
 fn requires_approval(tool: &str) -> bool {
     matches!(tool, "write_file" | "run_command")
+}
+
+fn tool_kind(tool: &str) -> &'static str {
+    match tool {
+        "read_file" => "read",
+        "grep_search" | "list_dir" => "grep",
+        "write_file" => "edit",
+        "run_command" => "command",
+        "git_status" | "git_diff" | "git_log" | "git_branch" => "git",
+        _ => "tool",
+    }
+}
+
+fn tool_label(tool: &str, arguments: &serde_json::Value) -> String {
+    let target = match tool {
+        "read_file" | "write_file" => arguments["path"].as_str(),
+        "list_dir" => arguments["path"].as_str().filter(|path| !path.is_empty()),
+        "grep_search" => arguments["query"].as_str(),
+        "run_command" => arguments["command"].as_str(),
+        _ => None,
+    }.map(|value| clamp_string(value.to_string(), 96));
+    match target {
+        Some(target) => format!("{} {}", tool.replace('_', " "), target),
+        None => tool.replace('_', " "),
+    }
 }
 
 fn validate_tool_call(call: &harness::ToolCall) -> Result<(), String> {
@@ -904,6 +944,7 @@ async fn run_agent_loop(
                         done: false,
                         error: None,
                         approval: None,
+                        step: None,
                     });
                 }
             },
@@ -956,10 +997,27 @@ async fn run_agent_loop(
                     done: false,
                     error: None,
                     approval: Some(request),
+                    step: None,
+                });
+                let step_id = call.id.clone();
+                let label = tool_label(&call.name, &call.arguments);
+                let _ = emitter.send(StreamChunk {
+                    text: String::new(),
+                    done: false,
+                    error: None,
+                    approval: None,
+                    step: Some(StepEvent { id: step_id.clone(), kind: tool_kind(&call.name).into(), label: label.clone(), status: "approval".into(), detail: None }),
                 });
                 let decision = receiver
                     .await
                     .map_err(|_| "Approval request was cancelled".to_string())?;
+                let _ = emitter.send(StreamChunk {
+                    text: String::new(),
+                    done: false,
+                    error: None,
+                    approval: None,
+                    step: Some(StepEvent { id: step_id, kind: tool_kind(&call.name).into(), label, status: if decision.allowed { "running" } else { "failed" }.into(), detail: None }),
+                });
                 if !decision.allowed {
                     let observation = decision
                         .response
@@ -970,6 +1028,14 @@ async fn run_agent_loop(
                     ));
                     continue;
                 }
+            } else {
+                let _ = emitter.send(StreamChunk {
+                    text: String::new(),
+                    done: false,
+                    error: None,
+                    approval: None,
+                    step: Some(StepEvent { id: call.id.clone(), kind: tool_kind(&call.name).into(), label: tool_label(&call.name, &call.arguments), status: "running".into(), detail: None }),
+                });
             }
 
             let root = project_root.clone();
@@ -979,6 +1045,26 @@ async fn run_agent_loop(
             })
             .await
             .map_err(|e| format!("Tool task failed: {}", e))?;
+            let status = if tool_result.success { "done" } else { "error" };
+            let detail = if tool_result.success {
+                let snippet = tool_result.output.trim().lines().next().unwrap_or("");
+                if snippet.is_empty() { None } else { Some(clamp_string(snippet.to_string(), 80)) }
+            } else {
+                tool_result.error.as_ref().map(|e| clamp_string(e.clone(), 80))
+            };
+            let _ = emitter.send(StreamChunk {
+                text: String::new(),
+                done: false,
+                error: None,
+                approval: None,
+                step: Some(StepEvent {
+                    id: call.id.clone(),
+                    kind: tool_kind(&call.name).into(),
+                    label: tool_label(&call.name, &call.arguments),
+                    status: status.into(),
+                    detail,
+                }),
+            });
             let mut observation = harness::ToolDispatcher::format_observation(&tool_result);
             observation = clamp_string(observation, MAX_TOOL_OUTPUT_BYTES);
             messages.push(client::ModelMessage::new("system", &observation));
@@ -1203,12 +1289,13 @@ async fn chat_send_stream(
                     "Local OpenHarness Assistant (Model: {}):\n\nConfigure API access for {} in Settings to route requests to live inference.",
                     model_owned, provider_owned
                 );
-                let _ = emitter.send(StreamChunk {
-                    text: text.clone(),
-                    done: false,
-                    error: None,
-                    approval: None,
-                });
+                    let _ = emitter.send(StreamChunk {
+                        text: text.clone(),
+                        done: false,
+                        error: None,
+                        approval: None,
+                        step: None,
+                    });
                 Ok(text)
             }
         } else if key_owned.is_some() || saved.is_some() {
@@ -1219,11 +1306,12 @@ async fn chat_send_stream(
                 key_owned.as_deref(),
                 url_owned.as_deref(),
                 move |text| {
-                    let _ = emitter.send(StreamChunk {
+                     let _ = emitter.send(StreamChunk {
                         text,
                         done: false,
                         error: None,
                         approval: None,
+                        step: None,
                     });
                 },
             )
@@ -1238,6 +1326,7 @@ async fn chat_send_stream(
                 done: false,
                 error: None,
                 approval: None,
+                step: None,
             });
             Ok(text)
         }
@@ -1263,6 +1352,7 @@ async fn chat_send_stream(
                     done: true,
                     error: None,
                     approval: None,
+                    step: None,
                 })
                 .map_err(|e| e.to_string())?;
             Ok(stream_id)
@@ -1273,6 +1363,7 @@ async fn chat_send_stream(
                 done: true,
                 error: Some(error.clone()),
                 approval: None,
+                step: None,
             });
             Err(error)
         }
@@ -1323,17 +1414,32 @@ fn read_terminal_output(stdout: std::process::ChildStdout, app: tauri::AppHandle
     std::thread::spawn(move || {
         let mut reader = std::io::BufReader::new(stdout);
         let mut buffer = [0u8; 4096];
+        let mut accum = String::new();
         loop {
             match reader.read(&mut buffer) {
                 Ok(0) => break,
                 Ok(n) => {
-                    let _ = app.emit(
-                        "terminal-output",
-                        serde_json::json!({
-                            "id": id,
-                            "data": String::from_utf8_lossy(&buffer[..n]),
-                        }),
-                    );
+                    let raw = String::from_utf8_lossy(&buffer[..n]);
+                    accum.push_str(&raw);
+                    let screens = [
+                        "Warning: PowerShell detected that you might be using a screen reader and has disabled PSReadLine for compatibility purposes. If you want to re-enable it, run 'Import-Module PSReadLine'.\r\n\r\n",
+                        "Warning: PowerShell detected that you might be using a screen reader and has disabled PSReadLine for compatibility purposes. If you want to re-enable it, run 'Import-Module PSReadLine'.\n\n",
+                        "Warning: PowerShell detected that you might be using a screen reader and has disabled PSReadLine for compatibility purposes. If you want to re-enable it, run 'Import-Module PSReadLine'.",
+                    ];
+                    let mut output = accum.clone();
+                    for screen in screens {
+                        output = output.replace(screen, "");
+                    }
+                    accum.clear();
+                    if !output.is_empty() {
+                        let _ = app.emit(
+                            "terminal-output",
+                            serde_json::json!({
+                                "id": id,
+                                "data": output,
+                            }),
+                        );
+                    }
                 }
                 Err(_) => break,
             }
@@ -1360,9 +1466,17 @@ fn terminal_create(
         command
     } else {
         let mut command = Command::new("powershell.exe");
-        command.args(["-NoLogo", "-NoProfile", "-NoExit", "-Command", "-"]);
+        command.args([
+            "-NoLogo",
+            "-NoProfile",
+            "-NoExit",
+            "-Command",
+            "function global:prompt { '' }; $ProgressPreference = 'SilentlyContinue'; $WarningPreference = 'SilentlyContinue'; -",
+        ]);
         command
     };
+    #[cfg(target_os = "windows")]
+    command.creation_flags(CREATE_NO_WINDOW);
     command
         .current_dir(&working_dir)
         .stdin(Stdio::piped())
@@ -1655,6 +1769,10 @@ mod tests {
             .unwrap();
         let fetched = state.get_thread(&thread.id).unwrap();
         assert_eq!(fetched.messages.len(), 1);
+        assert_eq!(fetched.title, "hello");
+        let renamed = state.rename_thread(&thread.id, "A better title").unwrap();
+        assert_eq!(renamed[0].title, "A better title");
+        assert!(state.rename_thread(&thread.id, "  ").is_err());
         let threads = state.list_threads(Some(&proj.id)).unwrap();
         assert_eq!(threads.len(), 1);
 
@@ -1695,4 +1813,30 @@ mod tests {
                 .is_ok()
         );
     }
+
+    #[test]
+    fn test_step_event_and_tool_helpers() {
+        assert_eq!(tool_kind("read_file"), "read");
+        assert_eq!(tool_kind("write_file"), "edit");
+        assert_eq!(tool_kind("grep_search"), "grep");
+        assert_eq!(tool_kind("run_command"), "command");
+        assert_eq!(tool_kind("git_diff"), "git");
+
+        let args = serde_json::json!({ "path": "src/App.tsx" });
+        assert_eq!(tool_label("read_file", &args), "read file src/App.tsx");
+
+        let step = StepEvent {
+            id: "step_1".to_string(),
+            kind: "read".to_string(),
+            label: "read file src/App.tsx".to_string(),
+            status: "done".to_string(),
+            detail: Some("12 lines read".to_string()),
+        };
+        let serialized = serde_json::to_string(&step).unwrap();
+        assert!(serialized.contains("\"kind\":\"read\""));
+        assert!(serialized.contains("\"status\":\"done\""));
+        assert!(serialized.contains("\"detail\":\"12 lines read\""));
+    }
 }
+
+
