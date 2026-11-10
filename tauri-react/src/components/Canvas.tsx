@@ -5,12 +5,15 @@ import { upsertStep } from './stepLifecycle';
 import type { Message } from '../types/message';
 import { cleanMessageText } from '../utils/cleanMessageText';
 import {isTauri} from '@tauri-apps/api/core';
-import {PlusIcon, ComputerDesktopIcon, ClipboardDocumentIcon, ArrowPathIcon, ArrowDownTrayIcon, TrashIcon, ChevronLeftIcon, ChevronRightIcon, DocumentTextIcon, SquaresPlusIcon, ChatBubbleLeftIcon} from '@heroicons/react/20/solid';
+import {PlusIcon, ComputerDesktopIcon, ClipboardDocumentIcon, ArrowPathIcon, TrashIcon, ChevronLeftIcon, ChevronRightIcon, DocumentTextIcon, SquaresPlusIcon, ChatBubbleLeftIcon} from '@heroicons/react/20/solid';
 import {Composer} from './Composer';
 import {WorkspaceGitDiff, GitDiffIcon} from './WorkspaceGitDiff';
 import {BrowserSidePanel} from './BrowserSidePanel';
 import {
   apiChatStream,
+  apiCompactThread,
+  apiListProviders,
+  type ProviderInfo,
   apiWorkspaceListDir,
   apiWorkspaceReadFile,
   type FileEntryLike,
@@ -218,6 +221,16 @@ export function Canvas() {
   const [messages, setMessages] = useState<Message[]>([]);
   const [threads, setThreads] = useState<ChatThreadLike[]>([]);
   const [threadId, setThreadId] = useState<string | null>(null);
+  const threadIdRef = useRef<string | null>(null);
+  const updateThreadId = (id: string | null) => {
+    threadIdRef.current = id;
+    setThreadId(id);
+  };
+  const [tokenLimits, setTokenLimits] = useState({context: 128_000, output: 4_096});
+  const [cachedInputTokens, setCachedInputTokens] = useState<number | null>(null);
+  const [compacting, setCompacting] = useState(false);
+  const compactingRef = useRef(false);
+  const compactedThreadsRef = useRef(new Set<string>());
   const [threadsCollapsed, setThreadsCollapsed] = useState(() => {
     try { return localStorage.getItem('openharness:threads-collapsed') === 'true'; } catch { return false; }
   });
@@ -230,6 +243,11 @@ export function Canvas() {
     }
   });
   const [projectId, setProjectId] = useState<string | null>(null);
+  const projectIdRef = useRef<string | null>(null);
+  const updateProjectId = (id: string | null) => {
+    projectIdRef.current = id;
+    setProjectId(id);
+  };
   const [projectName, setProjectName] = useState('');
 
   const toggleThreads = () => {
@@ -304,8 +322,9 @@ export function Canvas() {
     }
   };
 
-  const loadThreadMessages = (thread: ChatThreadLike) => {
-    setThreadId(thread.id);
+  const loadThreadMessages = (thread: ChatThreadLike, resetCachedTokens = true) => {
+    updateThreadId(thread.id);
+    if (resetCachedTokens) setCachedInputTokens(null);
     setMessages(thread.messages.map((message, index) => ({
       id: message.id || `${thread.id}:${index}`,
       role: message.role === 'assistant' ? 'assistant' : 'user',
@@ -335,7 +354,7 @@ export function Canvas() {
         const project = items.find(item => item.active) ?? items[0];
         const id = 'id' in project ? String(project.id) : '';
         if (id) {
-          setProjectId(id);
+          updateProjectId(id);
           setProjectName('name' in project && typeof project.name === 'string' ? project.name : '');
           void refreshThreads(id);
         }
@@ -356,20 +375,58 @@ export function Canvas() {
 
   useEffect(() => {
     let cancelled = false;
+    const compactCurrentThread = async (currentThreadId: string, provider: string, modelId: string, contextLimit: number) => {
+      if (compactingRef.current || compactedThreadsRef.current.has(currentThreadId)) return;
+      compactingRef.current = true;
+      setCompacting(true);
+      try {
+        const summary = await apiCompactThread(currentThreadId, modelId, provider);
+        if (!summary) return;
+        compactedThreadsRef.current.add(currentThreadId);
+        const refreshed = await apiGetThread(currentThreadId);
+        if (threadIdRef.current === currentThreadId) loadThreadMessages(refreshed);
+        setThreads(previous => previous.map(thread => thread.id === currentThreadId ? refreshed : thread));
+        toast(`Session compacted to stay within ${contextLimit.toLocaleString()} tokens.`);
+      } catch (error) {
+        toast(`Automatic compaction failed: ${String(error)}`);
+      } finally {
+        compactingRef.current = false;
+        setCompacting(false);
+      }
+    };
     const onSend = async (event: Event) => {
-      const detail = (event as CustomEvent<{text: string; modelId: string; provider: string; projectId?: string; attachments?: string[]}>).detail;
+      const detail = (event as CustomEvent<{text: string; modelId: string; provider: string; projectId?: string; attachments?: string[]; supportsVision?: boolean; modelContextTokens?: number; modelOutputTokens?: number}>).detail;
+      if (detail.modelContextTokens) setTokenLimits({context: detail.modelContextTokens, output: detail.modelOutputTokens ?? 4_096});
+      setCachedInputTokens(null);
       const text = String(detail?.text ?? '').trim();
       if (!text) return;
-      let currentThreadId = threadId;
+      if ((detail.attachments?.some(attachment => attachment.includes('data:image/')) ?? false) && !detail.supportsVision) {
+        toast('Selected model is not configured for image input.');
+        return;
+      }
+      const providerInfo: ProviderInfo | undefined = (await apiListProviders()).find(item => item.provider === detail.provider);
+      const activeLimits = {
+        context: detail.modelContextTokens ?? providerInfo?.max_context_tokens ?? tokenLimits.context,
+        output: detail.modelOutputTokens ?? providerInfo?.max_output_tokens ?? tokenLimits.output,
+      };
+      setTokenLimits(activeLimits);
+      let currentThreadId = threadIdRef.current;
+      const selectedProjectAtStart = projectIdRef.current;
+      if (threadId !== threadIdRef.current || projectId !== selectedProjectAtStart) return;
       const targetProjectId = projectId ?? detail?.projectId ?? null;
       if (!currentThreadId && targetProjectId) {
         try {
           const thread = await apiCreateThread(targetProjectId);
+          if (cancelled || threadIdRef.current !== currentThreadId || projectIdRef.current !== selectedProjectAtStart) {
+            toast('Chat send cancelled because the selected project or thread changed.');
+            return;
+          }
           currentThreadId = thread.id;
-          if (!cancelled) { setThreads(prev => [thread, ...prev.filter(item => item.id !== thread.id)]); }
-          setThreadId(thread.id);
+          setThreads(prev => [thread, ...prev.filter(item => item.id !== thread.id)]);
+          updateThreadId(thread.id);
         } catch (error) { toast(`Could not create chat: ${String(error)}`); return; }
       }
+      if (currentThreadId) compactedThreadsRef.current.delete(currentThreadId);
       const userMessage: Message = {id: `u-${Date.now()}`, role: 'user', text, status: 'done', attachments: detail.attachments};
       setMessages(prev => [...prev, userMessage]);
       const assistantId = `a-${Date.now()}`;
@@ -379,7 +436,7 @@ export function Canvas() {
       };
       setStopHandle(() => cancel);
       try {
-        await apiChatStream(text, detail.modelId, detail.provider, targetProjectId ?? undefined, currentThreadId ?? undefined, detail.attachments, (token) => {
+        await apiChatStream(text, detail.modelId, detail.provider, targetProjectId ?? undefined, currentThreadId ?? undefined, detail.attachments, detail.supportsVision, (token) => {
           setMessages(prev => prev.map(message => message.id === assistantId ? {...message, text: message.text + token, status: 'thinking'} : message));
         }, () => {
           setMessages(prev => prev.map(message => message.id === assistantId ? {...message, status: 'done', steps: message.steps} : message));
@@ -395,6 +452,8 @@ export function Canvas() {
           }
         }, (approvalRequest) => setApproval(approvalRequest), step => {
           setMessages(prev => prev.map(message => message.id === assistantId ? {...message, steps: upsertStep(message.steps ?? [], step), status: 'thinking'} : message));
+        }, tokens => {
+          if (threadIdRef.current === currentThreadId) setCachedInputTokens(tokens);
         });
       } catch (error) {
         const text = String(error);
@@ -410,32 +469,41 @@ export function Canvas() {
         if (currentThreadId) {
           try {
             const thread = await apiGetThread(currentThreadId);
-            loadThreadMessages(thread);
+            if (threadIdRef.current === currentThreadId) loadThreadMessages(thread, false);
+            const uncompactedMessages = thread.messages.slice(thread.compacted_message_count ?? 0);
+            const projectedTokens = uncompactedMessages.reduce((total, message) => total + Math.ceil(message.text.length / 4) + (message.attachments ?? []).reduce((sum, attachment) => sum + Math.ceil(attachment.length / 4), 0), 0) + Math.ceil((thread.compacted_summary ?? '').length / 4);
+            if (projectedTokens / Math.max(1, activeLimits.context) >= 0.7) {
+              void compactCurrentThread(currentThreadId, detail.provider, detail.modelId, activeLimits.context);
+            }
           } catch {}
           void refreshThreads(targetProjectId);
         }
       }
     };
     const startNewThread = () => {
-      setMessages([]);
-      setThreadId(null);
+       setMessages([]);
+       setCachedInputTokens(null);
+       updateThreadId(null);
     };
     const onNewChat = startNewThread;
     const onOpenThread = async (selectedThreadId: string) => {
       try {
         const thread = await apiGetThread(selectedThreadId);
-        loadThreadMessages(thread);
-        setThreadId(thread.id);
+        if (!cancelled) {
+          loadThreadMessages(thread);
+          updateThreadId(thread.id);
+        }
       } catch (error) { toast(String(error)); }
     };
     const onSelectProject = async (event: Event) => {
       const project = (event as CustomEvent<{id?: string; name?: string; title?: string}>).detail;
       const nextProjectId = project?.id ?? null;
-      setProjectId(nextProjectId);
+      updateProjectId(nextProjectId);
       setProjectName(project?.name ?? project?.title ?? '');
-      setThreadId(null);
-      setMessages([]);
-      void refreshWorkspaceGit(nextProjectId);
+      updateThreadId(null);
+        setMessages([]);
+       setCachedInputTokens(null);
+       void refreshWorkspaceGit(nextProjectId);
       await refreshThreads(nextProjectId);
     };
     const onDeleteThread = async (selectedThreadId: string) => {
@@ -444,8 +512,8 @@ export function Canvas() {
         const remaining = await apiDeleteThread(selectedThreadId);
         const filtered = projectId ? remaining.filter(t => t.project_id === projectId) : remaining;
         setThreads(filtered);
-                if (threadId === selectedThreadId) {
-                  setThreadId(null);
+                if (threadIdRef.current === selectedThreadId) {
+                  updateThreadId(null);
                   setMessages([]);
                   if (filtered.length) loadThreadMessages(filtered[0]);
                 }
@@ -754,14 +822,11 @@ export function Canvas() {
             ))}
           </ul>
           {!threads.length && <p className="thread-empty">No chats saved yet.</p>}
-          <section className="session-context-card" aria-label="Session context">
-            <span className="session-context-eyebrow">SESSION CONTEXT</span>
-            <strong>{projectName || 'No project selected'}</strong>
+          <section className="session-context-card" aria-label="Session token context">
+            <span className="session-context-eyebrow">TOKEN CONTEXT</span>
+            <strong>{`${cachedInputTokens?.toLocaleString() ?? '—'} cached input tokens`}</strong>
+            {compacting && <span className="session-context-detail">Compacting session…</span>}
             <span className="session-context-detail">{projectId ? (threads.find(thread => thread.id === threadId)?.title || 'New thread') : 'Select a project to show context.'}</span>
-            <div className="session-context-meter" role="meter" aria-label={`Session messages: ${messages.length}`} aria-valuemin={0} aria-valuemax={100} aria-valuenow={Math.min(messages.length, 100)}>
-              <span style={{width: `${Math.min(messages.length, 100)}%`}} />
-            </div>
-            <span className="session-context-foot">{messages.length} messages in this thread</span>
           </section>
         </aside>
       )}
@@ -777,15 +842,10 @@ export function Canvas() {
         {workspaceStatus && (
           <div className="git-status-badge" aria-label="Git repository status" title={workspaceStatus}>
             <span>{workspaceStatus}</span>
-            <button type="button" onClick={() => void refreshGitContext()} aria-label="Refresh git status and diff" title="Refresh git context">Refresh</button>
           </div>
         )}
         {/* browser rendered as docked right-side panel below */}
-        {stopHandle && (
-          <button className="stop-generation" type="button" onClick={stopGenerating} title="Stop generation" aria-label="Stop generation">
-            <ArrowDownTrayIcon width={14} aria-hidden="true" />
-          </button>
-        )}
+
         {empty && <Hero className={activeTool === 'terminal' ? 'hero-above-terminal' : undefined} />}
         <section className="conversation" aria-live="polite" ref={conversationRef} hidden={empty}>
           {messages.map(message => (
@@ -795,21 +855,21 @@ export function Canvas() {
           ))}
         </section>
         <div className="composer-wrap">
-          <Composer />
-          {approval && (
-            <div className="approval-backdrop" role="alertdialog" aria-modal="true" aria-labelledby="tool-approval-title">
-              <div className="approval-dialog">
-                <h2 id="tool-approval-title">Approve workspace operation</h2>
-                <p><strong>{approval.tool}</strong> requests:</p>
-                <pre>{JSON.stringify(approval.arguments, null, 2)}</pre>
-                <div className="approval-actions">
-                  <button type="button" onClick={() => void approveToolCall(false)}>Reject</button>
-                  <button type="button" className="confirm" onClick={() => void approveToolCall(true)}>Approve once</button>
-                </div>
+          <Composer running={Boolean(stopHandle)} onStop={stopGenerating} />
+        </div>
+        {approval && (
+          <div className="approval-backdrop" role="alertdialog" aria-modal="true" aria-labelledby="tool-approval-title">
+            <div className="approval-dialog">
+              <h2 id="tool-approval-title">Approve workspace operation</h2>
+              <p><strong>{approval.tool}</strong> requests:</p>
+              <pre>{JSON.stringify(approval.arguments, null, 2)}</pre>
+              <div className="approval-actions">
+                <button type="button" onClick={() => void approveToolCall(false)}>Reject</button>
+                <button type="button" className="confirm" onClick={() => void approveToolCall(true)}>Approve once</button>
               </div>
             </div>
-          )}
-        </div>
+          </div>
+        )}
         {activeTool === 'terminal' && (
           <section className="terminal-panel" aria-label="Terminal bottom panel" style={{height: `${terminalHeight}px`, right: '18px'}}>
             <div className="terminal-resizer" onPointerDown={resizeTerminal} role="separator" aria-orientation="horizontal" aria-label="Resize terminal panel" />

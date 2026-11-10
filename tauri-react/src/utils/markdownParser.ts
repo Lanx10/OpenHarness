@@ -28,7 +28,7 @@ export function sanitizeImageUrl(rawUrl: string): string | null {
 }
 
 export function formatInlineMarkdown(text: string): string {
-  let result = escapeHtml(text);
+  let result = escapeHtml(text).replace(/!\[([^\]]*)\]\((data:image\/[^)]+)\)/g, (_match, alt, _url) => `${escapeHtml(alt)} (image attachment)`);
 
   // Render only trusted image URL schemes; all other content remains escaped.
   result = result.replace(/!\[([^\]]*)\]\(([^)]+)\)/g, (_match, alt, url) => {

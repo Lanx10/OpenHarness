@@ -2,7 +2,7 @@ import {useEffect, useRef, useState} from 'react';
 import {isTauri} from '@tauri-apps/api/core';
 import {
   ArrowPathIcon, ArrowTopRightOnSquareIcon,
-  MagnifyingGlassIcon, ServerIcon, XMarkIcon, TrashIcon,
+  MagnifyingGlassIcon, ServerIcon, XMarkIcon, TrashIcon, PencilSquareIcon, PhotoIcon,
 } from '@heroicons/react/20/solid';
 import {apiDeleteProvider, apiListProviders, apiSaveProvider, type ProviderInfo} from '../../services/tauriBridge';
 
@@ -27,19 +27,22 @@ const providerDocs: Record<string, string> = {
   'OpenAI Compatible': 'https://platform.openai.com/docs/api-reference/chat/create',
 };
 
-function ProviderForm({onBack, onSaved}: {onBack: () => void; onSaved: () => void}) {
-  const [provider, setProvider] = useState(providerOptions[0]);
+function ProviderForm({onBack, onSaved, editProvider}: {onBack: () => void; onSaved: () => void; editProvider?: ProviderInfo}) {
+  const [provider, setProvider] = useState(editProvider?.provider ?? providerOptions[0]);
   const [apiKey, setApiKey] = useState('');
-  const [modelId, setModelId] = useState('');
-  const [baseUrl, setBaseUrl] = useState('');
-  const [customEndpoint, setCustomEndpoint] = useState(false);
+  const [modelId, setModelId] = useState(editProvider?.model_id ?? '');
+  const [baseUrl, setBaseUrl] = useState(editProvider?.base_url ?? '');
+  const [maxContextTokens, setMaxContextTokens] = useState(editProvider?.max_context_tokens ?? 128_000);
+  const [maxOutputTokens, setMaxOutputTokens] = useState(editProvider?.max_output_tokens ?? 4_096);
+  const [supportsVision, setSupportsVision] = useState(editProvider?.supports_vision ?? false);
+  const [customEndpoint, setCustomEndpoint] = useState(editProvider?.custom_endpoint ?? false);
   const [advanced, setAdvanced] = useState(false);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState('');
   const isOpenAICompatible = provider === 'OpenAI Compatible';
 
   const saveProvider = async () => {
-    if ((provider !== 'Ollama' && provider !== 'OpenAI Compatible' && !apiKey.trim()) || !modelId.trim()) {
+    if ((provider !== 'Ollama' && provider !== 'OpenAI Compatible' && !apiKey.trim() && !editProvider?.has_key) || !modelId.trim()) {
       setError(provider === 'Ollama' ? 'Enter a Model ID before saving.' : 'Enter an API key and Model ID before saving.');
       return;
     }
@@ -56,6 +59,12 @@ function ProviderForm({onBack, onSaved}: {onBack: () => void; onSaved: () => voi
         return;
       }
     }
+    const parsedContext = Number(maxContextTokens);
+    const parsedOutput = Number(maxOutputTokens);
+    if (!Number.isInteger(parsedContext) || parsedContext < 1024 || parsedContext > 2_000_000 || !Number.isInteger(parsedOutput) || parsedOutput < 1 || parsedOutput > parsedContext) {
+      setError('Context must be 1,024–2,000,000 tokens; output must be within the context window.');
+      return;
+    }
     setSaving(true);
     setError('');
     try {
@@ -64,7 +73,11 @@ function ProviderForm({onBack, onSaved}: {onBack: () => void; onSaved: () => voi
         modelId.trim(),
         (isOpenAICompatible || customEndpoint) ? baseUrl.trim() : null,
         isOpenAICompatible || customEndpoint,
-        apiKey
+        apiKey,
+        maxContextTokens,
+        maxOutputTokens,
+        supportsVision,
+        editProvider?.has_key ?? false
       );
       setApiKey('');
       window.dispatchEvent(new Event('openharness:provider-saved'));
@@ -90,7 +103,7 @@ function ProviderForm({onBack, onSaved}: {onBack: () => void; onSaved: () => voi
       <div className="provider-form-header"><ServerIcon width={19}/><strong>{provider === 'OpenAI Compatible' ? 'Connect a compatible API' : 'Add provider'}</strong></div>
       <label className="field-label" htmlFor="provider-select">Provider</label>
       <div className="provider-select-row">
-        <select id="provider-select" value={provider} onChange={event => { const next = event.target.value; setProvider(next); if (next === 'OpenAI Compatible') { setCustomEndpoint(true); setAdvanced(true); if (!baseUrl) setBaseUrl('https://api.openai.com/v1'); } setError(''); }}>
+        <select id="provider-select" value={provider} disabled={Boolean(editProvider)} onChange={event => { const next = event.target.value; setProvider(next); if (next === 'OpenAI Compatible') { setCustomEndpoint(true); setAdvanced(true); if (!baseUrl) setBaseUrl('https://api.openai.com/v1'); } setError(''); }}>
           {providerOptions.map(option => <option key={option}>{option}</option>)}
         </select>
         <a className="provider-setup" href={providerDocs[provider]} target="_blank" rel="noreferrer">Docs <ArrowTopRightOnSquareIcon width={13}/></a>
@@ -170,9 +183,17 @@ function ProviderForm({onBack, onSaved}: {onBack: () => void; onSaved: () => voi
           )}
         </>
       )}
+      <section className="provider-model-limits" aria-label="Model capabilities and limits">
+        <header><div><PhotoIcon width={17} aria-hidden="true"/><strong>Model capabilities</strong></div><span>Set model-specific limits</span></header>
+        <label className="provider-vision-toggle"><span><strong>Image input</strong><small>Model accepts image attachments</small></span><input type="checkbox" checked={supportsVision} onChange={event => setSupportsVision(event.target.checked)} aria-label="Model supports images" /></label>
+        <div className="provider-token-fields">
+          <label>Context window (tokens)<input type="number" min={1024} max={2000000} step={1024} value={maxContextTokens} onChange={event => setMaxContextTokens(Number(event.target.value))} /></label>
+          <label>Max output (tokens)<input type="number" min={1} max={maxContextTokens} step={256} value={maxOutputTokens} onChange={event => setMaxOutputTokens(Number(event.target.value))} /></label>
+        </div>
+      </section>
       {error && <div role="alert" className="provider-form-error">{error}</div>}
       <div className="provider-form-footer">
-        <span>{isOpenAICompatible ? 'API keys are stored through your operating system’s secure credential store.' : <>Keys are stored through your operating system&rsquo;s secure credential store.</>}</span>
+        <span>{editProvider?.has_key ? 'Leave the API key blank to keep the saved credential.' : isOpenAICompatible ? 'API keys are stored through your operating system’s secure credential store.' : <>Keys are stored through your operating system&rsquo;s secure credential store.</>}</span>
         <div>
           <button className="save-provider" type="button" onClick={() => void saveProvider()} disabled={saving}>{saving ? 'Saving…' : 'Save'}</button>
           <button className="back-button" type="button" onClick={onBack}>Back</button>
@@ -182,7 +203,7 @@ function ProviderForm({onBack, onSaved}: {onBack: () => void; onSaved: () => voi
   );
 }
 
-function ProviderList({items, onAdd, onDelete}: {items: ProviderInfo[]; onAdd: () => void; onDelete: (provider: string) => void}) {
+function ProviderList({items, onAdd, onEdit, onDelete}: {items: ProviderInfo[]; onAdd: () => void; onEdit: (provider: ProviderInfo) => void; onDelete: (provider: string) => void}) {
   const [pending, setPending] = useState<string | null>(null);
   if (items.length === 0) {
     return (
@@ -196,9 +217,10 @@ function ProviderList({items, onAdd, onDelete}: {items: ProviderInfo[]; onAdd: (
     <div className="provider-list">
       {items.map((item) => (
         <div className="saved-provider" key={item.provider}>
-          <div>
+          <div className="saved-provider-copy">
             <strong>{item.provider}</strong>
-            <small>{item.model_id}{item.has_key ? ' · Key secured' : ' · Missing key'}</small>
+            <small>{item.model_id}{item.has_key ? ' · Key secured' : ' · Missing key'}{item.supports_vision ? ' · Images' : ''}</small>
+            <small>{item.max_context_tokens.toLocaleString()} context · {item.max_output_tokens.toLocaleString()} output tokens</small>
           </div>
           {pending === item.provider ? (
             <div className="provider-delete-confirm">
@@ -207,7 +229,10 @@ function ProviderList({items, onAdd, onDelete}: {items: ProviderInfo[]; onAdd: (
               <button type="button" className="back-button" onClick={() => setPending(null)}>Cancel</button>
             </div>
           ) : (
-            <button type="button" className="iconbtn" aria-label={`Remove ${item.provider}`} onClick={() => setPending(item.provider)}><TrashIcon width={16}/></button>
+            <div className="saved-provider-actions">
+              <button type="button" className="iconbtn" aria-label={`Edit ${item.provider}`} title="Edit provider" onClick={() => onEdit(item)}><PencilSquareIcon width={16}/></button>
+              <button type="button" className="iconbtn" aria-label={`Remove ${item.provider}`} title="Remove provider" onClick={() => setPending(item.provider)}><TrashIcon width={16}/></button>
+            </div>
           )}
         </div>
       ))}
@@ -219,6 +244,7 @@ function ProviderList({items, onAdd, onDelete}: {items: ProviderInfo[]; onAdd: (
 export function SettingsPage({onClose, initialSection = 'Providers'}: SettingsPageProps) {
   const [selectedSection, setSelectedSection] = useState(initialSection);
   const [providerView, setProviderView] = useState<'list' | 'form'>('list');
+  const [editingProvider, setEditingProvider] = useState<ProviderInfo | undefined>();
   const [search, setSearch] = useState('');
   const [savedProviders, setSavedProviders] = useState<ProviderInfo[]>([]);
   const [providerError, setProviderError] = useState('');
@@ -321,9 +347,9 @@ export function SettingsPage({onClose, initialSection = 'Providers'}: SettingsPa
           <div className="providers-card">
             <section className="provider-detail">
               {providerView === 'list' ? <>
-                <ProviderList items={savedProviders} onAdd={() => setProviderView('form')} onDelete={async provider => {await apiDeleteProvider(provider); await updateProviders(); window.dispatchEvent(new Event('openharness:provider-saved'));}}/>
+                <ProviderList items={savedProviders} onAdd={() => {setEditingProvider(undefined); setProviderView('form');}} onEdit={provider => {setEditingProvider(provider); setProviderView('form');}} onDelete={async provider => {await apiDeleteProvider(provider); await updateProviders(); window.dispatchEvent(new Event('openharness:provider-saved'));}}/>
                 {providerError && <span role="alert" className="provider-error">{providerError}</span>}
-              </> : <ProviderForm onBack={() => setProviderView('list')} onSaved={async () => {await updateProviders(); setProviderView('list');}}/>}
+              </> : <ProviderForm editProvider={editingProvider} onBack={() => setProviderView('list')} onSaved={async () => {await updateProviders(); setProviderView('list'); setEditingProvider(undefined);}}/>}
             </section>
           </div>
         </> : activeSection === 'Update' ? <>

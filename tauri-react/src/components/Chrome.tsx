@@ -1,7 +1,7 @@
 import {useEffect, useState} from 'react';
 import {getCurrentWindow} from '@tauri-apps/api/window';
 import {invoke, isTauri} from '@tauri-apps/api/core';
-import {XMarkIcon, PlusIcon, MinusIcon, Square2StackIcon, Squares2X2Icon, CommandLineIcon, GlobeAltIcon, DocumentTextIcon} from '@heroicons/react/20/solid';
+import {XMarkIcon, MinusIcon, Square2StackIcon, Squares2X2Icon, CommandLineIcon, GlobeAltIcon, DocumentTextIcon} from '@heroicons/react/20/solid';
 
 type Props = {onMinimize: () => void; onToggleMaximize: () => void; onClose: () => void; updateAvailable?: boolean; onOpenSettings?: () => void};
 
@@ -79,18 +79,13 @@ export function TitleBar({onMinimize, onToggleMaximize, onClose, updateAvailable
     <header className="titlebar" data-od-id="title-bar">
       <div className="breadcrumb" aria-live="polite">
         <span className="breadcrumb-project" id="breadcrumb-project">OpenHarness</span>
-        <span className="breadcrumb-separator" aria-hidden="true">/</span>
-        <span className="breadcrumb-chat" id="breadcrumb-chat">New chat</span>
-        <button className="new-tab" id="new-tab" type="button" aria-label="New chat" title="New chat" onClick={() => window.dispatchEvent(new Event('openharness:new-chat'))}>
-          <PlusIcon width={13} height={13} aria-hidden="true" />
-        </button>
       </div>
 
       <div className="drag-region" aria-hidden="true" data-tauri-drag-region />
 
       <div className="window-tools-menu">
         <button className="window-tools-trigger" type="button" aria-label="Open workspace tools" title="Workspace tools" aria-expanded={toolsOpen} aria-haspopup="menu" onClick={() => setToolsOpen(open => !open)}>
-          <Squares2X2Icon width={17} height={17} aria-hidden="true" />
+          <Squares2X2Icon width={18} height={18} aria-hidden="true" />
         </button>
         {toolsOpen && <>
           <button className="window-tools-dismiss" type="button" aria-label="Close workspace tools menu" onClick={() => setToolsOpen(false)} />

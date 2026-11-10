@@ -24,7 +24,16 @@ pub struct ProviderInfo {
     pub base_url: Option<String>,
     pub custom_endpoint: bool,
     pub has_key: bool,
+    #[serde(default = "default_context_tokens")]
+    pub max_context_tokens: u32,
+    #[serde(default = "default_output_tokens")]
+    pub max_output_tokens: u32,
+    #[serde(default)]
+    pub supports_vision: bool,
 }
+
+fn default_context_tokens() -> u32 { 128_000 }
+fn default_output_tokens() -> u32 { 4_096 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProjectInfo {
@@ -42,13 +51,15 @@ pub struct ChatResponse {
     pub provider: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ChatMessage {
     pub id: String,
     pub role: String,
     pub text: String,
     #[serde(default)]
     pub attachments: Vec<String>,
+    #[serde(default)]
+    pub compacted_summary: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -57,12 +68,17 @@ pub struct ChatThread {
     pub project_id: String,
     pub title: String,
     pub messages: Vec<ChatMessage>,
+    #[serde(default)]
+    pub compacted_summary: Option<String>,
+    #[serde(default)]
+    pub compacted_message_count: usize,
 }
 
 pub struct AppState {
     pub providers: Mutex<HashMap<String, ProviderInfo>>,
     pub projects: Mutex<Vec<ProjectInfo>>,
     pub threads: Mutex<Vec<ChatThread>>,
+    persist_lock: Mutex<()>,
     app_data_dir: Mutex<Option<PathBuf>>,
     pub streams: Mutex<HashMap<String, oneshot::Sender<()>>>,
     next_stream_id: AtomicU64,
@@ -81,6 +97,7 @@ impl Default for AppState {
             providers: Mutex::new(HashMap::new()),
             projects: Mutex::new(Vec::new()),
             threads: Mutex::new(Vec::new()),
+            persist_lock: Mutex::new(()),
             app_data_dir: Mutex::new(None),
             streams: Mutex::new(HashMap::new()),
             next_stream_id: AtomicU64::new(1),
@@ -124,6 +141,7 @@ struct PersistedState {
 
 impl AppState {
     fn persist(&self) -> Result<(), String> {
+        let _persist_guard = self.persist_lock.lock().map_err(|e| format!("Lock failure: {}", e))?;
         let path = self
             .app_data_dir
             .lock()
@@ -196,6 +214,9 @@ impl AppState {
         base_url: Option<String>,
         custom_endpoint: bool,
         api_key: String,
+        max_context_tokens: u32,
+        max_output_tokens: u32,
+        supports_vision: bool,
     ) -> Result<ProviderInfo, String> {
         let provider = provider.trim();
         let model_id = model_id.trim();
@@ -210,23 +231,36 @@ impl AppState {
             Some(value) => Some(client::validated_endpoint_for_test(provider, Some(value))?),
             None => None,
         };
-        let has_key = !api_key.trim().is_empty();
+        if !(1_024..=2_000_000).contains(&max_context_tokens) || !(1..=max_context_tokens).contains(&max_output_tokens) {
+            return Err("Token limits are outside supported ranges".into());
+        }
+        let keep_existing_key = api_key == "__KEEP_EXISTING__";
+        let existing_has_key = self.providers.lock().map_err(|e| format!("Lock failure: {}", e))?.get(provider).map(|item| item.has_key).unwrap_or(false);
+        if keep_existing_key && !existing_has_key {
+            return Err("No saved API key exists to preserve".into());
+        }
+        if keep_existing_key && secrets::get_secret(&format!("provider_{}", provider))?.is_none() {
+            return Err("The saved API key is missing; enter it again".into());
+        }
+        let has_key = keep_existing_key || !api_key.trim().is_empty();
         if provider.is_empty() || model_id.is_empty() || (provider != "Ollama" && provider != "OpenAI Compatible" && !has_key) {
             return Err("Provider, model ID, and API key are required".into());
         }
 
-        if has_key {
+        if has_key && !keep_existing_key {
             secrets::save_secret(&format!("provider_{}", provider), &api_key)?;
-        } else {
+        } else if !keep_existing_key {
             secrets::delete_secret(&format!("provider_{}", provider))?;
         }
-
         let info = ProviderInfo {
             provider: provider.to_string(),
             model_id: model_id.to_string(),
             base_url: validated_base_url,
             custom_endpoint,
             has_key,
+            max_context_tokens,
+            max_output_tokens,
+            supports_vision,
         };
 
         let mut guard = self
@@ -433,6 +467,8 @@ impl AppState {
             project_id: project_id.to_string(),
             title: "New chat".into(),
             messages: Vec::new(),
+            compacted_summary: None,
+            compacted_message_count: 0,
         };
         let mut guard = self
             .threads
@@ -496,7 +532,33 @@ impl AppState {
         self.append_thread_message_with_attachments(thread_id, role, text, &[])
     }
 
+    fn set_thread_compaction_summary(
+        &self,
+        thread_id: &str,
+        expected_messages: &[ChatMessage],
+        summary: &str,
+    ) -> Result<ChatThread, String> {
+        let mut guard = self
+            .threads
+            .lock()
+            .map_err(|e| format!("Lock failure: {}", e))?;
+        let thread = guard
+            .iter_mut()
+            .find(|thread| thread.id == thread_id)
+            .ok_or_else(|| format!("Thread not found: {}", thread_id))?;
+        if thread.messages != expected_messages {
+            return Err("Thread changed during compaction; retry after refresh".into());
+        }
+        thread.compacted_summary = Some(summary.to_string());
+        thread.compacted_message_count = thread.messages.len();
+        let updated = thread.clone();
+        drop(guard);
+        self.persist()?;
+        Ok(updated)
+    }
+
     pub fn append_thread_message_with_attachments(
+
         &self,
         thread_id: &str,
         role: &str,
@@ -514,6 +576,7 @@ impl AppState {
             role: role.into(),
             text: text.into(),
             attachments: attachments.to_vec(),
+            compacted_summary: None,
         };
         let mut guard = self
             .threads
@@ -552,6 +615,8 @@ impl AppState {
             .find(|msg| msg.id == message_id)
             .ok_or_else(|| format!("Message not found: {}", message_id))?;
         message.text = new_text.trim().to_string();
+        thread.compacted_summary = None;
+        thread.compacted_message_count = 0;
         let updated = message.clone();
         drop(guard);
         self.persist()?;
@@ -572,6 +637,8 @@ impl AppState {
             .find(|thread| thread.id == thread_id)
             .ok_or_else(|| format!("Thread not found: {}", thread_id))?;
         thread.messages.retain(|msg| msg.id != message_id);
+        thread.compacted_summary = None;
+        thread.compacted_message_count = 0;
         let remaining = thread.messages.clone();
         drop(guard);
         self.persist()?;
@@ -584,7 +651,12 @@ impl AppState {
         model_id: &str,
         provider: &str,
         project_id: Option<&str>,
+        attachments: &[String],
+        supports_vision: bool,
     ) -> Result<ChatResponse, String> {
+        if !attachments.is_empty() && !supports_vision {
+            return Err("Selected model is not configured for image input".into());
+        }
         let trimmed = prompt.trim();
         if trimmed.is_empty() {
             return Err("Prompt cannot be empty".into());
@@ -610,6 +682,9 @@ impl AppState {
                 &messages,
                 key_opt.as_deref(),
                 base_url,
+                saved_provider.as_ref().map(|provider| provider.max_output_tokens).unwrap_or_else(default_output_tokens),
+                attachments,
+                supports_vision,
             )
             .await?
         } else {
@@ -656,9 +731,21 @@ fn provider_save(
     base_url: Option<String>,
     custom_endpoint: bool,
     api_key: String,
+    max_context_tokens: Option<u32>,
+    max_output_tokens: Option<u32>,
+    supports_vision: Option<bool>,
     state: State<'_, AppState>,
 ) -> Result<ProviderInfo, String> {
-    state.save_provider(provider, model_id, base_url, custom_endpoint, api_key)
+    state.save_provider(
+        provider,
+        model_id,
+        base_url,
+        custom_endpoint,
+        api_key,
+        max_context_tokens.unwrap_or_else(default_context_tokens),
+        max_output_tokens.unwrap_or_else(default_output_tokens),
+        supports_vision.unwrap_or(false),
+    )
 }
 
 #[tauri::command]
@@ -746,6 +833,24 @@ fn get_thread(id: String, state: State<'_, AppState>) -> Result<ChatThread, Stri
 }
 
 #[tauri::command]
+async fn compact_thread(thread_id: String, model_id: String, provider: String, state: State<'_, AppState>) -> Result<String, String> {
+    let thread = state.get_thread(&thread_id)?;
+    if thread.messages.len() < 2 { return Ok(String::new()); }
+    let original_messages = thread.messages.clone();
+    let compacted_count = thread.compacted_message_count.min(original_messages.len());
+    let mut messages = Vec::with_capacity(original_messages.len().saturating_sub(compacted_count) + 1);
+    if let Some(existing_summary) = thread.compacted_summary.as_deref() {
+        messages.push(client::ModelMessage::new("system", &format!("Previously compacted conversation summary: {}", existing_summary)));
+    }
+    messages.extend(original_messages.iter().skip(compacted_count).map(|message| client::ModelMessage::new(&message.role, &message.text)));
+    let key = secrets::get_secret(&format!("provider_{}", provider))?;
+    let saved = state.providers.lock().map_err(|e| format!("Lock failure: {}", e))?.get(&provider).cloned();
+    let summary = client::query_llm(&provider, &model_id, &messages, key.as_deref(), saved.as_ref().and_then(|p| p.base_url.as_deref()), saved.as_ref().map(|p| p.max_output_tokens).unwrap_or_else(default_output_tokens), &[], false).await?;
+    state.set_thread_compaction_summary(&thread_id, &original_messages, &summary)?;
+    Ok(summary)
+}
+
+#[tauri::command]
 fn edit_thread_message(
     thread_id: String,
     message_id: String,
@@ -799,6 +904,8 @@ struct StreamChunk {
     approval: Option<ApprovalRequest>,
     #[serde(skip_serializing_if = "Option::is_none")]
     step: Option<StepEvent>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cached_input_tokens: Option<u32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -820,7 +927,7 @@ pub struct PendingApprovals {
     waiting: HashMap<String, tokio::sync::oneshot::Sender<ApprovalDecision>>,
 }
 
-const MAX_AGENT_ITERATIONS: usize = 12;
+const MAX_AGENT_ITERATIONS: usize = 24;
 const MAX_AGENT_RESPONSE_BYTES: usize = 1_000_000;
 const MAX_COMMAND_BYTES: usize = 16_384;
 const MAX_TOOL_OUTPUT_BYTES: usize = 200_000;
@@ -916,21 +1023,29 @@ async fn run_agent_loop(
     base_url: Option<String>,
     project_root: PathBuf,
     initial_messages: Vec<client::ModelMessage>,
+    compacted_summary: Option<String>,
+    max_output_tokens: u32,
     emitter: Channel<StreamChunk>,
     approvals: Arc<Mutex<PendingApprovals>>,
     attachments: Vec<String>,
+    supports_vision: bool,
 ) -> Result<String, String> {
     let system_prompt = harness::ToolDispatcher::build_system_prompt();
-    let mut messages = Vec::with_capacity(initial_messages.len() + attachments.len() + 1);
+    let configured_max_output_tokens = max_output_tokens;
+    let mut messages = Vec::with_capacity(initial_messages.len() + attachments.len() + 2);
     messages.push(client::ModelMessage::new("system", &system_prompt));
+    if let Some(summary) = compacted_summary.as_deref() {
+        messages.push(client::ModelMessage::new("system", &format!("Previously compacted conversation summary: {}", summary)));
+    }
     for m in initial_messages {
-        if m.role != "system" {
-            messages.push(m);
+        messages.push(m);
+    }
+        for attachment in &attachments {
+            if client::is_image_attachment(attachment) {
+                continue;
+            }
+            messages.push(client::ModelMessage::new("user", attachment));
         }
-    }
-    for attachment in attachments {
-        messages.push(client::ModelMessage::new("user", &attachment));
-    }
 
     let final_text = String::new();
     for _iteration in 0..MAX_AGENT_ITERATIONS {
@@ -952,7 +1067,23 @@ async fn run_agent_loop(
             key.as_deref(),
             base_url.as_deref(),
             &tools,
+            configured_max_output_tokens,
+            &attachments,
+            supports_vision,
             |_| {},
+            {
+                let usage_emitter = emitter.clone();
+                move |tokens| {
+                    let _ = usage_emitter.send(StreamChunk {
+                        text: String::new(),
+                        done: false,
+                        error: None,
+                        approval: None,
+                        step: None,
+                        cached_input_tokens: Some(tokens),
+                    });
+                }
+            },
         )
         .await?;
 
@@ -978,6 +1109,7 @@ async fn run_agent_loop(
                 error: None,
                 approval: None,
                 step: None,
+                cached_input_tokens: None,
             });
             return Ok(final_reply);
         }
@@ -1031,6 +1163,7 @@ async fn run_agent_loop(
                     error: None,
                     approval: Some(request),
                     step: None,
+                    cached_input_tokens: None,
                 });
                 let step_id = call.id.clone();
                 let label = tool_label(&call.name, &call.arguments);
@@ -1040,6 +1173,7 @@ async fn run_agent_loop(
                     error: None,
                     approval: None,
                     step: Some(StepEvent { id: step_id.clone(), kind: tool_kind(&call.name).into(), label: label.clone(), status: "approval".into(), detail: None }),
+                    cached_input_tokens: None,
                 });
                 let decision = receiver
                     .await
@@ -1050,6 +1184,7 @@ async fn run_agent_loop(
                     error: None,
                     approval: None,
                     step: Some(StepEvent { id: step_id, kind: tool_kind(&call.name).into(), label, status: if decision.allowed { "running" } else { "failed" }.into(), detail: None }),
+                    cached_input_tokens: None,
                 });
                 if !decision.allowed {
                     let observation = decision
@@ -1068,6 +1203,7 @@ async fn run_agent_loop(
                     error: None,
                     approval: None,
                     step: Some(StepEvent { id: call.id.clone(), kind: tool_kind(&call.name).into(), label: tool_label(&call.name, &call.arguments), status: "running".into(), detail: None }),
+                    cached_input_tokens: None,
                 });
             }
 
@@ -1097,6 +1233,7 @@ async fn run_agent_loop(
                     status: status.into(),
                     detail,
                 }),
+                cached_input_tokens: None,
             });
             let mut observation = harness::ToolDispatcher::format_observation(&tool_result);
             observation = clamp_string(observation, MAX_TOOL_OUTPUT_BYTES);
@@ -1220,10 +1357,17 @@ async fn chat_send(
     model_id: String,
     provider: String,
     project_id: Option<String>,
+    attachments: Option<Vec<String>>,
+    supports_vision: Option<bool>,
     state: State<'_, AppState>,
 ) -> Result<ChatResponse, String> {
+    let vision_enabled = supports_vision.unwrap_or_else(|| {
+        state.providers.lock().ok()
+            .and_then(|providers| providers.get(&provider).filter(|item| item.model_id == model_id).map(|item| item.supports_vision))
+            .unwrap_or(false)
+    });
     state
-        .chat(&prompt, &model_id, &provider, project_id.as_deref())
+        .chat(&prompt, &model_id, &provider, project_id.as_deref(), attachments.as_deref().unwrap_or(&[]), vision_enabled)
         .await
 }
 
@@ -1236,6 +1380,7 @@ async fn chat_send_stream(
     project_id: Option<String>,
     thread_id: Option<String>,
     attachments: Option<Vec<String>>,
+    supports_vision: Option<bool>,
     channel: Channel<StreamChunk>,
     state: State<'_, AppState>,
 ) -> Result<String, String> {
@@ -1269,12 +1414,17 @@ async fn chat_send_stream(
         .get(&provider)
         .cloned();
     let config_url = saved.as_ref().and_then(|item| item.base_url.clone());
-    let history = if let Some(thread_id) = thread_id.as_deref() {
-        state.get_thread(thread_id)?.messages
+    let max_output_tokens = saved.as_ref().map(|item| item.max_output_tokens).unwrap_or_else(default_output_tokens);
+    let supports_vision = supports_vision.unwrap_or_else(|| saved.as_ref().filter(|item| item.model_id == model_id).map(|item| item.supports_vision).unwrap_or(false));
+    let history_thread = if let Some(thread_id) = thread_id.as_deref() {
+        Some(state.get_thread(thread_id)?)
     } else {
-        Vec::new()
+        None
     };
-    let attachments_from_request = attachments.clone().unwrap_or_default();
+    let history = history_thread.as_ref().map(|thread| thread.messages.clone()).unwrap_or_default();
+    let compacted_message_count = history_thread.as_ref().map(|thread| thread.compacted_message_count.min(thread.messages.len())).unwrap_or(0);
+    let attachments = attachments.unwrap_or_default();
+    let attachments_from_request = attachments.clone();
     if let Some(thread_id) = thread_id.as_deref() {
         state.append_thread_message_with_attachments(
             thread_id,
@@ -1283,16 +1433,29 @@ async fn chat_send_stream(
             &attachments_from_request,
         )?;
     }
-    let mut messages = history
+    let mut messages = Vec::with_capacity(history.len() + attachments.len() + 1);
+    messages.extend(history
         .iter()
-        .map(|message| client::ModelMessage::new(&message.role, &message.text))
-        .collect::<Vec<_>>();
+        .skip(compacted_message_count)
+        .map(|message| client::ModelMessage::new(&message.role, &message.text)));
     messages.push(client::ModelMessage::new("user", trimmed));
+    for attachment in &attachments {
+            if client::is_image_attachment(attachment) {
+                continue;
+            }
+            messages.push(client::ModelMessage::new("user", attachment));
+        }
+        if !attachments.is_empty() && !messages.iter().any(|message| message.role == "user" && message.content == trimmed) {
+            messages.push(client::ModelMessage::new("user", trimmed));
+        }
     let emitter = channel.clone();
+    let usage_channel = channel.clone();
     let provider_owned = provider.clone();
     let model_owned = model_id.clone();
     let key_owned = key.clone();
     let url_owned = config_url.clone();
+    let max_output_tokens_owned = max_output_tokens;
+    let attachments_owned = attachments_from_request;
     let project_root_opt = project_id
         .as_deref()
         .and_then(|id| state.project_root(id).ok())
@@ -1305,9 +1468,11 @@ async fn chat_send_stream(
     let approvals = state.pending_approvals.clone();
     let task_state = state.inner();
     let task = tokio::spawn(async move {
-        let attachments = attachments_from_request;
         if let Some(root) = project_root_opt {
             if key_owned.is_some() || saved.is_some() || provider_owned == "Ollama" {
+                if !attachments_owned.is_empty() && !supports_vision {
+                    return Err("Selected model is not configured for image input".into());
+                }
                 let result = run_agent_loop(
                     provider_owned.clone(),
                     model_owned.clone(),
@@ -1315,9 +1480,12 @@ async fn chat_send_stream(
                     url_owned.clone(),
                     root,
                     messages,
+                    history_thread.as_ref().and_then(|thread| thread.compacted_summary.clone()),
+                    max_output_tokens_owned,
                     emitter.clone(),
                     approvals,
                     attachments,
+                    supports_vision,
                 )
                 .await?;
                 Ok(result)
@@ -1332,16 +1500,23 @@ async fn chat_send_stream(
                         error: None,
                         approval: None,
                         step: None,
+                        cached_input_tokens: None,
                     });
                 Ok(text)
             }
         } else if key_owned.is_some() || saved.is_some() {
+            if !attachments_owned.is_empty() && !supports_vision {
+                return Err("Selected model is not configured for image input".into());
+            }
             client::query_llm_stream(
                 &provider_owned,
                 &model_owned,
                 &messages,
                 key_owned.as_deref(),
                 url_owned.as_deref(),
+                max_output_tokens_owned,
+                &attachments_owned,
+                supports_vision,
                 move |text| {
                      let _ = emitter.send(StreamChunk {
                         text,
@@ -1349,6 +1524,17 @@ async fn chat_send_stream(
                         error: None,
                         approval: None,
                         step: None,
+                        cached_input_tokens: None,
+                    });
+                },
+                move |tokens| {
+                    let _ = usage_channel.send(StreamChunk {
+                        text: String::new(),
+                        done: false,
+                        error: None,
+                        approval: None,
+                        step: None,
+                        cached_input_tokens: Some(tokens),
                     });
                 },
             )
@@ -1364,6 +1550,7 @@ async fn chat_send_stream(
                 error: None,
                 approval: None,
                 step: None,
+                cached_input_tokens: None,
             });
             Ok(text)
         }
@@ -1386,11 +1573,12 @@ async fn chat_send_stream(
             channel
                 .send(StreamChunk {
                     text: String::new(),
-                    done: true,
-                    error: None,
-                    approval: None,
-                    step: None,
-                })
+                done: true,
+                error: None,
+                approval: None,
+                step: None,
+                cached_input_tokens: None,
+            })
                 .map_err(|e| e.to_string())?;
             Ok(stream_id)
         }
@@ -1401,6 +1589,7 @@ async fn chat_send_stream(
                 error: Some(error.clone()),
                 approval: None,
                 step: None,
+                cached_input_tokens: None,
             });
             Err(error)
         }
@@ -1442,6 +1631,9 @@ async fn test_provider_connection(
         &test_messages,
         Some(&api_key),
         base_url.as_deref(),
+        default_output_tokens(),
+        &[],
+        false,
     )
     .await?;
     Ok("Connection successful".into())
@@ -1702,6 +1894,7 @@ pub fn run() {
             delete_thread,
             rename_thread,
             get_thread,
+            compact_thread,
             append_thread_message,
             edit_thread_message,
             delete_thread_message,
@@ -1761,6 +1954,9 @@ mod tests {
             Some("https://api.test.com".into()),
             true,
             "test-secret-key-123".into(),
+            128_000,
+            4_096,
+            true,
         );
         assert!(save_res.is_ok());
 
@@ -1794,6 +1990,84 @@ mod tests {
         assert_eq!(renamed[0].name, "Renamed");
         let after_delete = state.delete_project(&proj.id).unwrap();
         assert!(after_delete.is_empty());
+    }
+
+    #[test]
+    fn agent_tool_loop_allows_at_least_24_model_rounds() {
+        assert!(MAX_AGENT_ITERATIONS >= 24);
+    }
+
+    #[test]
+    fn compaction_stores_summary_without_deleting_thread_history() {
+        let state = AppState::default();
+        let project = state.create_project("Compaction".into(), None).unwrap();
+        let thread = state.create_thread(&project.id).unwrap();
+        state.append_thread_message(&thread.id, "user", "first question").unwrap();
+        state.append_thread_message(&thread.id, "assistant", "first answer").unwrap();
+        let before = state.get_thread(&thread.id).unwrap();
+
+        state.set_thread_compaction_summary(&thread.id, &before.messages, "Summary of prior exchange").unwrap();
+        let after = state.get_thread(&thread.id).unwrap();
+
+        assert_eq!(after.messages, before.messages);
+        assert_eq!(after.messages.len(), 2);
+        assert_eq!(after.compacted_summary.as_deref(), Some("Summary of prior exchange"));
+        assert_eq!(after.compacted_message_count, 2);
+
+        state.append_thread_message(&thread.id, "user", "follow-up").unwrap();
+        let after_follow_up = state.get_thread(&thread.id).unwrap();
+        assert_eq!(after_follow_up.messages.len(), 3);
+        assert_eq!(after_follow_up.compacted_summary.as_deref(), Some("Summary of prior exchange"));
+        assert_eq!(after_follow_up.compacted_message_count, 2);
+
+        state.set_thread_compaction_summary(&thread.id, &after_follow_up.messages, "Summary after follow-up").unwrap();
+        let newest = state.get_thread(&thread.id).unwrap();
+        let existing_summary = newest.compacted_summary.clone();
+        state.append_thread_message(&thread.id, "assistant", "follow-up response").unwrap();
+        let final_state = state.get_thread(&thread.id).unwrap();
+        assert_eq!(final_state.messages.len(), 4);
+        assert_eq!(final_state.compacted_summary, existing_summary);
+        assert_eq!(final_state.compacted_message_count, 3);
+
+        state.set_thread_compaction_summary(&thread.id, &final_state.messages, "Final compacted context").unwrap();
+        let newly_compacted = state.get_thread(&thread.id).unwrap();
+        assert_eq!(newly_compacted.messages.len(), 4);
+        assert_eq!(newly_compacted.compacted_summary.as_deref(), Some("Final compacted context"));
+        assert_eq!(newly_compacted.compacted_message_count, 4);
+    }
+
+    #[test]
+    fn compaction_request_contains_summary_and_only_newer_messages() {
+        let state = AppState::default();
+        let project = state.create_project("Compaction suffix".into(), None).unwrap();
+        let thread = state.create_thread(&project.id).unwrap();
+        state.append_thread_message(&thread.id, "user", "old prompt").unwrap();
+        state.append_thread_message(&thread.id, "assistant", "old response").unwrap();
+        let original = state.get_thread(&thread.id).unwrap();
+        state.set_thread_compaction_summary(&thread.id, &original.messages, "prior summary").unwrap();
+        state.append_thread_message(&thread.id, "user", "new prompt").unwrap();
+        let updated = state.get_thread(&thread.id).unwrap();
+        let compacted_count = updated.compacted_message_count.min(updated.messages.len());
+        let request = updated.messages.iter().skip(compacted_count).map(|message| message.text.as_str()).collect::<Vec<_>>();
+        assert_eq!(request, vec!["new prompt"]);
+        assert_eq!(updated.compacted_summary.as_deref(), Some("prior summary"));
+        assert_eq!(updated.messages.len(), 3);
+    }
+
+    #[test]
+    fn compaction_rejects_changed_history_without_mutating_thread() {
+        let state = AppState::default();
+        let project = state.create_project("Compaction race".into(), None).unwrap();
+        let thread = state.create_thread(&project.id).unwrap();
+        state.append_thread_message(&thread.id, "user", "first question").unwrap();
+        let before = state.get_thread(&thread.id).unwrap();
+        state.append_thread_message(&thread.id, "assistant", "newer answer").unwrap();
+
+        assert!(state.set_thread_compaction_summary(&thread.id, &before.messages, "Stale summary").is_err());
+        let after = state.get_thread(&thread.id).unwrap();
+        assert_eq!(after.messages.len(), 2);
+        assert!(after.compacted_summary.is_none());
+        assert_eq!(after.compacted_message_count, 0);
     }
 
     #[test]

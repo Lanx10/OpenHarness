@@ -1,11 +1,14 @@
 import {useEffect, useRef, useState} from 'react';
-import {ChevronDownIcon, ArrowUpIcon, PaperClipIcon} from '@heroicons/react/20/solid';
+import {ChevronDownIcon, ArrowUpIcon, PaperClipIcon, StopIcon} from '@heroicons/react/20/solid';
 import {apiListProviders, type ProviderInfo} from '../services/tauriBridge';
 
 type Model = {
   id: string;
   name: string;
   provider: string;
+  supportsVision: boolean;
+  maxContextTokens: number;
+  maxOutputTokens: number;
 };
 
 type AttachmentInfo = {
@@ -15,7 +18,7 @@ type AttachmentInfo = {
   isImage?: boolean;
 };
 
-export function Composer() {
+export function Composer({running = false, onStop}: {running?: boolean; onStop?: () => void}) {
   const [prompt, setPrompt] = useState('');
   const [modelPickerOpen, setModelPickerOpen] = useState(false);
   const [models, setModels] = useState<Model[]>([]);
@@ -28,12 +31,12 @@ export function Composer() {
   const loadModels = async () => {
     try {
       const providers: ProviderInfo[] = await apiListProviders();
-      const list: Model[] = providers.map((p) => ({id: p.model_id, name: `${p.provider} · ${p.model_id}`, provider: p.provider}));
+      const list: Model[] = providers.map((p) => ({id: p.model_id, name: `${p.provider} · ${p.model_id}`, provider: p.provider, supportsVision: p.supports_vision ?? false, maxContextTokens: p.max_context_tokens ?? 128_000, maxOutputTokens: p.max_output_tokens ?? 4_096}));
       const savedDefault = localStorage.getItem('openharness:default-model');
       if (savedDefault) {
         const parsed: Model = JSON.parse(savedDefault);
         if (!list.some((m) => m.id === parsed.id && m.provider === parsed.provider)) {
-          list.unshift(parsed);
+          list.unshift({...parsed, supportsVision: parsed.supportsVision ?? false, maxContextTokens: parsed.maxContextTokens ?? 128_000, maxOutputTokens: parsed.maxOutputTokens ?? 4_096});
         }
       }
       setModels(list);
@@ -141,10 +144,16 @@ export function Composer() {
   const send = () => {
     const text = prompt.trim();
     if (!text && attachments.length === 0) return;
-    const combined = attachments.length ? `${attachments.map(a => a.content).join('\n\n')}\n\n${text}` : text;
+    const fileText = attachments.filter(attachment => !attachment.isImage).map(attachment => attachment.content).join('\n\n');
+    const combined = [fileText, text].filter(Boolean).join('\n\n');
     const model = selectedModel;
     if (!model) return;
-    const detail = {text: combined, modelId: model.id, provider: model.provider, projectId, attachments: attachments.map(a => a.content)};
+    const imageAttachments = attachments.filter(item => item.isImage);
+    if (imageAttachments.length && !model.supportsVision) {
+      toastError('Selected model does not support images. Remove image attachments or choose a vision-capable model.');
+      return;
+    }
+    const detail = {text: combined, modelId: model.id, provider: model.provider, projectId, attachments: attachments.map(a => a.content), supportsVision: model.supportsVision, modelContextTokens: model.maxContextTokens, modelOutputTokens: model.maxOutputTokens};
     window.dispatchEvent(new CustomEvent('openharness:send-message', {detail}));
     setPrompt('');
     setAttachments([]);
@@ -220,15 +229,21 @@ export function Composer() {
                     localStorage.setItem('openharness:default-model', JSON.stringify(m));
                   }}
                 >
-                  {m.name}
+                  {m.name}{m.supportsVision ? ' · Images' : ''}
                 </button>
               );
             })}
           </div>
         </div>
-        <button className="send-button" type="submit" aria-label="Send message" title="Send">
-          <ArrowUpIcon width={16} height={16} aria-hidden="true" />
-        </button>
+        {running ? (
+          <button className="send-button stop-generation" type="button" onClick={onStop} aria-label="Stop generation" title="Stop generation">
+            <StopIcon width={14} aria-hidden="true" />
+          </button>
+        ) : (
+          <button className="send-button" type="submit" aria-label="Send message" title="Send">
+            <ArrowUpIcon width={16} height={16} aria-hidden="true" />
+          </button>
+        )}
       </div>
     </form>
   );

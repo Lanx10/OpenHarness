@@ -31,6 +31,13 @@ test('renders markdown images with safe image sources and escaped alt text', () 
   assert.ok(!html.includes('javascript:'));
 });
 
+test('does not render an attached data image markdown as prompt text', () => {
+  const html = formatInlineMarkdown('What is in this picture? ![sample](data:image/png;base64,aGVsbG8=)');
+  assert.match(html, /What is in this picture\?/);
+  assert.match(html, /sample \(image attachment\)/);
+  assert.ok(!html.includes('aGVsbG8='));
+});
+
 test('preserves fenced code as a code block, escaped only by React text rendering', () => {
   const blocks = parseMarkdownBlocks('```ts\nconst x = "<tag>";\n```');
   assert.deepEqual(blocks, [{type: 'code', language: 'ts', content: 'const x = "<tag>";'}]);

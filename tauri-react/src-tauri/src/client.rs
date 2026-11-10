@@ -25,6 +25,58 @@ impl ModelMessage {
 const MAX_ERROR_BODY_CHARS: usize = 512;
 const MAX_RESPONSE_BYTES: usize = 1_000_000;
 
+pub fn is_image_attachment(attachment: &str) -> bool {
+    attachment.starts_with("![") && attachment.contains("](data:image/")
+}
+
+fn image_data_urls(attachments: &[String]) -> Vec<String> {
+    attachments
+        .iter()
+        .filter_map(|attachment| {
+            let url = if attachment.starts_with("![") && attachment.contains("](data:image/") {
+                let start = attachment.find("](data:image/")? + 2;
+                let end = attachment[start..].find(')')? + start;
+                &attachment[start..end]
+            } else if attachment.starts_with("data:image/") {
+                attachment.as_str()
+            } else {
+                let start = attachment.find("](data:image/")? + 2;
+                let end = attachment[start..].find(')')? + start;
+                &attachment[start..end]
+            };
+            let (header, data) = url.split_once(',')?;
+            let mime = header.strip_prefix("data:")?.strip_suffix(";base64")?;
+            let valid_mime = matches!(mime, "image/png" | "image/jpeg" | "image/webp" | "image/gif");
+            let valid_base64 = !data.is_empty()
+                && data.len() % 4 == 0
+                && {
+                    let padding = data.bytes().rev().take_while(|byte| *byte == b'=').count();
+                    padding <= 2
+                        && !data[..data.len() - padding].contains('=')
+                        && data
+                            .bytes()
+                            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'/' | b'='))
+                };
+            (valid_mime && valid_base64 && url.len() <= 5_600_000).then(|| url.to_string())
+        })
+        .collect()
+}
+
+fn attach_images_to_user(payload: &mut [Value], images: &[String], ollama: bool) -> Result<(), String> {
+    if images.is_empty() { return Ok(()); }
+    let user = payload.iter_mut().rev().find(|message| message["role"] == "user")
+        .ok_or_else(|| "Image attachments require a current user message".to_string())?;
+    if ollama {
+        user["images"] = serde_json::json!(images.iter().filter_map(|image| image.split_once(',').map(|(_, data)| data.to_string())).collect::<Vec<_>>());
+    } else {
+        let prompt = user["content"].as_str().unwrap_or("").to_string();
+        let mut content = vec![serde_json::json!({"type": "text", "text": prompt})];
+        content.extend(images.iter().map(|image| serde_json::json!({"type": "image_url", "image_url": {"url": image}})));
+        user["content"] = serde_json::json!(content);
+    }
+    Ok(())
+}
+
 fn safe_error_body(body: &str) -> String {
     body.chars().take(MAX_ERROR_BODY_CHARS).collect()
 }
@@ -72,9 +124,7 @@ fn endpoint_url(provider: &str, custom: Option<&str>) -> Result<String, String> 
     let default_url = match provider {
         "Ollama" => "http://localhost:11434/api/chat",
         "OpenRouter" => "https://openrouter.ai/api/v1/chat/completions",
-        "Google AI Studio" => {
-            "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions"
-        }
+        "Google AI Studio" => "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions",
         "OpenAI Compatible" => "https://api.openai.com/v1/chat/completions",
         _ => return Err(format!("Unsupported provider: {}", provider)),
     };
@@ -147,6 +197,9 @@ pub async fn query_llm(
     messages: &[ModelMessage],
     api_key: Option<&str>,
     base_url: Option<&str>,
+    max_output_tokens: u32,
+    attachments: &[String],
+    supports_vision: bool,
 ) -> Result<String, String> {
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(45))
@@ -156,11 +209,18 @@ pub async fn query_llm(
 
     match provider {
         "Ollama" => {
+            let images = image_data_urls(attachments);
+            if !images.is_empty() && !supports_vision {
+                return Err("Model is not configured for image input".into());
+            }
             let url = endpoint_url(provider, base_url)?;
+            let mut payload = messages_json(messages);
+            attach_images_to_user(&mut payload, &images, true)?;
             let body = serde_json::json!({
                 "model": model_id,
-                "messages": messages_json(messages),
-                "stream": false
+                "messages": payload,
+                "stream": false,
+                "options": {"num_predict": max_output_tokens}
             });
             let mut req = client.post(url).json(&body);
             if let Some(key) = api_key.filter(|key| !key.trim().is_empty()) {
@@ -188,15 +248,22 @@ pub async fn query_llm(
                 .unwrap_or("No reply from Ollama");
             Ok(content.to_string())
         }
-        _ => {
+        "OpenRouter" | "Google AI Studio" | "OpenAI Compatible" => {
+            let images = image_data_urls(attachments);
+            if !images.is_empty() && !supports_vision {
+                return Err("Model is not configured for image input".into());
+            }
             let key_opt = api_key.filter(|k| !k.trim().is_empty());
             if key_opt.is_none() && provider != "OpenAI Compatible" {
                 return Err(format!("API key is required for {}", provider));
             }
             let url = endpoint_url(provider, base_url)?;
+            let mut payload = messages_json(messages);
+            attach_images_to_user(&mut payload, &images, false)?;
             let body = serde_json::json!({
                 "model": model_id,
-                "messages": messages_json(messages)
+                "messages": payload,
+                "max_tokens": max_output_tokens
             });
 
             let mut req = client
@@ -256,7 +323,22 @@ pub async fn query_llm(
                 Err("Provider returned empty response choices without text or tool calls.".to_string())
             }
         }
+        other => Err(format!("Unsupported provider: {}", other)),
     }
+}
+
+fn cached_input_tokens(usage: &Value) -> Option<u32> {
+    [
+        usage.pointer("/prompt_tokens_details/cached_tokens"),
+        usage.pointer("/input_tokens_details/cached_tokens"),
+        usage.pointer("/usageMetadata/cachedContentTokenCount"),
+        usage.pointer("/usage/usageMetadata/cachedContentTokenCount"),
+        usage.pointer("/prompt_token_count_details/cached_tokens"),
+    ]
+    .into_iter()
+    .flatten()
+    .find_map(Value::as_u64)
+    .and_then(|tokens| u32::try_from(tokens).ok())
 }
 
 pub async fn query_llm_stream(
@@ -265,9 +347,13 @@ pub async fn query_llm_stream(
     messages: &[ModelMessage],
     api_key: Option<&str>,
     base_url: Option<&str>,
+    max_output_tokens: u32,
+    attachments: &[String],
+    supports_vision: bool,
     on_token: impl Fn(String) + Send + Sync + 'static,
+    on_cached_input_tokens: impl Fn(u32) + Send + Sync + 'static,
 ) -> Result<String, String> {
-    query_llm_stream_with_tools(provider, model_id, messages, api_key, base_url, &[], on_token).await
+    query_llm_stream_with_tools(provider, model_id, messages, api_key, base_url, &[], max_output_tokens, attachments, supports_vision, on_token, on_cached_input_tokens).await
 }
 
 pub async fn query_llm_stream_with_tools(
@@ -277,7 +363,11 @@ pub async fn query_llm_stream_with_tools(
     api_key: Option<&str>,
     base_url: Option<&str>,
     tools: &[Value],
+    max_output_tokens: u32,
+    attachments: &[String],
+    supports_vision: bool,
     on_token: impl Fn(String) + Send + Sync + 'static,
+    on_usage: impl Fn(u32) + Send + Sync + 'static,
 ) -> Result<String, String> {
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(120))
@@ -287,11 +377,22 @@ pub async fn query_llm_stream_with_tools(
 
     match provider {
         "Ollama" => {
+            let images = image_data_urls(attachments);
+            if !images.is_empty() && !supports_vision {
+                return Err("Model is not configured for image input".into());
+            }
             let url = endpoint_url(provider, base_url)?;
+            let mut payload = messages_json(messages);
+            if !images.is_empty() {
+                if let Some(last) = payload.last_mut().filter(|message| message["role"] == "user") {
+                    last["images"] = serde_json::json!(images.iter().filter_map(|image| image.split_once(',').map(|(_, data)| data.to_string())).collect::<Vec<_>>());
+                }
+            }
             let mut body_map = serde_json::Map::new();
             body_map.insert("model".to_string(), serde_json::json!(model_id));
-            body_map.insert("messages".to_string(), serde_json::json!(messages_json(messages)));
+            body_map.insert("messages".to_string(), serde_json::json!(payload));
             body_map.insert("stream".to_string(), serde_json::json!(true));
+            body_map.insert("options".to_string(), serde_json::json!({"num_predict": max_output_tokens}));
             if !tools.is_empty() {
                 body_map.insert("tools".to_string(), serde_json::json!(tools));
             }
@@ -365,16 +466,24 @@ pub async fn query_llm_stream_with_tools(
                 Ok(accumulated)
             }
         }
-        _ => {
+        "OpenRouter" | "Google AI Studio" | "OpenAI Compatible" => {
+            let images = image_data_urls(attachments);
+            if !images.is_empty() && !supports_vision {
+                return Err("Model is not configured for image input".into());
+            }
             let key_opt = api_key.filter(|k| !k.trim().is_empty());
             if key_opt.is_none() && provider != "OpenAI Compatible" {
                 return Err(format!("API key is required for {}", provider));
             }
             let url = endpoint_url(provider, base_url)?;
+            let mut payload = messages_json(messages);
+            attach_images_to_user(&mut payload, &images, false)?;
             let mut body_map = serde_json::Map::new();
             body_map.insert("model".to_string(), serde_json::json!(model_id));
-            body_map.insert("messages".to_string(), serde_json::json!(messages_json(messages)));
+            body_map.insert("messages".to_string(), serde_json::json!(payload));
             body_map.insert("stream".to_string(), serde_json::json!(true));
+            body_map.insert("stream_options".to_string(), serde_json::json!({"include_usage": true}));
+            body_map.insert("max_tokens".to_string(), serde_json::json!(max_output_tokens));
             if !tools.is_empty() {
                 body_map.insert("tools".to_string(), serde_json::json!(tools));
             }
@@ -418,6 +527,11 @@ pub async fn query_llm_stream_with_tools(
                     let data = line[5..].trim();
                     if data == "[DONE]" { continue; }
                     if let Ok(json) = serde_json::from_str::<Value>(data) {
+                        if let Some(usage) = json.get("usage").or_else(|| json.get("usageMetadata"))
+                            && let Some(tokens) = cached_input_tokens(usage)
+                        {
+                            on_usage(tokens);
+                        }
                         if let Some(content) = json["choices"][0]["delta"]["content"].as_str().filter(|s| !s.is_empty()) {
                             accumulated.push_str(content);
                             on_token(content.to_string());
@@ -511,5 +625,82 @@ pub async fn query_llm_stream_with_tools(
                 Ok(accumulated)
             }
         }
+        other => Err(format!("Unsupported provider: {}", other)),
+    }
+}
+
+#[cfg(test)]
+mod image_payload_tests {
+    use super::{attach_images_to_user, image_data_urls, is_image_attachment, messages_json, ModelMessage};
+
+    #[test]
+    fn reads_cached_input_tokens_from_openai_usage() {
+        let usage = serde_json::json!({
+            "prompt_tokens": 120,
+            "prompt_tokens_details": {"cached_tokens": 80}
+        });
+        assert_eq!(super::cached_input_tokens(&usage), Some(80));
+    }
+
+    #[test]
+    fn reads_cached_input_tokens_from_google_usage() {
+        let usage = serde_json::json!({
+            "usageMetadata": {"cachedContentTokenCount": 80}
+        });
+        assert_eq!(super::cached_input_tokens(&usage), Some(80));
+    }
+
+    #[test]
+    fn reads_cached_input_tokens_from_google_usage_nested_in_envelope() {
+        let response = serde_json::json!({
+            "usage": {"usageMetadata": {"cachedContentTokenCount": 7_000}}
+        });
+        assert_eq!(super::cached_input_tokens(&response["usage"]), Some(7_000));
+    }
+
+    #[test]
+    fn accepts_supported_base64_image_data_urls() {
+        let attachment = "![sample](data:image/png;base64,aGVsbG8=)".to_string();
+        assert_eq!(image_data_urls(&[attachment]), vec!["data:image/png;base64,aGVsbG8="]);
+    }
+
+    #[test]
+    fn rejects_non_image_malformed_and_oversized_data_urls() {
+        let attachments = vec![
+            "notes.txt\njust text".to_string(),
+            "![bad](data:image/png;base64,not+valid===)".to_string(),
+            format!("![huge](data:image/png;base64,{})", "A".repeat(5_600_001)),
+        ];
+        assert!(image_data_urls(&attachments).is_empty());
+    }
+
+    #[test]
+    fn image_attachment_is_not_treated_as_text_file() {
+        let attachment = "![sample](data:image/png;base64,aGVsbG8=)";
+        assert!(is_image_attachment(attachment));
+        assert!(!is_image_attachment("[notes.txt]\nhello"));
+    }
+
+    #[test]
+    fn image_is_a_vision_part_not_markdown_text() {
+        let messages = vec![ModelMessage::new("user", "What is in this picture?")];
+        let images = image_data_urls(&["![sample](data:image/png;base64,aGVsbG8=)".into()]);
+        let mut payload = messages_json(&messages);
+        attach_images_to_user(&mut payload, &images, false).unwrap();
+        assert_eq!(payload[0]["content"][0]["type"], "text");
+        assert_eq!(payload[0]["content"][0]["text"], "What is in this picture?");
+        assert_eq!(payload[0]["content"][1]["type"], "image_url");
+        assert_eq!(payload[0]["content"][1]["image_url"]["url"], "data:image/png;base64,aGVsbG8=");
+    }
+
+    #[test]
+    fn image_with_file_context_keeps_text_in_separate_user_messages() {
+        let messages = vec![ModelMessage::new("user", "Read this attached config")];
+        let mut payload = messages_json(&messages);
+        payload.insert(0, serde_json::json!({"role":"user", "content":"[config.json] {\"enabled\":true}"}));
+        let images = image_data_urls(&["![sample](data:image/png;base64,aGVsbG8=)".into()]);
+        attach_images_to_user(&mut payload, &images, false).unwrap();
+        assert_eq!(payload[0]["content"], "[config.json] {\"enabled\":true}");
+        assert_eq!(payload[1]["content"][1]["type"], "image_url");
     }
 }

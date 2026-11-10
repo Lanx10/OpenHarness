@@ -30,6 +30,9 @@ export type ProviderInfo = {
   base_url?: string | null;
   custom_endpoint: boolean;
   has_key: boolean;
+  max_context_tokens: number;
+  max_output_tokens: number;
+  supports_vision: boolean;
 };
 
 export type ProjectInfo = {
@@ -87,7 +90,11 @@ export async function apiSaveProvider(
   modelId: string,
   baseUrl: string | null,
   customEndpoint: boolean,
-  apiKey: string
+  apiKey: string,
+  maxContextTokens = 128_000,
+  maxOutputTokens = 4_096,
+  supportsVision = false,
+  keepExistingKey = false
 ): Promise<ProviderInfo> {
   if (isTauri()) {
     return await invoke<ProviderInfo>('provider_save', {
@@ -95,15 +102,22 @@ export async function apiSaveProvider(
       modelId,
       baseUrl,
       customEndpoint,
-      apiKey,
+      apiKey: apiKey || (keepExistingKey ? '__KEEP_EXISTING__' : ''),
+      maxContextTokens,
+      maxOutputTokens,
+      supportsVision,
     });
   }
+  const existing = localProviders.find(item => item.provider === provider);
   const info: ProviderInfo = {
     provider,
     model_id: modelId,
     base_url: baseUrl,
     custom_endpoint: customEndpoint,
-    has_key: true,
+    has_key: Boolean(apiKey) || (keepExistingKey && Boolean(existing?.has_key)),
+    max_context_tokens: maxContextTokens,
+    max_output_tokens: maxOutputTokens,
+    supports_vision: supportsVision,
   };
   localProviders = localProviders.filter((p) => p.provider !== provider).concat(info);
   persistStoredProviders(localProviders);
@@ -199,6 +213,7 @@ export type StreamChunkLike = {
   error?: string | null;
   approval?: ApprovalRequestLike | null;
   step?: StepEventLike | null;
+  cached_input_tokens?: number | null;
 };
 
 export async function apiChatStream(
@@ -208,11 +223,13 @@ export async function apiChatStream(
   projectId?: string,
   threadId?: string,
   attachments?: string[],
+  supportsVision: boolean | undefined = undefined,
   onToken?: (token: string) => void,
   onDone?: () => void,
   onError?: (error: string) => void,
   onApproval?: (approval: ApprovalRequestLike) => void,
   onStep?: (step: StepEventLike) => void,
+  onUsage?: (cachedInputTokens: number) => void,
 ): Promise<void> {
   if (isTauri()) {
     const channel = new Channel<StreamChunkLike>();
@@ -221,6 +238,7 @@ export async function apiChatStream(
       if (message.text) onToken?.(message.text);
       if (message.approval) onApproval?.(message.approval);
       if (message.step) onStep?.(message.step);
+      if (message.cached_input_tokens !== undefined) onUsage?.(message.cached_input_tokens ?? 0);
       if (message.done) onDone?.();
     };
     await invoke('chat_send_stream', {
@@ -230,11 +248,13 @@ export async function apiChatStream(
       projectId: projectId ?? null,
       threadId: threadId ?? null,
       attachments: attachments ?? null,
+      supportsVision: supportsVision ?? false,
       channel,
     });
     return;
   }
-  const text = `Local OpenHarness Assistant (${modelId}):\n\nProcessing "${prompt.trim()}". Configure a provider for live inference.`;
+  const text = `Local OpenHarness Assistant (${modelId}):\n\nProcessing "${prompt.trim()}"${attachments?.length ? ` with ${attachments.length} attachment(s)` : ''}. Configure a provider for live inference.`;
+  onUsage?.(0);
   if (threadId) {
     await apiAppendMessage(threadId, 'user', prompt.trim());
     await apiAppendMessage(threadId, 'assistant', text);
@@ -243,8 +263,8 @@ export async function apiChatStream(
   onDone?.();
 }
 
-export type ChatMessageLike = { id: string; role: string; text: string; attachments?: string[] };
-export type ChatThreadLike = { id: string; project_id: string; title: string; messages: ChatMessageLike[] };
+export type ChatMessageLike = { id: string; role: string; text: string; attachments?: string[]; compacted_summary?: string | null };
+export type ChatThreadLike = { id: string; project_id: string; title: string; messages: ChatMessageLike[]; compacted_summary?: string | null; compacted_message_count?: number };
 
 let localThreads: ChatThreadLike[] = [];
 
@@ -255,7 +275,7 @@ export async function apiListThreads(projectId?: string): Promise<ChatThreadLike
 
 export async function apiCreateThread(projectId: string): Promise<ChatThreadLike> {
   if (isTauri()) return invoke('create_thread', { projectId });
-  const thread = { id: `thread-${Date.now()}`, project_id: projectId, title: 'New chat', messages: [] };
+  const thread = { id: `thread-${Date.now()}`, project_id: projectId, title: 'New chat', messages: [], compacted_summary: null, compacted_message_count: 0 };
   localThreads = [thread, ...localThreads];
   return thread;
 }
@@ -276,7 +296,19 @@ export async function apiGetThread(id: string): Promise<ChatThreadLike> {
   if (isTauri()) return invoke('get_thread', { id });
   const thread = localThreads.find(item => item.id === id);
   if (thread) return thread;
-  return { id, project_id: 'default', title: 'Chat', messages: [] };
+  return { id, project_id: 'default', title: 'Chat', messages: [], compacted_summary: null, compacted_message_count: 0 };
+}
+
+export async function apiCompactThread(threadId: string, modelId: string, provider: string): Promise<string> {
+  if (isTauri()) return invoke('compact_thread', {threadId, modelId, provider});
+  const thread = localThreads.find(item => item.id === threadId);
+  if (!thread || thread.messages.length < 2) return '';
+  const history = [...thread.messages];
+  const summary = [...(thread.compacted_summary ? [`Previous summary: ${thread.compacted_summary}`] : []), ...history.map(message => `${message.role}: ${message.text}`)].join('\n').slice(0, 4000);
+  if (thread.messages.length !== history.length || thread.messages.some((message, index) => message.id !== history[index]?.id)) throw new Error('Thread changed during compaction; retry after refresh');
+  thread.compacted_summary = summary;
+  thread.compacted_message_count = history.length;
+  return summary;
 }
 
 export async function apiAppendMessage(threadId: string, role: string, text: string): Promise<ChatMessageLike> {
@@ -285,7 +317,12 @@ export async function apiAppendMessage(threadId: string, role: string, text: str
   localThreads = localThreads.map(thread => {
     if (thread.id !== threadId) return thread;
     const title = thread.title === 'New chat' && role === 'user' ? text.slice(0, 40) : thread.title;
-    return { ...thread, title, messages: [...thread.messages, msg] };
+    const next = { ...thread, title, messages: [...thread.messages, msg] };
+    if (thread.compacted_message_count) {
+      next.compacted_summary = null;
+      next.compacted_message_count = 0;
+    }
+    return next;
   });
   return msg;
 }
@@ -393,7 +430,9 @@ export async function apiChatSend(
   prompt: string,
   modelId: string,
   provider: string,
-  projectId?: string
+  projectId?: string,
+  attachments?: string[],
+  supportsVision: boolean | undefined = undefined
 ): Promise<ChatResponse> {
   if (isTauri()) {
     return await invoke<ChatResponse>('chat_send', {
@@ -401,6 +440,8 @@ export async function apiChatSend(
       modelId,
       provider,
       projectId: projectId ?? null,
+      attachments: attachments ?? null,
+      supportsVision: supportsVision ?? false,
     });
   }
   const trimmed = prompt.trim();
