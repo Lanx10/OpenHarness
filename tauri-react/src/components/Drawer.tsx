@@ -9,6 +9,7 @@ import {pickProjectFolder} from '../services/tauriBridge';
 
 export function Drawer() {
   const [projects, setProjects] = useState<ProjectInfo[]>([]);
+  const [, setActiveProject] = useState<ProjectInfo | null>(null);
   const [drawerCollapsed, setDrawerCollapsed] = useState(() => {
     try { return localStorage.getItem('openharness:drawer-collapsed') === 'true'; } catch { return false; }
   });
@@ -107,10 +108,12 @@ export function Drawer() {
     let cancelled = false;
     void apiGetProjects().then(items => {
       if (!cancelled) {
-        const validItems = items.filter(project => !project.path || true);
+        const validItems = items;
         setProjects(validItems);
-        const activeProject = validItems.find(project => project.active);
-        if (activeProject) window.dispatchEvent(new CustomEvent('openharness:select-project', {detail: activeProject}));
+        const active = validItems.find(project => project.active) ?? validItems[0] ?? null;
+        setActiveProject(active);
+        if (active) window.dispatchEvent(new CustomEvent('openharness:select-project', {detail: active}));
+        else if (validItems.length) void selectProject(validItems[0]);
       }
     }).catch(error => {
       if (!cancelled) setNotice(`Could not load projects: ${String(error)}`);
@@ -157,20 +160,22 @@ export function Drawer() {
       setProjectModalOpen(false);
       setNotice(`Project "${name}" opened`);
       window.setTimeout(() => setNotice(''), 2500);
-      const activeProject = updated.find(p => p.active);
-      if (activeProject) {
-        window.dispatchEvent(new CustomEvent('openharness:select-project', {detail: activeProject}));
-      }
-    } catch (error) {
-      setNotice(`Could not create project: ${String(error)}`);
+       const active = updated.find(project => project.active) ?? updated[0] ?? null;
+       setActiveProject(active);
+       if (active) window.dispatchEvent(new CustomEvent('openharness:select-project', {detail: active}));
+       else { setActiveProject(null); window.dispatchEvent(new CustomEvent('openharness:select-project', {detail: null})); }
+     } catch (error) {
+       setNotice(`Could not create project: ${String(error)}`);
     }
   };
 
   const selectProject = async (project: ProjectInfo) => {
     try {
-      const next = await apiSelectProject(project.id);
-      setProjects(next);
-      window.dispatchEvent(new CustomEvent('openharness:select-project', {detail: project}));
+       const next = await apiSelectProject(project.id);
+       setProjects(next);
+       const active = next.find(item => item.active) ?? project;
+       setActiveProject(active);
+       window.dispatchEvent(new CustomEvent('openharness:select-project', {detail: active}));
     } catch (error) {
       setNotice(`Could not select project: ${String(error)}`);
     }
@@ -248,8 +253,27 @@ export function Drawer() {
                 </button>
                 <div className="project-actions">
                   <button type="button" aria-label={`Rename ${project.name}`} title="Rename project" onClick={() => { setEditingId(project.id); setEditingName(project.name); }}><PencilIcon width={12}/></button>
-                  <button type="button" aria-label={`Relink ${project.name} folder`} title="Relink folder" onClick={async () => { const picked = await pickProjectFolder(); if (picked) { try { setProjects(await apiRelinkProject(project.id, picked.path)); } catch (error) { setNotice(String(error)); } } }}><FolderIcon width={12}/></button>
-                  <button type="button" aria-label={`Delete ${project.name}`} title="Delete project" onClick={async () => { if (!window.confirm(`Delete ${project.name}?`)) return; try { setProjects(await apiDeleteProject(project.id)); } catch (error) { setNotice(String(error)); } }}><TrashIcon width={12}/></button>
+                   <button type="button" aria-label={`Relink ${project.name} folder`} title="Relink folder" onClick={async () => {
+                     const picked = await pickProjectFolder();
+                     if (!picked) return;
+                     try {
+                       const next = await apiRelinkProject(project.id, picked.path);
+                       setProjects(next);
+                       const active = next.find(item => item.active) ?? null;
+                       setActiveProject(active);
+                       if (active) window.dispatchEvent(new CustomEvent('openharness:select-project', {detail: active}));
+                     } catch (error) { setNotice(String(error)); }
+                   }}><FolderIcon width={12}/></button>
+                  <button type="button" aria-label={`Delete ${project.name}`} title="Delete project" onClick={async () => {
+                     if (!window.confirm(`Delete ${project.name}?`)) return;
+                     try {
+                       const next = await apiDeleteProject(project.id);
+                       setProjects(next);
+                       const active = next.find(item => item.active) ?? next[0] ?? null;
+                       setActiveProject(active);
+                       window.dispatchEvent(new CustomEvent('openharness:select-project', {detail: active}));
+                     } catch (error) { setNotice(String(error)); }
+                   }}><TrashIcon width={12}/></button>
                 </div>
                 {editingId === project.id && (
                   <div className="project-edit">

@@ -207,6 +207,13 @@ export type ApprovalRequestLike = {
 };
 
 import type { StepEventLike } from '../components/StepEvent';
+export type SkillInfoLike = {name: string; description: string; path: string};
+
+export async function apiListSkills(): Promise<SkillInfoLike[]> {
+  if (isTauri()) return invoke('skills_list');
+  return [];
+}
+
 export type StreamChunkLike = {
   text: string;
   done: boolean;
@@ -224,6 +231,7 @@ export async function apiChatStream(
   threadId?: string,
   attachments?: string[],
   supportsVision: boolean | undefined = undefined,
+  selectedSkills: string[] = [],
   onToken?: (token: string) => void,
   onDone?: () => void,
   onError?: (error: string) => void,
@@ -249,6 +257,7 @@ export async function apiChatStream(
       threadId: threadId ?? null,
       attachments: attachments ?? null,
       supportsVision: supportsVision ?? false,
+      selectedSkills,
       channel,
     });
     return;

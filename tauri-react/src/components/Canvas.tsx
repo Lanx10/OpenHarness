@@ -243,6 +243,12 @@ export function Canvas() {
     }
   });
   const [projectId, setProjectId] = useState<string | null>(null);
+  const [selectedSkillNames, setSelectedSkillNames] = useState<string[]>(() => {
+    try {
+      const names: unknown = JSON.parse(localStorage.getItem('openharness:global-skills') || '[]');
+      return Array.isArray(names) ? names.filter((name): name is string => typeof name === 'string') : [];
+    } catch { return []; }
+  });
   const projectIdRef = useRef<string | null>(null);
   const updateProjectId = (id: string | null) => {
     projectIdRef.current = id;
@@ -414,6 +420,7 @@ export function Canvas() {
       const selectedProjectAtStart = projectIdRef.current;
       if (threadId !== threadIdRef.current || projectId !== selectedProjectAtStart) return;
       const targetProjectId = projectId ?? detail?.projectId ?? null;
+      const activeSkills = selectedSkillNames;
       if (!currentThreadId && targetProjectId) {
         try {
           const thread = await apiCreateThread(targetProjectId);
@@ -436,7 +443,7 @@ export function Canvas() {
       };
       setStopHandle(() => cancel);
       try {
-        await apiChatStream(text, detail.modelId, detail.provider, targetProjectId ?? undefined, currentThreadId ?? undefined, detail.attachments, detail.supportsVision, (token) => {
+        await apiChatStream(text, detail.modelId, detail.provider, targetProjectId ?? undefined, currentThreadId ?? undefined, detail.attachments, detail.supportsVision, activeSkills, (token) => {
           setMessages(prev => prev.map(message => message.id === assistantId ? {...message, text: message.text + token, status: 'thinking'} : message));
         }, () => {
           setMessages(prev => prev.map(message => message.id === assistantId ? {...message, status: 'done', steps: message.steps} : message));
@@ -480,6 +487,10 @@ export function Canvas() {
         }
       }
     };
+    const onSkillsChanged = (event: Event) => {
+      const detail = (event as CustomEvent<{names?: string[]}>).detail;
+      setSelectedSkillNames(Array.isArray(detail?.names) ? detail.names.filter((name): name is string => typeof name === 'string') : []);
+    };
     const startNewThread = () => {
        setMessages([]);
        setCachedInputTokens(null);
@@ -499,7 +510,12 @@ export function Canvas() {
       const project = (event as CustomEvent<{id?: string; name?: string; title?: string}>).detail;
       const nextProjectId = project?.id ?? null;
       updateProjectId(nextProjectId);
+      try {
+        const names: unknown = JSON.parse(localStorage.getItem('openharness:global-skills') || '[]');
+        setSelectedSkillNames(Array.isArray(names) ? names.filter((name): name is string => typeof name === 'string') : []);
+      } catch { setSelectedSkillNames([]); }
       setProjectName(project?.name ?? project?.title ?? '');
+      window.dispatchEvent(new CustomEvent('openharness:active-project', {detail: {id: nextProjectId, name: project?.name ?? project?.title ?? ''}}));
       updateThreadId(null);
         setMessages([]);
        setCachedInputTokens(null);
@@ -539,10 +555,11 @@ export function Canvas() {
     window.addEventListener('openharness:quick-browser', handleQuickBrowser);
     window.addEventListener('openharness:send-message', onSend as EventListener);
     window.addEventListener('openharness:new-chat', onNewChat);
+    window.addEventListener('openharness:skills-changed', onSkillsChanged);
     window.addEventListener('openharness:select-project', onSelectProject as EventListener);
     window.addEventListener('openharness:open-thread', handleOpenThread);
     window.addEventListener('openharness:delete-thread', handleDeleteThread);
-    return () => { cancelled = true; window.removeEventListener('openharness:send-message', onSend as EventListener); window.removeEventListener('openharness:new-chat', onNewChat); window.removeEventListener('openharness:select-project', onSelectProject as EventListener); window.removeEventListener('openharness:open-thread', handleOpenThread); window.removeEventListener('openharness:delete-thread', handleDeleteThread); window.removeEventListener('openharness:quick-cmd', handleQuickCmd); window.removeEventListener('openharness:quick-files', handleQuickFiles); window.removeEventListener('openharness:quick-git', handleQuickGit); window.removeEventListener('openharness:quick-browser', handleQuickBrowser); };
+    return () => { cancelled = true; window.removeEventListener('openharness:send-message', onSend as EventListener); window.removeEventListener('openharness:new-chat', onNewChat); window.removeEventListener('openharness:skills-changed', onSkillsChanged); window.removeEventListener('openharness:select-project', onSelectProject as EventListener); window.removeEventListener('openharness:open-thread', handleOpenThread); window.removeEventListener('openharness:delete-thread', handleDeleteThread); window.removeEventListener('openharness:quick-cmd', handleQuickCmd); window.removeEventListener('openharness:quick-files', handleQuickFiles); window.removeEventListener('openharness:quick-git', handleQuickGit); window.removeEventListener('openharness:quick-browser', handleQuickBrowser); };
   }, [threadId, projectId]);
 
   useEffect(() => {

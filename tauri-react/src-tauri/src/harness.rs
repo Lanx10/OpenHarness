@@ -40,6 +40,13 @@ pub struct ToolDefinition {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SkillInfo {
+    pub name: String,
+    pub description: String,
+    pub path: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolCall {
     pub id: String,
     pub name: String,
@@ -59,6 +66,8 @@ const MAX_READ_BYTES: usize = 2_000_000;
 const MAX_GREP_MATCHES: usize = 100;
 const MAX_DIR_ENTRIES: usize = 250;
 const MAX_OUTPUT_BYTES: usize = 500_000;
+const MAX_SKILL_FILE_BYTES: usize = 100_000;
+const MAX_SELECTED_SKILLS: usize = 12;
 
 pub struct Sandbox {
     root: PathBuf,
@@ -403,8 +412,16 @@ impl ExecutionEngine {
 
         #[cfg(target_os = "windows")]
         let mut cmd = {
-            let mut c = Command::new("cmd.exe");
-            c.arg("/C").arg(trimmed);
+            let mut c = Command::new("powershell.exe");
+            c.args([
+                "-NoLogo",
+                "-NoProfile",
+                "-InputFormat",
+                "Text",
+                "-NonInteractive",
+                "-Command",
+            ])
+            .arg(trimmed);
             c
         };
 
@@ -548,6 +565,72 @@ impl GitContext {
 pub struct ToolDispatcher;
 
 impl ToolDispatcher {
+    pub fn list_skills(root: &Path) -> Result<Vec<SkillInfo>, String> {
+        let sandbox = Sandbox::new(root.to_path_buf())?;
+        let mut skills = Vec::new();
+        let mut scanned_entries = 0;
+        let mut total_skill_bytes = 0;
+        for directory in [".agents/skills", ".claude/skills", ".kilo/skills"] {
+            if sandbox.resolve_path(directory).is_err() {
+                continue;
+            }
+            let entries = match sandbox.list_dir(Some(directory)) {
+                Ok(entries) => entries,
+                Err(_) => continue,
+            };
+            for entry in entries.into_iter().filter(|entry| entry.is_dir) {
+                scanned_entries += 1;
+                if scanned_entries > 250 { return Err("Skill directories exceed the 250-entry scan limit".into()); }
+                let skill_path = format!("{}/{}/SKILL.md", directory, entry.name);
+                let metadata = match sandbox.resolve_path(&skill_path).and_then(|path| fs::symlink_metadata(path).map_err(|error| error.to_string())) {
+                    Ok(metadata) if metadata.is_file() && !metadata.file_type().is_symlink() => metadata,
+                    _ => continue,
+                };
+                if metadata.len() as usize > MAX_SKILL_FILE_BYTES { continue; }
+                total_skill_bytes += metadata.len() as usize;
+                if total_skill_bytes > MAX_SKILL_FILE_BYTES * 20 { return Err("Skill metadata scan exceeds 2 MB".into()); }
+                let content = match sandbox.read_file(&skill_path, None, None) {
+                    Ok(content) => content,
+                    Err(_) => continue,
+                };
+                let description = content
+                    .lines()
+                    .find(|line| line.trim_start().starts_with("description:"))
+                    .map(|line| line.trim().trim_start_matches("description:").trim().trim_matches('"').to_string())
+                    .unwrap_or_default();
+                skills.push(SkillInfo { name: entry.name, description, path: skill_path });
+            }
+        }
+        skills.sort_by_key(|skill| skill.name.to_lowercase());
+        skills.dedup_by(|left, right| left.name.eq_ignore_ascii_case(&right.name));
+        Ok(skills)
+    }
+
+    pub fn load_skills(root: &Path, selected: &[String]) -> Result<Vec<(String, String)>, String> {
+        if selected.len() > MAX_SELECTED_SKILLS {
+            return Err(format!("Select no more than {} skills", MAX_SELECTED_SKILLS));
+        }
+        let available = Self::list_skills(root)?;
+        let mut loaded = Vec::new();
+        for name in selected {
+            let Some(skill) = available.iter().find(|skill| skill.name == *name) else {
+                continue;
+            };
+            let sandbox = Sandbox::new(root.to_path_buf())?;
+            let path = sandbox.resolve_path(&skill.path)?;
+            let metadata = fs::symlink_metadata(&path).map_err(|error| format!("Could not inspect skill {}: {}", name, error))?;
+            if metadata.file_type().is_symlink() || !metadata.is_file() || metadata.len() as usize > MAX_SKILL_FILE_BYTES {
+                return Err(format!("Skill {} is not a regular file within the {} byte limit", name, MAX_SKILL_FILE_BYTES));
+            }
+            let contents = fs::read_to_string(path).map_err(|error| format!("Could not read skill {}: {}", name, error))?;
+            if contents.len() > MAX_SKILL_FILE_BYTES {
+                return Err(format!("Skill {} exceeds {} bytes", name, MAX_SKILL_FILE_BYTES));
+            }
+            loaded.push((name.clone(), contents));
+        }
+        Ok(loaded)
+    }
+
     pub fn native_tool_call(value: &serde_json::Value, next_id: usize) -> Option<ToolCall> {
         let function = value.get("function").unwrap_or(value);
         let raw_name = function
@@ -1378,6 +1461,63 @@ mod tests {
     use super::*;
 
     #[test]
+    fn lists_skills_from_user_global_locations() {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("target")
+            .join(format!("global_skill_test_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join(".claude/skills/global-sample")).unwrap();
+        fs::write(
+            root.join(".claude/skills/global-sample/SKILL.md"),
+            "---\nname: global-sample\ndescription: Global skill\n---\nUse global skill.",
+        )
+        .unwrap();
+        fs::create_dir_all(root.join(".agent/skills/project-only")).unwrap();
+        fs::write(
+            root.join(".agent/skills/project-only/SKILL.md"),
+            "---\nname: project-only\n---\nProject-specific.",
+        )
+        .unwrap();
+        let skills = ToolDispatcher::list_skills(&root).unwrap();
+        assert_eq!(skills.len(), 1);
+        assert_eq!(skills[0].name, "global-sample");
+        assert!(ToolDispatcher::load_skills(&root, &["global-sample".into()]).is_ok());
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn lists_and_loads_only_valid_workspace_skills() {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target").join(format!("skill_test_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join(".agents/skills/sample")).unwrap();
+        fs::write(root.join(".agents/skills/sample/SKILL.md"), "---\nname: sample\ndescription: Sample guidance\n---\nUse this skill.").unwrap();
+        fs::create_dir_all(root.join(".agent/skills/no-skill-file")).unwrap();
+        let skills = ToolDispatcher::list_skills(&root).unwrap();
+        assert_eq!(skills.len(), 1);
+        assert_eq!(skills[0].name, "sample");
+        assert_eq!(skills[0].description, "Sample guidance");
+        assert_eq!(ToolDispatcher::load_skills(&root, &["sample".into()]).unwrap()[0].1, "---\nname: sample\ndescription: Sample guidance\n---\nUse this skill.");
+        assert!(ToolDispatcher::load_skills(&root, &["missing".into()]).unwrap().is_empty());
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn lists_and_loads_workspace_skill_instructions() {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target").join(format!("skill_test_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join(".agents/skills/sample")).unwrap();
+        let skill = "---\nname: sample\ndescription: Sample guidance\n---\nUse this skill.";
+        fs::write(root.join(".agents/skills/sample/SKILL.md"), skill).unwrap();
+        let skills = ToolDispatcher::list_skills(&root).unwrap();
+        assert_eq!(skills.len(), 1);
+        assert_eq!(skills[0].name, "sample");
+        assert_eq!(skills[0].description, "Sample guidance");
+        assert_eq!(ToolDispatcher::load_skills(&root, &["sample".into()]).unwrap()[0].1, skill);
+        assert!(ToolDispatcher::load_skills(&root, &["missing".into()]).unwrap().is_empty());
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn test_sandbox_security_traversal_forbidden() {
         let unique = format!(
             "oh_sec_{}_{}",
@@ -1552,11 +1692,22 @@ mod tests {
     fn test_execution_engine_echo() {
         let temp_dir = std::env::temp_dir();
         #[cfg(target_os = "windows")]
-        let res = ExecutionEngine::run_command(&temp_dir, "echo harness_ok", Some(5)).unwrap();
+        let res = ExecutionEngine::run_command(&temp_dir, "Write-Output harness_ok", Some(5)).unwrap();
         #[cfg(not(target_os = "windows"))]
         let res = ExecutionEngine::run_command(&temp_dir, "echo harness_ok", Some(5)).unwrap();
 
         assert_eq!(res.exit_code, Some(0));
         assert!(res.stdout.contains("harness_ok"));
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn execution_engine_handles_powershell_pipeline() {
+        let temp_dir = std::env::temp_dir();
+        let res = ExecutionEngine::run_command(&temp_dir, "'one', 'two' | ForEach-Object { $_.ToUpper() }", Some(5)).unwrap();
+
+        assert_eq!(res.exit_code, Some(0));
+        assert!(res.stdout.contains("ONE"));
+        assert!(res.stdout.contains("TWO"));
     }
 }
