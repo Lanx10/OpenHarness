@@ -72,20 +72,35 @@ fn endpoint_url(provider: &str, custom: Option<&str>) -> Result<String, String> 
         }
         Err(_) => host == "localhost" || host.ends_with(".local"),
     };
-    match parsed.scheme() {
-        "http" if private_or_local && (provider == "Ollama" || provider == "OpenAI Compatible") => {
-            Ok(parsed.to_string())
+    let normalized = if provider == "OpenAI Compatible" {
+        let path = parsed.path().trim_end_matches('/');
+        let mut modified = parsed.clone();
+        if path.is_empty() || path == "/v1" {
+            modified.set_path("/v1/chat/completions");
+        } else if !path.ends_with("/chat/completions") {
+            modified.set_path(&format!("{}/chat/completions", path));
+        } else {
+            modified.set_path(path);
         }
-        "https" if provider == "OpenAI Compatible" => Ok(parsed.to_string()),
+        modified
+    } else {
+        parsed
+    };
+
+    match normalized.scheme() {
+        "http" if private_or_local && (provider == "Ollama" || provider == "OpenAI Compatible") => {
+            Ok(normalized.to_string())
+        }
+        "https" if provider == "OpenAI Compatible" => Ok(normalized.to_string()),
         "https" => match (private_or_local, provider == "Ollama") {
             (true, false) => {
                 Err("Non-Ollama providers cannot use private or internal endpoints".to_string())
             }
-            _ => Ok(parsed.to_string()),
+            _ => Ok(normalized.to_string()),
         },
         _ => Err(format!(
             "Endpoint URL must use HTTPS; Ollama and OpenAI Compatible local endpoints may use HTTP. Provided: {}",
-            parsed
+            normalized
         )),
     }
 }

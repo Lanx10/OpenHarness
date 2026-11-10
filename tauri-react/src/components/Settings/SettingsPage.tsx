@@ -65,7 +65,7 @@ function ProviderForm({onBack, onSaved}: {onBack: () => void; onSaved: () => voi
       <div className="provider-form-header"><ServerIcon width={19}/><strong>Add provider</strong></div>
       <label className="field-label" htmlFor="provider-select">Provider</label>
       <div className="provider-select-row">
-        <select id="provider-select" value={provider} onChange={event => { const next = event.target.value; setProvider(next); if (next === 'OpenAI Compatible') setCustomEndpoint(true); setError(''); }}>
+        <select id="provider-select" value={provider} onChange={event => { const next = event.target.value; setProvider(next); if (next === 'OpenAI Compatible') { setCustomEndpoint(true); setAdvanced(true); if (!baseUrl) setBaseUrl('https://api.openai.com/v1'); } setError(''); }}>
           {providerOptions.map(option => <option key={option}>{option}</option>)}
         </select>
         <a className="provider-setup" href={providerDocs[provider]} target="_blank" rel="noreferrer">Docs <ArrowTopRightOnSquareIcon width={13}/></a>
