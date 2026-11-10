@@ -19,8 +19,22 @@ export function sanitizeUrl(rawUrl: string): string | null {
   return null;
 }
 
+export function sanitizeImageUrl(rawUrl: string): string | null {
+  const trimmed = rawUrl.trim();
+  if (!trimmed) return null;
+  if (/^(https?:\/\/)/i.test(trimmed) || trimmed.startsWith('/')) return trimmed;
+  if (/^data:image\/(png|jpeg|webp|gif|svg\+xml);base64,[a-z0-9+/=]+$/i.test(trimmed)) return trimmed;
+  return null;
+}
+
 export function formatInlineMarkdown(text: string): string {
   let result = escapeHtml(text);
+
+  // Render only trusted image URL schemes; all other content remains escaped.
+  result = result.replace(/!\[([^\]]*)\]\(([^)]+)\)/g, (_match, alt, url) => {
+    const cleanUrl = sanitizeImageUrl(url);
+    return cleanUrl ? `<img src=\"${escapeHtml(cleanUrl)}\" alt=\"${escapeHtml(alt)}\" class=\"markdown-image\" loading=\"lazy\" />` : '';
+  });
 
   // Bold + Italic: ***text*** or ___text___
   result = result.replace(/\*\*\*(.+?)\*\*\*/g, '<strong><em>$1</em></strong>');

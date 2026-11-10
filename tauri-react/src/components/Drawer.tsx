@@ -1,5 +1,9 @@
-import {useEffect, useState} from 'react';
+import {useEffect, useRef, useState} from 'react';
 import {PlusIcon, FolderIcon, XMarkIcon, PencilIcon, TrashIcon, MagnifyingGlassIcon, ChevronLeftIcon, ChevronRightIcon} from '@heroicons/react/20/solid';
+
+const DRAWER_MIN_WIDTH = 160;
+const DRAWER_MAX_WIDTH = 260;
+const DRAWER_COLLAPSED_WIDTH = 52;
 import {apiCreateProject, apiGetProjects, apiSelectProject, apiRenameProject, apiDeleteProject, apiRelinkProject, type ProjectInfo} from '../services/tauriBridge';
 import {pickProjectFolder} from '../services/tauriBridge';
 
@@ -7,6 +11,14 @@ export function Drawer() {
   const [projects, setProjects] = useState<ProjectInfo[]>([]);
   const [drawerCollapsed, setDrawerCollapsed] = useState(() => {
     try { return localStorage.getItem('openharness:drawer-collapsed') === 'true'; } catch { return false; }
+  });
+  const [drawerWidth, setDrawerWidth] = useState(() => {
+    try {
+      const saved = Number(localStorage.getItem('openharness:drawer-width'));
+      return Number.isFinite(saved) && saved >= DRAWER_MIN_WIDTH && saved <= DRAWER_MAX_WIDTH ? saved : 250;
+    } catch {
+      return 250;
+    }
   });
   const [search, setSearch] = useState('');
   const [editingId, setEditingId] = useState<string | null>(null);
@@ -16,6 +28,13 @@ export function Drawer() {
   const [projectPath, setProjectPath] = useState<string | null>(null);
   const [notice, setNotice] = useState('');
   const [isSelecting, setIsSelecting] = useState(false);
+  const searchInputRef = useRef<HTMLInputElement>(null);
+
+  useEffect(() => {
+    try {
+      localStorage.setItem('openharness:drawer-width', String(drawerWidth));
+    } catch {}
+  }, [drawerWidth]);
 
   const toggleDrawer = () => {
     setDrawerCollapsed(prev => {
@@ -23,6 +42,59 @@ export function Drawer() {
       try { localStorage.setItem('openharness:drawer-collapsed', String(next)); } catch {}
       return next;
     });
+  };
+
+  const handleCollapsedSearchClick = () => {
+    setDrawerCollapsed(false);
+    try { localStorage.setItem('openharness:drawer-collapsed', 'false'); } catch {}
+    window.setTimeout(() => {
+      searchInputRef.current?.focus();
+    }, 60);
+  };
+
+  const handleResizePointerDown = (event: React.PointerEvent<HTMLDivElement>) => {
+    if (drawerCollapsed) return;
+    const startX = event.clientX;
+    const startWidth = drawerWidth;
+    const captured = event.currentTarget;
+
+    const move = (pointer: PointerEvent) => {
+      const nextWidth = Math.min(DRAWER_MAX_WIDTH, Math.max(DRAWER_MIN_WIDTH, startWidth + (pointer.clientX - startX)));
+      setDrawerWidth(nextWidth);
+    };
+
+    const stop = () => {
+      window.removeEventListener('pointermove', move);
+      window.removeEventListener('pointerup', stop);
+      window.removeEventListener('pointercancel', stop);
+      window.removeEventListener('lostpointercapture', stop);
+      if (captured && captured.hasPointerCapture?.(event.pointerId)) {
+        try { captured.releasePointerCapture(event.pointerId); } catch {}
+      }
+    };
+
+    window.addEventListener('pointermove', move);
+    window.addEventListener('pointerup', stop, {once: true});
+    window.addEventListener('pointercancel', stop, {once: true});
+    window.addEventListener('lostpointercapture', stop, {once: true});
+    captured.setPointerCapture(event.pointerId);
+  };
+
+  const handleResizeKeyDown = (event: React.KeyboardEvent<HTMLDivElement>) => {
+    if (drawerCollapsed) return;
+    if (event.key === 'ArrowRight') {
+      event.preventDefault();
+      setDrawerWidth(w => Math.min(DRAWER_MAX_WIDTH, w + 10));
+    } else if (event.key === 'ArrowLeft') {
+      event.preventDefault();
+      setDrawerWidth(w => Math.max(DRAWER_MIN_WIDTH, w - 10));
+    } else if (event.key === 'Home') {
+      event.preventDefault();
+      setDrawerWidth(DRAWER_MIN_WIDTH);
+    } else if (event.key === 'End') {
+      event.preventDefault();
+      setDrawerWidth(DRAWER_MAX_WIDTH);
+    }
   };
 
   useEffect(() => {
@@ -106,28 +178,14 @@ export function Drawer() {
 
   return (
     <>
-      <aside className={`drawer ${drawerCollapsed ? 'drawer-collapsed' : ''}`} aria-label="Projects and chats" data-od-id="project-drawer">
+      <aside className={`drawer ${drawerCollapsed ? 'drawer-collapsed' : ''}`} style={{width: drawerCollapsed ? DRAWER_COLLAPSED_WIDTH : drawerWidth, flexBasis: drawerCollapsed ? DRAWER_COLLAPSED_WIDTH : drawerWidth}} aria-label="Projects and chats" data-od-id="project-drawer">
         {drawerCollapsed ? (
-          <button
-            type="button"
-            className="collapse-toggle-btn"
-            onClick={toggleDrawer}
-            aria-label="Expand new chat sidebar"
-            title="Expand new chat sidebar"
-            style={{
-              background: 'transparent',
-              border: 0,
-              color: 'var(--accent)',
-              cursor: 'pointer',
-              display: 'grid',
-              placeItems: 'center',
-              padding: '4px',
-              borderRadius: 4,
-              alignSelf: 'center'
-            }}
-          >
-            <ChevronRightIcon width={14} height={14} />
-          </button>
+          <div className="drawer-collapsed-actions">
+            <button type="button" className="collapsed-drawer-action" onClick={toggleDrawer} aria-label="Expand project sidebar" title="Expand project sidebar"><ChevronRightIcon width={15} height={15} aria-hidden="true" /></button>
+            <button type="button" className="collapsed-drawer-action collapsed-drawer-primary" onClick={() => window.dispatchEvent(new Event('openharness:new-chat'))} aria-label="New chat" title="New chat"><PlusIcon width={17} height={17} aria-hidden="true" /></button>
+            <button type="button" className="collapsed-drawer-action" onClick={() => window.dispatchEvent(new Event('openharness:new-project'))} aria-label="New project" title="New project"><FolderIcon width={16} height={16} aria-hidden="true" /></button>
+            <button type="button" className="collapsed-drawer-action" onClick={handleCollapsedSearchClick} aria-label="Search projects" title="Search projects"><MagnifyingGlassIcon width={16} height={16} aria-hidden="true" /></button>
+          </div>
         ) : <>
         <div className="brand" data-od-id="brand" style={{justifyContent: 'space-between', alignItems: 'center'}}>
           <div style={{display: 'flex', alignItems: 'center', gap: 9}}>
@@ -166,7 +224,7 @@ export function Drawer() {
           </button>
         </div>
 
-        <label className="project-search"><MagnifyingGlassIcon width={14} aria-hidden="true" /><input value={search} onChange={e => setSearch(e.target.value)} placeholder="Search projects" aria-label="Search projects"/></label>
+        <label className="project-search"><MagnifyingGlassIcon width={14} aria-hidden="true" /><input ref={searchInputRef} value={search} onChange={e => setSearch(e.target.value)} placeholder="Search projects" aria-label="Search projects"/></label>
         <p className="group-heading projects-heading">Projects</p>
         <div className="project-list" id="project-list" role="list">
             {projects.length === 0 ? (
@@ -203,6 +261,18 @@ export function Drawer() {
             ))}
           </div>
         <div className="drawer-foot"><span className="group-heading">Workspace · Local</span></div>
+        <div
+          className="drawer-resizer"
+          onPointerDown={handleResizePointerDown}
+          onKeyDown={handleResizeKeyDown}
+          tabIndex={0}
+          role="separator"
+          aria-orientation="vertical"
+          aria-valuenow={drawerWidth}
+          aria-valuemin={DRAWER_MIN_WIDTH}
+          aria-valuemax={DRAWER_MAX_WIDTH}
+          aria-label="Resize project drawer"
+        />
         </>}
       </aside>
 

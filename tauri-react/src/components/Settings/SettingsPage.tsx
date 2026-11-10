@@ -11,6 +11,15 @@ type SettingsPageProps = {onClose: () => void; initialSection?: string};
 const sections = ['Providers', 'Update'];
 const providerOptions = ['OpenRouter', 'Google AI Studio', 'Ollama', 'OpenAI Compatible'];
 
+const OPENAI_PRESETS = [
+  { label: 'LM Studio', url: 'http://localhost:1234/v1', model: 'local-model' },
+  { label: 'Ollama', url: 'http://localhost:11434/v1', model: 'llama3.3' },
+  { label: 'vLLM', url: 'http://localhost:8000/v1', model: 'meta-llama/Llama-3-8B-Instruct' },
+  { label: 'OpenAI', url: 'https://api.openai.com/v1', model: 'gpt-4o' },
+  { label: 'DeepSeek', url: 'https://api.deepseek.com/v1', model: 'deepseek-chat' },
+  { label: 'Groq', url: 'https://api.groq.com/openai/v1', model: 'llama-3.3-70b-versatile' },
+];
+
 const providerDocs: Record<string, string> = {
   'OpenRouter': 'https://openrouter.ai/docs/quickstart',
   'Google AI Studio': 'https://ai.google.dev/gemini-api/docs/openai',
@@ -27,15 +36,16 @@ function ProviderForm({onBack, onSaved}: {onBack: () => void; onSaved: () => voi
   const [advanced, setAdvanced] = useState(false);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState('');
+  const isOpenAICompatible = provider === 'OpenAI Compatible';
 
   const saveProvider = async () => {
     if ((provider !== 'Ollama' && provider !== 'OpenAI Compatible' && !apiKey.trim()) || !modelId.trim()) {
       setError(provider === 'Ollama' ? 'Enter a Model ID before saving.' : 'Enter an API key and Model ID before saving.');
       return;
     }
-    if (customEndpoint) {
+    if (isOpenAICompatible || customEndpoint) {
       if (!baseUrl.trim()) {
-        setError('Enter an endpoint URL when custom endpoint is enabled.');
+        setError('Enter an endpoint URL to connect.');
         return;
       }
       try {
@@ -49,7 +59,13 @@ function ProviderForm({onBack, onSaved}: {onBack: () => void; onSaved: () => voi
     setSaving(true);
     setError('');
     try {
-      await apiSaveProvider(provider, modelId.trim(), customEndpoint ? baseUrl.trim() : null, customEndpoint, apiKey);
+      await apiSaveProvider(
+        provider,
+        modelId.trim(),
+        (isOpenAICompatible || customEndpoint) ? baseUrl.trim() : null,
+        isOpenAICompatible || customEndpoint,
+        apiKey
+      );
       setApiKey('');
       window.dispatchEvent(new Event('openharness:provider-saved'));
       onSaved();
@@ -61,8 +77,17 @@ function ProviderForm({onBack, onSaved}: {onBack: () => void; onSaved: () => voi
   };
 
   return (
-    <div className="provider-form">
-      <div className="provider-form-header"><ServerIcon width={19}/><strong>Add provider</strong></div>
+    <div className={`provider-form ${provider === 'OpenAI Compatible' ? 'provider-form-openai' : ''}`}>
+      {provider === 'OpenAI Compatible' && (
+        <div className="provider-openai-callout">
+          <div className="provider-openai-callout-icon"><ServerIcon width={20}/></div>
+          <div className="provider-openai-callout-copy">
+            <strong>OpenAI-compatible endpoint</strong>
+            <span>Connect to any API that speaks the OpenAI chat completions protocol — OpenAI, LM Studio, vLLM, llama.cpp, or a local gateway.</span>
+          </div>
+        </div>
+      )}
+      <div className="provider-form-header"><ServerIcon width={19}/><strong>{provider === 'OpenAI Compatible' ? 'Connect a compatible API' : 'Add provider'}</strong></div>
       <label className="field-label" htmlFor="provider-select">Provider</label>
       <div className="provider-select-row">
         <select id="provider-select" value={provider} onChange={event => { const next = event.target.value; setProvider(next); if (next === 'OpenAI Compatible') { setCustomEndpoint(true); setAdvanced(true); if (!baseUrl) setBaseUrl('https://api.openai.com/v1'); } setError(''); }}>
@@ -70,20 +95,84 @@ function ProviderForm({onBack, onSaved}: {onBack: () => void; onSaved: () => voi
         </select>
         <a className="provider-setup" href={providerDocs[provider]} target="_blank" rel="noreferrer">Docs <ArrowTopRightOnSquareIcon width={13}/></a>
       </div>
-      <label className="field-label" htmlFor="model-id">Model ID</label>
-      <input id="model-id" value={modelId} onChange={event => setModelId(event.target.value)} placeholder={provider === 'OpenAI Compatible' ? "e.g. gpt-4o, llama-3.3-70b, or deepseek-chat" : "e.g. google/gemini-2.5-flash-lite"} />
-      <label className="field-label" htmlFor="api-key">API key {provider === 'OpenAI Compatible' || provider === 'Ollama' ? '(optional for local endpoints)' : ''}</label>
-      <input id="api-key" type="password" value={apiKey} onChange={event => setApiKey(event.target.value)} placeholder={provider === 'OpenAI Compatible' || provider === 'Ollama' ? "Optional for local endpoints, required for remote APIs" : "Paste your API key"} />
-      <button className="advanced-toggle" type="button" aria-expanded={advanced} onClick={() => setAdvanced(value => !value)}>Advanced endpoint settings {advanced ? '▾' : '▸'}</button>
-      {advanced && (
-        <div className="advanced-panel">
-          <label><input type="checkbox" checked={customEndpoint} onChange={event => setCustomEndpoint(event.target.checked)} /> Use custom endpoint</label>
-          <label>Endpoint URL<input value={baseUrl} onChange={event => setBaseUrl(event.target.value)} placeholder={provider === 'OpenAI Compatible' ? "https://api.openai.com/v1 or http://localhost:1234/v1" : "https://…"} disabled={!customEndpoint} /></label>
+      {provider === 'OpenAI Compatible' ? (
+        <div className="provider-openai-fields">
+          <div className="provider-openai-header-row">
+            <label className="field-label" htmlFor="openai-endpoint">Endpoint Base URL</label>
+            <span className="provider-openai-protocol-badge">
+              {baseUrl.startsWith('http://') ? 'HTTP (Local)' : baseUrl.startsWith('https://') ? 'HTTPS (Remote)' : 'Custom'}
+            </span>
+          </div>
+          <input
+            id="openai-endpoint"
+            value={baseUrl}
+            onChange={event => setBaseUrl(event.target.value)}
+            placeholder="http://localhost:1234/v1 or https://api.openai.com/v1"
+          />
+          <span className="provider-openai-hint">
+            Specify the base URL. <code>/chat/completions</code> is automatically appended.
+          </span>
+
+          <div className="provider-openai-presets-wrap">
+            <span className="provider-presets-label">Quick Presets:</span>
+            <div className="provider-openai-presets" role="group" aria-label="Quick preset endpoints">
+              {OPENAI_PRESETS.map(preset => (
+                <button
+                  key={preset.label}
+                  type="button"
+                  className={`provider-preset-btn ${baseUrl.trim() === preset.url ? 'active' : ''}`}
+                  onClick={() => {
+                    setBaseUrl(preset.url);
+                    if (!modelId.trim() || OPENAI_PRESETS.some(p => p.model === modelId.trim())) {
+                      setModelId(preset.model);
+                    }
+                    setError('');
+                  }}
+                >
+                  {preset.label}
+                </button>
+              ))}
+            </div>
+          </div>
+
+          <label className="field-label" htmlFor="model-id">Model ID</label>
+          <input
+            id="model-id"
+            value={modelId}
+            onChange={event => setModelId(event.target.value)}
+            placeholder="e.g. gpt-4o, llama-3.3-70b, or deepseek-chat"
+          />
+
+          <div className="provider-openai-header-row">
+            <label className="field-label" htmlFor="api-key">API Key</label>
+            <span className="provider-openai-optional">OPTIONAL FOR LOCAL</span>
+          </div>
+          <input
+            id="api-key"
+            type="password"
+            value={apiKey}
+            onChange={event => setApiKey(event.target.value)}
+            placeholder="Leave empty for local servers (LM Studio, Ollama, vLLM)"
+          />
         </div>
+      ) : (
+        <>
+          <label className="field-label" htmlFor="model-id">Model ID</label>
+          <input id="model-id" value={modelId} onChange={event => setModelId(event.target.value)} placeholder="e.g. google/gemini-2.5-flash-lite" />
+          <label className="field-label" htmlFor="api-key">API key {provider === 'Ollama' ? '(optional for local endpoints)' : ''}</label>
+          <input id="api-key" type="password" value={apiKey} onChange={event => setApiKey(event.target.value)} placeholder={provider === 'Ollama' ? "Optional for local endpoints, required for remote APIs" : "Paste your API key"} />
+          <button className="advanced-toggle" type="button" aria-expanded={advanced} onClick={() => setAdvanced(value => !value)}>Advanced endpoint settings {advanced ? '▾' : '▸'}</button>
+          {advanced && (
+            <div className="advanced-panel">
+              <label className="check-row"><input type="checkbox" checked={customEndpoint} onChange={event => setCustomEndpoint(event.target.checked)} /> Use custom endpoint</label>
+              <label>Endpoint URL<input value={baseUrl} onChange={event => setBaseUrl(event.target.value)} placeholder="https://…" disabled={!customEndpoint} /></label>
+            </div>
+          )}
+        </>
       )}
       {error && <div role="alert" className="provider-form-error">{error}</div>}
       <div className="provider-form-footer">
-        <span>Keys are stored through your operating system&rsquo;s secure credential store.</span>
+        <span>{isOpenAICompatible ? 'API keys are stored through your operating system’s secure credential store.' : <>Keys are stored through your operating system&rsquo;s secure credential store.</>}</span>
         <div>
           <button className="save-provider" type="button" onClick={() => void saveProvider()} disabled={saving}>{saving ? 'Saving…' : 'Save'}</button>
           <button className="back-button" type="button" onClick={onBack}>Back</button>

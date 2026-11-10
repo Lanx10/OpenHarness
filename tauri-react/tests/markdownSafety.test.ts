@@ -24,6 +24,13 @@ test('renders common markdown as safe HTML blocks', () => {
   assert.match(html, /<table>/);
 });
 
+test('renders markdown images with safe image sources and escaped alt text', () => {
+  const html = parseMarkdownBlocks('![a < b](https://example.com/image.png) ![unsafe](javascript:alert(1))')[0].content;
+  assert.match(html, /<img[^>]+src=\"https:\/\/example\.com\/image\.png\"/);
+  assert.match(html, /alt=\"a &amp;lt; b\"/);
+  assert.ok(!html.includes('javascript:'));
+});
+
 test('preserves fenced code as a code block, escaped only by React text rendering', () => {
   const blocks = parseMarkdownBlocks('```ts\nconst x = "<tag>";\n```');
   assert.deepEqual(blocks, [{type: 'code', language: 'ts', content: 'const x = "<tag>";'}]);

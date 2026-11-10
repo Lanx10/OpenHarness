@@ -30,10 +30,42 @@ fn safe_error_body(body: &str) -> String {
 }
 
 fn messages_json(messages: &[ModelMessage]) -> Vec<Value> {
-    messages
-        .iter()
-        .map(|message| serde_json::json!({"role": message.role, "content": message.content}))
-        .collect()
+    let mut normalized: Vec<Value> = Vec::new();
+    for (i, message) in messages.iter().enumerate() {
+        if message.role == "assistant"
+            && let Ok(val) = serde_json::from_str::<Value>(&message.content)
+            && val.get("tool_calls").is_some()
+        {
+            normalized.push(val);
+            continue;
+        }
+
+        let role = if message.role == "system" {
+            if i == 0 {
+                "system"
+            } else {
+                "user"
+            }
+        } else if message.role == "assistant" {
+            "assistant"
+        } else {
+            "user"
+        };
+
+        if let Some(last) = normalized.last_mut()
+            && last["role"] == role
+            && last.get("tool_calls").is_none()
+        {
+            let existing = last["content"].as_str().unwrap_or("").to_string();
+            last["content"] = serde_json::json!(format!("{}\n\n{}", existing, message.content));
+            continue;
+        }
+        normalized.push(serde_json::json!({
+            "role": role,
+            "content": message.content
+        }));
+    }
+    normalized
 }
 
 fn endpoint_url(provider: &str, custom: Option<&str>) -> Result<String, String> {
@@ -193,10 +225,36 @@ pub async fn query_llm(
                 .json()
                 .await
                 .map_err(|e| format!("Failed to parse response JSON: {}", e))?;
-            let content = json["choices"][0]["message"]["content"]
-                .as_str()
-                .unwrap_or("No content in response choices");
-            Ok(content.to_string())
+            let choice = &json["choices"][0];
+            if let Some(content) = choice["message"]["content"].as_str().filter(|s| !s.is_empty()) {
+                Ok(content.to_string())
+            } else if let Some(tool_calls) = choice["message"]["tool_calls"].as_array().filter(|a| !a.is_empty()) {
+                let mut formatted = String::new();
+                for (idx, tc) in tool_calls.iter().enumerate() {
+                    let call_id = tc["id"]
+                        .as_str()
+                        .map(str::to_string)
+                        .unwrap_or_else(|| format!("call_{}", idx + 1));
+                    let name = tc["function"]["name"].as_str().unwrap_or("");
+                    let args = &tc["function"]["arguments"];
+                    let parsed_args = if let Some(s) = args.as_str() {
+                        serde_json::from_str(s).unwrap_or_else(|_| serde_json::json!({}))
+                    } else {
+                        args.clone()
+                    };
+                    formatted.push_str(&format!(
+                        "<tool_call>\n{}\n</tool_call>\n",
+                        serde_json::json!({
+                            "id": call_id,
+                            "name": name,
+                            "arguments": parsed_args
+                        })
+                    ));
+                }
+                Ok(formatted)
+            } else {
+                Err("Provider returned empty response choices without text or tool calls.".to_string())
+            }
         }
     }
 }
@@ -209,6 +267,18 @@ pub async fn query_llm_stream(
     base_url: Option<&str>,
     on_token: impl Fn(String) + Send + Sync + 'static,
 ) -> Result<String, String> {
+    query_llm_stream_with_tools(provider, model_id, messages, api_key, base_url, &[], on_token).await
+}
+
+pub async fn query_llm_stream_with_tools(
+    provider: &str,
+    model_id: &str,
+    messages: &[ModelMessage],
+    api_key: Option<&str>,
+    base_url: Option<&str>,
+    tools: &[Value],
+    on_token: impl Fn(String) + Send + Sync + 'static,
+) -> Result<String, String> {
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(120))
         .redirect(reqwest::redirect::Policy::none())
@@ -218,11 +288,14 @@ pub async fn query_llm_stream(
     match provider {
         "Ollama" => {
             let url = endpoint_url(provider, base_url)?;
-            let body = serde_json::json!({
-                "model": model_id,
-                "messages": messages_json(messages),
-                "stream": true
-            });
+            let mut body_map = serde_json::Map::new();
+            body_map.insert("model".to_string(), serde_json::json!(model_id));
+            body_map.insert("messages".to_string(), serde_json::json!(messages_json(messages)));
+            body_map.insert("stream".to_string(), serde_json::json!(true));
+            if !tools.is_empty() {
+                body_map.insert("tools".to_string(), serde_json::json!(tools));
+            }
+            let body = Value::Object(body_map);
             let mut req = client.post(url).json(&body);
             if let Some(key) = api_key.filter(|key| !key.trim().is_empty()) {
                 req = req.header("Authorization", format!("Bearer {}", key));
@@ -240,30 +313,54 @@ pub async fn query_llm_stream(
             }
             let mut stream = res.bytes_stream();
             let mut accumulated = String::new();
+            let mut buffer = String::new();
+            let mut native_calls = Vec::new();
             while let Some(chunk) = stream.next().await {
                 let chunk = chunk.map_err(|e| e.to_string())?;
-                if accumulated.len() + chunk.len() > MAX_RESPONSE_BYTES {
+                if accumulated.len() + buffer.len() + chunk.len() > MAX_RESPONSE_BYTES {
                     return Err("Provider response exceeded the maximum allowed size".to_string());
                 }
-                let payload = String::from_utf8_lossy(&chunk);
-                for line in payload.lines() {
-                    if line.trim().is_empty() {
-                        continue;
-                    }
-                    if let Ok(json) = serde_json::from_str::<Value>(line)
-                        && let Some(content) = json["message"]["content"]
-                            .as_str()
-                            .filter(|s| !s.is_empty())
-                    {
-                        accumulated.push_str(content);
-                        on_token(content.to_string());
+                buffer.push_str(&String::from_utf8_lossy(&chunk));
+                while let Some(pos) = buffer.find('\n') {
+                    let line = buffer[..pos].trim().to_string();
+                    buffer.drain(..=pos);
+                    if line.is_empty() { continue; }
+                    if let Ok(json) = serde_json::from_str::<Value>(&line) {
+                        if let Some(content) = json["message"]["content"].as_str().filter(|s| !s.is_empty()) {
+                            accumulated.push_str(content);
+                            on_token(content.to_string());
+                        }
+                        if let Some(calls) = json["message"]["tool_calls"].as_array() {
+                            native_calls.extend(calls.iter().cloned());
+                        }
                     }
                 }
             }
+            if !buffer.trim().is_empty()
+                && let Ok(json) = serde_json::from_str::<Value>(buffer.trim())
+            {
+                if let Some(content) = json["message"]["content"].as_str().filter(|s| !s.is_empty()) {
+                    accumulated.push_str(content);
+                    on_token(content.to_string());
+                }
+                if let Some(calls) = json["message"]["tool_calls"].as_array() {
+                    native_calls.extend(calls.iter().cloned());
+                }
+            }
+            for (idx, call) in native_calls.iter().enumerate() {
+                if let Some(parsed) = super::harness::ToolDispatcher::native_tool_call(call, idx + 1) {
+                    accumulated.push_str(&format!(
+                        "<tool_call>\n{}\n</tool_call>\n",
+                        serde_json::json!({
+                            "id": parsed.id,
+                            "name": parsed.name,
+                            "arguments": parsed.arguments
+                        })
+                    ));
+                }
+            }
             if accumulated.is_empty() {
-                let content = "No reply from Ollama";
-                on_token(content.to_string());
-                Ok(content.to_string())
+                Err("Ollama stream completed without text or tool calls.".to_string())
             } else {
                 Ok(accumulated)
             }
@@ -274,11 +371,14 @@ pub async fn query_llm_stream(
                 return Err(format!("API key is required for {}", provider));
             }
             let url = endpoint_url(provider, base_url)?;
-            let body = serde_json::json!({
-                "model": model_id,
-                "messages": messages_json(messages),
-                "stream": true
-            });
+            let mut body_map = serde_json::Map::new();
+            body_map.insert("model".to_string(), serde_json::json!(model_id));
+            body_map.insert("messages".to_string(), serde_json::json!(messages_json(messages)));
+            body_map.insert("stream".to_string(), serde_json::json!(true));
+            if !tools.is_empty() {
+                body_map.insert("tools".to_string(), serde_json::json!(tools));
+            }
+            let body = Value::Object(body_map);
             let mut req = client
                 .post(url)
                 .header("content-type", "application/json")
@@ -301,38 +401,112 @@ pub async fn query_llm_stream(
             let mut stream = res.bytes_stream();
             let mut accumulated = String::new();
             let mut buffer = String::new();
+            let mut stream_error = None;
+            let mut tool_accumulator: std::collections::BTreeMap<usize, (String, String, String)> =
+                std::collections::BTreeMap::new();
             while let Some(chunk) = stream.next().await {
                 let chunk = chunk.map_err(|e| e.to_string())?;
-                if accumulated.len() + chunk.len() > MAX_RESPONSE_BYTES {
+                if accumulated.len() + buffer.len() + chunk.len() > MAX_RESPONSE_BYTES {
                     return Err("Provider response exceeded the maximum allowed size".to_string());
                 }
-                let payload = String::from_utf8_lossy(&chunk);
-                buffer.push_str(&payload);
+                buffer.push_str(&String::from_utf8_lossy(&chunk));
                 while let Some(pos) = buffer.find('\n') {
                     let line = buffer[..pos].to_string();
                     buffer.drain(..=pos);
                     let line = line.trim();
-                    if !line.starts_with("data:") {
-                        continue;
-                    }
+                    if !line.starts_with("data:") { continue; }
                     let data = line[5..].trim();
-                    if data == "[DONE]" {
-                        continue;
-                    }
-                    if let Ok(json) = serde_json::from_str::<Value>(data)
-                        && let Some(content) = json["choices"][0]["delta"]["content"]
-                            .as_str()
-                            .filter(|s| !s.is_empty())
-                    {
-                        accumulated.push_str(content);
-                        on_token(content.to_string());
+                    if data == "[DONE]" { continue; }
+                    if let Ok(json) = serde_json::from_str::<Value>(data) {
+                        if let Some(content) = json["choices"][0]["delta"]["content"].as_str().filter(|s| !s.is_empty()) {
+                            accumulated.push_str(content);
+                            on_token(content.to_string());
+                            continue;
+                        }
+                        if let Some(content) = json["choices"][0]["message"]["content"].as_str().filter(|s| !s.is_empty()) {
+                            accumulated.push_str(content);
+                            on_token(content.to_string());
+                            continue;
+                        }
+                        let tool_calls = json["choices"][0]["delta"]["tool_calls"]
+                            .as_array()
+                            .or_else(|| json["choices"][0]["message"]["tool_calls"].as_array());
+                        if let Some(tool_calls) = tool_calls.filter(|calls| !calls.is_empty()) {
+                            for (fallback_idx, tc) in tool_calls.iter().enumerate() {
+                                let index = tc.get("index")
+                                    .and_then(|v| v.as_u64())
+                                    .map(|v| v as usize)
+                                    .unwrap_or(fallback_idx);
+                                let entry = tool_accumulator.entry(index).or_insert_with(|| (String::new(), String::new(), String::new()));
+                                if let Some(id) = tc.get("id").and_then(|v| v.as_str())
+                                    && !id.is_empty()
+                                {
+                                    entry.0 = id.to_string();
+                                }
+                                if let Some(name) = tc.pointer("/function/name").and_then(|v| v.as_str())
+                                    && !name.is_empty()
+                                {
+                                    entry.1 = name.to_string();
+                                }
+                                if let Some(args_chunk) = tc.pointer("/function/arguments").and_then(|v| v.as_str()) {
+                                    entry.2.push_str(args_chunk);
+                                } else if let Some(args_obj) = tc.pointer("/function/arguments").and_then(|v| v.as_object()) {
+                                    entry.2 = serde_json::to_string(args_obj).unwrap_or_default();
+                                }
+                            }
+                            continue;
+                        }
+                        if let Some(reason) = json["choices"][0]["finish_reason"].as_str() {
+                            if reason == "length" {
+                                stream_error = Some("Model response was truncated (finish_reason=length). Retry with a shorter prompt.".to_string());
+                            } else if reason == "content_filter" {
+                                stream_error = Some("Model response was blocked by the provider's content filter.".to_string());
+                            }
+                        }
+                        if let Some(error) = json.get("error") {
+                            stream_error = Some(format!("{} returned error: {}", provider, safe_error_body(&error.to_string())));
+                        }
                     }
                 }
             }
-            if accumulated.is_empty() {
-                let content = "No content in response choices";
+            if !tool_accumulator.is_empty() {
+                for (idx, (id, name, arguments)) in tool_accumulator {
+                    let call_id = if id.is_empty() {
+                        format!("call_{}", idx + 1)
+                    } else {
+                        id
+                    };
+                    let parsed_args = if arguments.trim().is_empty() {
+                        serde_json::json!({})
+                    } else {
+                        serde_json::from_str::<Value>(&arguments).unwrap_or_else(|_| {
+                            serde_json::json!({ "raw": arguments })
+                        })
+                    };
+                    accumulated.push_str(&format!(
+                        "<tool_call>\n{}\n</tool_call>\n",
+                        serde_json::json!({
+                            "id": call_id,
+                            "name": name,
+                            "arguments": parsed_args
+                        })
+                    ));
+                }
+            }
+            if let Some(error) = stream_error { return Err(error); }
+            if !buffer.trim().is_empty() {
+                let line = buffer.trim();
+                if let Some(data) = line.strip_prefix("data:")
+                && data.trim() != "[DONE]"
+                && let Ok(json) = serde_json::from_str::<Value>(data.trim())
+                && let Some(content) = json["choices"][0]["delta"]["content"].as_str().filter(|s| !s.is_empty())
+            {
+                accumulated.push_str(content);
                 on_token(content.to_string());
-                Ok(content.to_string())
+            }
+            }
+            if accumulated.is_empty() {
+                Err("Provider stream completed without text. The model may have returned tool calls or an unsupported response format.".to_string())
             } else {
                 Ok(accumulated)
             }

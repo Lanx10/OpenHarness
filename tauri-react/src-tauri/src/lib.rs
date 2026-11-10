@@ -863,6 +863,7 @@ fn validate_tool_call(call: &harness::ToolCall) -> Result<(), String> {
         "read_file" => {
             let path = call.arguments["path"]
                 .as_str()
+                .filter(|path| !path.trim().is_empty())
                 .ok_or("read_file requires a path")?;
             if path.len() > 4096 {
                 return Err("File path exceeds 4096 bytes".to_string());
@@ -884,9 +885,10 @@ fn validate_tool_call(call: &harness::ToolCall) -> Result<(), String> {
                 return Err("Directory path exceeds 4096 bytes".to_string());
             }
         }
-        "grep_search" => {
+        "grep_search" | "grep" => {
             let query = call.arguments["query"]
                 .as_str()
+                .or_else(|| call.arguments["pattern"].as_str())
                 .ok_or("grep_search requires a query")?;
             if query.len() > 1024 {
                 return Err("Search query exceeds 1024 bytes".to_string());
@@ -918,36 +920,39 @@ async fn run_agent_loop(
     approvals: Arc<Mutex<PendingApprovals>>,
     attachments: Vec<String>,
 ) -> Result<String, String> {
-    let tool_hint = format!("\n\n{}", harness::ToolDispatcher::build_system_prompt());
-    let mut messages = initial_messages;
+    let system_prompt = harness::ToolDispatcher::build_system_prompt();
+    let mut messages = Vec::with_capacity(initial_messages.len() + attachments.len() + 1);
+    messages.push(client::ModelMessage::new("system", &system_prompt));
+    for m in initial_messages {
+        if m.role != "system" {
+            messages.push(m);
+        }
+    }
     for attachment in attachments {
         messages.push(client::ModelMessage::new("user", &attachment));
     }
-    if let Some(first_user) = messages.iter_mut().find(|m| m.role == "user") {
-        first_user.content.push_str(&tool_hint);
-    }
 
-    let mut final_text = String::new();
+    let final_text = String::new();
     for _iteration in 0..MAX_AGENT_ITERATIONS {
-        let token_emitter = emitter.clone();
-        let result = client::query_llm_stream(
+        let tools = harness::ToolDispatcher::list_tools()
+            .into_iter()
+            .map(|tool| serde_json::json!({
+                "type": "function",
+                "function": {
+                    "name": tool.name,
+                    "description": tool.description,
+                    "parameters": tool.parameters
+                }
+            }))
+            .collect::<Vec<_>>();
+        let result = client::query_llm_stream_with_tools(
             &provider,
             &model_id,
             &messages,
             key.as_deref(),
             base_url.as_deref(),
-            move |text| {
-                // Hide executable tool protocol from chat; show only final prose.
-                if !text.contains("<tool_call>") && !text.contains("</tool_call>") {
-                    let _ = token_emitter.send(StreamChunk {
-                        text,
-                        done: false,
-                        error: None,
-                        approval: None,
-                        step: None,
-                    });
-                }
-            },
+            &tools,
+            |_| {},
         )
         .await?;
 
@@ -957,15 +962,43 @@ async fn run_agent_loop(
 
         let calls = harness::ToolDispatcher::parse_tool_calls(&result);
         if calls.is_empty() {
-            return Ok(if result.trim().is_empty() {
-                final_text
+            let cleaned = harness::ToolDispatcher::strip_tool_calls(&result);
+            let final_reply = if cleaned.is_empty() {
+                if result.trim().is_empty() {
+                    final_text
+                } else {
+                    result
+                }
             } else {
-                result
+                cleaned
+            };
+            let _ = emitter.send(StreamChunk {
+                text: final_reply.clone(),
+                done: false,
+                error: None,
+                approval: None,
+                step: None,
             });
+            return Ok(final_reply);
         }
 
-        let mut assistant_content = result.clone();
-        messages.push(client::ModelMessage::new("assistant", &assistant_content));
+        let native_tool_calls = result.trim_start().starts_with("<tool_call>")
+            && result.contains("</tool_call>")
+            && result
+                .trim_start()
+                .strip_prefix("<tool_call>")
+                .and_then(|payload| payload.lines().next())
+                .is_none_or(|first_line| !first_line.trim().is_empty());
+        let tool_calls_repr = if native_tool_calls {
+            serde_json::json!({"role": "assistant", "content": null, "tool_calls": calls.iter().map(|call| serde_json::json!({"id": call.id, "type": "function", "function": {"name": call.name, "arguments": serde_json::to_string(&call.arguments).unwrap_or_else(|_| "{}".into())}})).collect::<Vec<_>>() }).to_string()
+        } else {
+            calls
+                .iter()
+                .map(|call| format!("<tool_call>\n{}\n</tool_call>", serde_json::json!({"name": call.name, "arguments": call.arguments})))
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        messages.push(client::ModelMessage::new("assistant", &tool_calls_repr));
         for call in calls {
             if let Err(error) = validate_tool_call(&call) {
                 messages.push(client::ModelMessage::new(
@@ -1068,9 +1101,7 @@ async fn run_agent_loop(
             let mut observation = harness::ToolDispatcher::format_observation(&tool_result);
             observation = clamp_string(observation, MAX_TOOL_OUTPUT_BYTES);
             messages.push(client::ModelMessage::new("system", &observation));
-            assistant_content.clear();
         }
-        final_text = result;
     }
 
     Err("Agent stopped after reaching the maximum tool iteration count".to_string())
@@ -1264,13 +1295,19 @@ async fn chat_send_stream(
     let url_owned = config_url.clone();
     let project_root_opt = project_id
         .as_deref()
-        .and_then(|id| state.project_root(id).ok());
+        .and_then(|id| state.project_root(id).ok())
+        .or_else(|| {
+            let projects = state.projects.lock().ok()?;
+            let active = projects.iter().find(|p| p.active).or_else(|| projects.first())?;
+            state.project_root(&active.id).ok()
+        })
+        .or_else(|| std::env::current_dir().ok());
     let approvals = state.pending_approvals.clone();
     let task_state = state.inner();
     let task = tokio::spawn(async move {
         let attachments = attachments_from_request;
         if let Some(root) = project_root_opt {
-            if key_owned.is_some() || saved.is_some() {
+            if key_owned.is_some() || saved.is_some() || provider_owned == "Ollama" {
                 let result = run_agent_loop(
                     provider_owned.clone(),
                     model_owned.clone(),

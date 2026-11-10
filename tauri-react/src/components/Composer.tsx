@@ -12,6 +12,7 @@ type AttachmentInfo = {
   name: string;
   size: number;
   content: string;
+  isImage?: boolean;
 };
 
 export function Composer() {
@@ -87,18 +88,40 @@ export function Composer() {
     if (!files) return;
     const next: AttachmentInfo[] = [];
     for (const file of Array.from(files)) {
-      if (file.size > 256 * 1024) {
-        toastError(`Attachment too large: ${file.name}`);
+      const isImg = file.type.startsWith('image/') || /\.(png|jpe?g|webp|gif|svg)$/i.test(file.name);
+      const maxSize = isImg ? 4 * 1024 * 1024 : 256 * 1024;
+      if (file.size > maxSize) {
+        toastError(`Attachment too large: ${file.name} (max ${isImg ? '4MB' : '256KB'})`);
         continue;
       }
       try {
-        const content = await new Promise<string>((resolve, reject) => {
-          const reader = new FileReader();
-          reader.onload = () => resolve(String(reader.result || ''));
-          reader.onerror = () => reject(reader.error);
-          reader.readAsText(file);
-        });
-        next.push({ name: file.name, size: file.size, content: `[${file.name}]\n${content}` });
+        if (isImg) {
+          const dataUrl = await new Promise<string>((resolve, reject) => {
+            const reader = new FileReader();
+            reader.onload = () => resolve(String(reader.result || ''));
+            reader.onerror = () => reject(reader.error);
+            reader.readAsDataURL(file);
+          });
+          next.push({
+            name: file.name,
+            size: file.size,
+            isImage: true,
+            content: `![${file.name}](${dataUrl})`,
+          });
+        } else {
+          const content = await new Promise<string>((resolve, reject) => {
+            const reader = new FileReader();
+            reader.onload = () => resolve(String(reader.result || ''));
+            reader.onerror = () => reject(reader.error);
+            reader.readAsText(file);
+          });
+          next.push({
+            name: file.name,
+            size: file.size,
+            isImage: false,
+            content: `[${file.name}]\n${content}`,
+          });
+        }
       } catch {
         toastError(`Could not read: ${file.name}`);
       }
@@ -164,8 +187,8 @@ export function Composer() {
         }}
       />
       <div className="composer-row">
-        <input ref={fileInputRef} type="file" multiple style={{display:'none'}} onChange={(e) => { void handleFiles(e.target.files); e.target.value = ''; }} />
-        <button className="model-button" type="button" aria-label="Attach files" title="Attach files" onClick={() => fileInputRef.current?.click()}>
+        <input ref={fileInputRef} type="file" accept="image/*,.txt,.md,.json,.ts,.js,.rs,.py,.css,.html" multiple style={{display:'none'}} onChange={(e) => { void handleFiles(e.target.files); e.target.value = ''; }} />
+        <button className="model-button" type="button" aria-label="Attach files or images" title="Attach files or images" onClick={() => fileInputRef.current?.click()}>
           <PaperClipIcon width={16} height={16} aria-hidden="true" />
         </button>
         <span className="composer-spacer" />

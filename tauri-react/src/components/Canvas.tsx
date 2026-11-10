@@ -3,8 +3,9 @@ import { SafeMarkdown } from './SafeMarkdown';
 import { MessageCrumbs } from './MessageCrumbs';
 import { upsertStep } from './stepLifecycle';
 import type { Message } from '../types/message';
+import { cleanMessageText } from '../utils/cleanMessageText';
 import {isTauri} from '@tauri-apps/api/core';
-import {PlusIcon, ComputerDesktopIcon, ClipboardDocumentIcon, ArrowPathIcon, ArrowDownTrayIcon, TrashIcon, ChevronLeftIcon, ChevronRightIcon, DocumentTextIcon, SquaresPlusIcon} from '@heroicons/react/20/solid';
+import {PlusIcon, ComputerDesktopIcon, ClipboardDocumentIcon, ArrowPathIcon, ArrowDownTrayIcon, TrashIcon, ChevronLeftIcon, ChevronRightIcon, DocumentTextIcon, SquaresPlusIcon, ChatBubbleLeftIcon} from '@heroicons/react/20/solid';
 import {Composer} from './Composer';
 import {WorkspaceGitDiff, GitDiffIcon} from './WorkspaceGitDiff';
 import {BrowserSidePanel} from './BrowserSidePanel';
@@ -18,6 +19,7 @@ import {
   apiListThreads,
   apiGetThread,
   apiDeleteThread,
+  apiGetProjects,
   apiEditMessage,
   apiDeleteMessage,
   apiRespondToToolApproval,
@@ -120,29 +122,93 @@ function WorkspaceFiles({projectId}: {projectId: string | null}) {
   </div>;
 }
 
+function renderAttachment(item: string, index: number) {
+  const imgMatch = item.match(/^!\[([^\]]*)\]\((data:image\/[^)]+|https?:\/\/[^)]+)\)$/);
+  if (imgMatch) {
+    const [, alt, src] = imgMatch;
+    return (
+      <figure key={index} className="message-attachment-image-wrap">
+        <img src={src} alt={alt || 'Attached image'} className="message-attachment-image" loading="lazy" />
+        {alt && <figcaption>{alt}</figcaption>}
+      </figure>
+    );
+  }
+  const fileTitle = item.startsWith('[') && item.includes(']') ? item.slice(1, item.indexOf(']')) : item;
+  return <span className="attachment-pill" key={index}>{fileTitle}</span>;
+}
+
 type MessageProps = {message: Message; onCopy: () => void; onDelete: () => void; onRegenerate: () => void; onSaveEdit: (text: string) => void};
 
 function MessageView({message, onCopy, onDelete, onRegenerate, onSaveEdit}: MessageProps) {
   const [editing, setEditing] = useState(false);
   const [draft, setDraft] = useState(message.text);
   useEffect(() => setDraft(message.text), [message.text]);
+
+  if (message.role === 'user') {
+    return (
+      <div className="chatgpt-user-row">
+        <div className="chatgpt-user-group">
+          <article className="chatgpt-user-bubble">
+            {message.attachments?.length ? (
+              <div className="message-attachments">
+                {message.attachments.map((file, index) => renderAttachment(file, index))}
+              </div>
+            ) : null}
+            <div className="message-content">
+              {editing ? (
+                <textarea value={draft} onChange={e => setDraft(e.target.value)} aria-label="Edit message" />
+              ) : (
+                <p>{message.text}</p>
+              )}
+            </div>
+          </article>
+          <div className="chatgpt-user-actions">
+            <button type="button" onClick={onCopy} aria-label="Copy" title="Copy"><ClipboardDocumentIcon width={13}/></button>
+            <button type="button" onClick={() => { if (editing) { onSaveEdit(draft); setEditing(false); } else setEditing(true); }} aria-label={editing ? 'Save edit' : 'Edit'} title="Edit message">{editing ? 'Save' : 'Edit'}</button>
+            <button type="button" onClick={onDelete} aria-label="Delete" title="Delete message"><TrashIcon width={13}/></button>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  const isThinking = message.status === 'thinking';
+  const hasText = Boolean(message.text.trim());
+  const showBody = hasText || editing || isThinking;
+
   return (
-    <article className={`message ${message.role}`} aria-live={message.status === 'thinking' ? 'off' : 'polite'}>
-      <div className="message-role-label">{message.role === 'user' ? 'You' : 'OpenHarness'}</div>
-      {message.attachments?.length ? <div className="message-attachments">{message.attachments.map(file => <span className="attachment-pill" key={file}>{file}</span>)}</div> : null}
-      <div className="message-content">
-        {editing ? (
-          <textarea value={draft} onChange={e => setDraft(e.target.value)} aria-label="Edit message" />
-        ) : message.role === 'assistant' ? <SafeMarkdown content={message.text} /> : <p>{message.text}</p>}
+    <div className={`chatgpt-assistant-row${isThinking ? ' is-thinking' : ''}${message.status === 'error' ? ' is-error' : ''}`}>
+      <div className="chatgpt-assistant-avatar" aria-hidden="true">
+        <span className="chatgpt-avatar-mark">OH</span>
       </div>
-      {message.role === 'assistant' && <MessageCrumbs steps={message.steps} thinking={message.status === 'thinking' && message.steps?.every(step => step.status !== 'running')} />}
-      <div className="message-actions">
-        <button type="button" onClick={onCopy} aria-label="Copy"><ClipboardDocumentIcon width={12}/></button>
-        {message.role === 'assistant' && <button type="button" onClick={onRegenerate} aria-label="Regenerate"><ArrowPathIcon width={12}/></button>}
-        <button type="button" onClick={() => { if (editing) { onSaveEdit(draft); setEditing(false); } else setEditing(true); }} aria-label={editing ? 'Save edit' : 'Edit'}>{editing ? 'Save' : 'Edit'}</button>
-        <button type="button" onClick={onDelete} aria-label="Delete"><TrashIcon width={12}/></button>
+      <div className="chatgpt-assistant-main">
+        <MessageCrumbs steps={message.steps} thinking={isThinking && (!message.steps || message.steps.every(step => step.status !== 'running'))} />
+        {showBody && (
+          <article className="chatgpt-assistant-body">
+            {message.attachments?.length ? (
+              <div className="message-attachments">
+                {message.attachments.map((file, index) => renderAttachment(file, index))}
+              </div>
+            ) : null}
+            <div className="message-content">
+              {editing ? (
+                <textarea value={draft} onChange={e => setDraft(e.target.value)} aria-label="Edit message" />
+              ) : (
+                <SafeMarkdown content={cleanMessageText(message.text)} />
+              )}
+            </div>
+          </article>
+        )}
+        {hasText && (
+          <div className="chatgpt-assistant-actions">
+            <button type="button" onClick={onCopy} aria-label="Copy" title="Copy"><ClipboardDocumentIcon width={13}/></button>
+            <button type="button" onClick={onRegenerate} aria-label="Regenerate" title="Regenerate"><ArrowPathIcon width={13}/></button>
+            <button type="button" onClick={() => { if (editing) { onSaveEdit(draft); setEditing(false); } else setEditing(true); }} aria-label={editing ? 'Save edit' : 'Edit'} title="Edit message">{editing ? 'Save' : 'Edit'}</button>
+            <button type="button" onClick={onDelete} aria-label="Delete" title="Delete message"><TrashIcon width={13}/></button>
+          </div>
+        )}
       </div>
-    </article>
+    </div>
   );
 }
 
@@ -154,6 +220,14 @@ export function Canvas() {
   const [threadId, setThreadId] = useState<string | null>(null);
   const [threadsCollapsed, setThreadsCollapsed] = useState(() => {
     try { return localStorage.getItem('openharness:threads-collapsed') === 'true'; } catch { return false; }
+  });
+  const [threadsWidth, setThreadsWidth] = useState(() => {
+    try {
+      const saved = Number(localStorage.getItem('openharness:threads-width'));
+      return Number.isFinite(saved) && saved >= 160 && saved <= 320 ? saved : 206;
+    } catch {
+      return 206;
+    }
   });
   const [projectId, setProjectId] = useState<string | null>(null);
   const [projectName, setProjectName] = useState('');
@@ -205,10 +279,11 @@ export function Canvas() {
   useEffect(() => {
     try { localStorage.setItem('openharness:file-panel-width', String(filePanelWidth)); } catch {}
   }, [filePanelWidth]);
-   useEffect(() => {
-     try { localStorage.setItem('openharness:git-panel-width', String(gitPanelWidth)); } catch {}
-   }, [gitPanelWidth]);
+  useEffect(() => {
+    try { localStorage.setItem('openharness:git-panel-width', String(gitPanelWidth)); } catch {}
+  }, [gitPanelWidth]);
   useEffect(() => { try { localStorage.setItem('openharness:browser-panel-width', String(browserPanelWidth)); } catch {} }, [browserPanelWidth]);
+  useEffect(() => { try { localStorage.setItem('openharness:threads-width', String(threadsWidth)); } catch {} }, [threadsWidth]);
 
   const refreshWorkspaceGit = async (currentProjectId: string | null) => {
     if (!currentProjectId) {
@@ -254,6 +329,22 @@ export function Canvas() {
   };
 
   useEffect(() => {
+    let active = true;
+    void apiGetProjects().then(items => {
+      if (active && !projectId && items.length) {
+        const project = items.find(item => item.active) ?? items[0];
+        const id = 'id' in project ? String(project.id) : '';
+        if (id) {
+          setProjectId(id);
+          setProjectName('name' in project && typeof project.name === 'string' ? project.name : '');
+          void refreshThreads(id);
+        }
+      }
+    }).catch(() => {});
+    return () => { active = false; };
+  }, []);
+
+  useEffect(() => {
     const applyThreadTitle = (event: Event) => {
       const detail = (event as CustomEvent<{ threadId?: string; title?: string }>).detail;
       if (!detail?.threadId || !detail.title) return;
@@ -270,14 +361,15 @@ export function Canvas() {
       const text = String(detail?.text ?? '').trim();
       if (!text) return;
       let currentThreadId = threadId;
-        if (!currentThreadId && projectId) {
-          try {
-            const thread = await apiCreateThread(projectId);
-            currentThreadId = thread.id;
-            if (!cancelled) { setThreads(prev => [thread, ...prev.filter(item => item.id !== thread.id)]); }
-            setThreadId(thread.id);
-          } catch (error) { toast(`Could not create chat: ${String(error)}`); return; }
-        }
+      const targetProjectId = projectId ?? detail?.projectId ?? null;
+      if (!currentThreadId && targetProjectId) {
+        try {
+          const thread = await apiCreateThread(targetProjectId);
+          currentThreadId = thread.id;
+          if (!cancelled) { setThreads(prev => [thread, ...prev.filter(item => item.id !== thread.id)]); }
+          setThreadId(thread.id);
+        } catch (error) { toast(`Could not create chat: ${String(error)}`); return; }
+      }
       const userMessage: Message = {id: `u-${Date.now()}`, role: 'user', text, status: 'done', attachments: detail.attachments};
       setMessages(prev => [...prev, userMessage]);
       const assistantId = `a-${Date.now()}`;
@@ -287,11 +379,11 @@ export function Canvas() {
       };
       setStopHandle(() => cancel);
       try {
-  await apiChatStream(text, detail.modelId, detail.provider, projectId ?? undefined, currentThreadId ?? undefined, detail.attachments, (token) => {
+        await apiChatStream(text, detail.modelId, detail.provider, targetProjectId ?? undefined, currentThreadId ?? undefined, detail.attachments, (token) => {
           setMessages(prev => prev.map(message => message.id === assistantId ? {...message, text: message.text + token, status: 'thinking'} : message));
         }, () => {
           setMessages(prev => prev.map(message => message.id === assistantId ? {...message, status: 'done', steps: message.steps} : message));
-          void refreshWorkspaceGit(projectId ?? null);
+          void refreshWorkspaceGit(targetProjectId);
         }, (error) => {
           const errText = String(error);
           if (errText.includes('Generation stopped')) {
@@ -320,26 +412,13 @@ export function Canvas() {
             const thread = await apiGetThread(currentThreadId);
             loadThreadMessages(thread);
           } catch {}
-          void refreshThreads(projectId);
+          void refreshThreads(targetProjectId);
         }
       }
     };
-    const startNewThread = async () => {
+    const startNewThread = () => {
       setMessages([]);
       setThreadId(null);
-      if (!projectId) {
-        toast('Select a project before starting a new thread');
-        return;
-      }
-      try {
-        const thread = await apiCreateThread(projectId);
-        if (cancelled) return;
-        setThreadId(thread.id);
-        setThreads(previous => [thread, ...previous.filter(item => item.id !== thread.id)]);
-        toast('New thread started');
-      } catch (error) {
-        toast(`Could not create thread: ${String(error)}`);
-      }
     };
     const onNewChat = startNewThread;
     const onOpenThread = async (selectedThreadId: string) => {
@@ -390,6 +469,7 @@ export function Canvas() {
     window.addEventListener('openharness:quick-files', handleQuickFiles);
     window.addEventListener('openharness:quick-git', handleQuickGit);
     window.addEventListener('openharness:quick-browser', handleQuickBrowser);
+    window.addEventListener('openharness:send-message', onSend as EventListener);
     window.addEventListener('openharness:new-chat', onNewChat);
     window.addEventListener('openharness:select-project', onSelectProject as EventListener);
     window.addEventListener('openharness:open-thread', handleOpenThread);
@@ -459,6 +539,50 @@ export function Canvas() {
     window.addEventListener('pointercancel', stop, { once: true });
     window.addEventListener('lostpointercapture', stop, { once: true });
     captured.setPointerCapture(event.pointerId);
+  };
+
+  const resizeThreadSidebar = (event: React.PointerEvent<HTMLDivElement>) => {
+    if (threadsCollapsed) return;
+    const startX = event.clientX;
+    const startWidth = threadsWidth;
+    const captured = event.currentTarget;
+
+    const move = (pointer: PointerEvent) => {
+      const width = Math.min(320, Math.max(160, startWidth + pointer.clientX - startX));
+      setThreadsWidth(width);
+    };
+
+    const stop = () => {
+      window.removeEventListener('pointermove', move);
+      window.removeEventListener('pointerup', stop);
+      window.removeEventListener('pointercancel', stop);
+      window.removeEventListener('lostpointercapture', stop);
+      if (captured && captured.hasPointerCapture?.(event.pointerId)) {
+        try { captured.releasePointerCapture(event.pointerId); } catch {}
+      }
+    };
+
+    window.addEventListener('pointermove', move);
+    window.addEventListener('pointerup', stop, { once: true });
+    window.addEventListener('pointercancel', stop, { once: true });
+    window.addEventListener('lostpointercapture', stop, { once: true });
+    captured.setPointerCapture(event.pointerId);
+  };
+
+  const handleThreadResizeKeyDown = (event: React.KeyboardEvent<HTMLDivElement>) => {
+    if (event.key === 'ArrowRight') {
+      event.preventDefault();
+      setThreadsWidth(width => Math.min(320, width + 10));
+    } else if (event.key === 'ArrowLeft') {
+      event.preventDefault();
+      setThreadsWidth(width => Math.max(160, width - 10));
+    } else if (event.key === 'Home') {
+      event.preventDefault();
+      setThreadsWidth(160);
+    } else if (event.key === 'End') {
+      event.preventDefault();
+      setThreadsWidth(320);
+    }
   };
 
   const closeTerminal = async (id: string) => {
@@ -578,13 +702,40 @@ export function Canvas() {
   return (
       <div className="canvas-layout">
       {threadsCollapsed ? (
-        <aside className="thread-sidebar thread-sidebar-collapsed" aria-label="Chat threads collapsed">
+        <aside className="thread-sidebar thread-sidebar-collapsed" aria-label="Chat threads collapsed" style={{width: 48, minWidth: 48, flexBasis: 48}}>
           <button type="button" className="collapse-toggle-btn thread-toggle" onClick={toggleThreads} aria-label="Expand threads sidebar" title="Expand threads sidebar">
             <ChevronRightIcon width={14} height={14} />
           </button>
+          <button type="button" className="thread-collapsed-action" onClick={() => window.dispatchEvent(new Event('openharness:new-chat'))} aria-label="New thread" title="New thread"><PlusIcon width={16} height={16} aria-hidden="true" /></button>
+          <div className="thread-collapsed-list">
+            {threads.slice(0, 6).map(thread => (
+              <button
+                key={thread.id}
+                type="button"
+                className={`thread-collapsed-item ${thread.id === threadId ? 'active' : ''}`}
+                title={thread.title || 'Chat thread'}
+                aria-label={thread.title || 'Chat thread'}
+                onClick={() => window.dispatchEvent(new CustomEvent('openharness:open-thread', {detail: thread.id}))}
+              >
+                <ChatBubbleLeftIcon width={15} height={15} aria-hidden="true" />
+              </button>
+            ))}
+          </div>
         </aside>
       ) : (
-        <aside className="thread-sidebar" aria-label="Chat threads">
+        <aside className="thread-sidebar" aria-label="Chat threads" style={{width: threadsWidth, minWidth: 160, flexBasis: threadsWidth}}>
+          <div
+            className="thread-sidebar-resizer"
+            onPointerDown={resizeThreadSidebar}
+            onKeyDown={handleThreadResizeKeyDown}
+            tabIndex={0}
+            role="separator"
+            aria-orientation="vertical"
+            aria-valuenow={threadsWidth}
+            aria-valuemin={160}
+            aria-valuemax={320}
+            aria-label="Resize threads sidebar"
+          />
           <div className="thread-sidebar-header">
             <div className="thread-sidebar-title-row">
               <span className="thread-sidebar-title">Threads</span>
@@ -603,6 +754,15 @@ export function Canvas() {
             ))}
           </ul>
           {!threads.length && <p className="thread-empty">No chats saved yet.</p>}
+          <section className="session-context-card" aria-label="Session context">
+            <span className="session-context-eyebrow">SESSION CONTEXT</span>
+            <strong>{projectName || 'No project selected'}</strong>
+            <span className="session-context-detail">{projectId ? (threads.find(thread => thread.id === threadId)?.title || 'New thread') : 'Select a project to show context.'}</span>
+            <div className="session-context-meter" role="meter" aria-label={`Session messages: ${messages.length}`} aria-valuemin={0} aria-valuemax={100} aria-valuenow={Math.min(messages.length, 100)}>
+              <span style={{width: `${Math.min(messages.length, 100)}%`}} />
+            </div>
+            <span className="session-context-foot">{messages.length} messages in this thread</span>
+          </section>
         </aside>
       )}
       <main
@@ -629,7 +789,9 @@ export function Canvas() {
         {empty && <Hero className={activeTool === 'terminal' ? 'hero-above-terminal' : undefined} />}
         <section className="conversation" aria-live="polite" ref={conversationRef} hidden={empty}>
           {messages.map(message => (
-            <MessageView key={message.id} message={message} onCopy={() => copyMessage(message)} onDelete={() => deleteMessage(message.id)} onRegenerate={() => regenerateMessage(message.id)} onSaveEdit={text => void saveMessageEdit(message.id, text)} />
+            <div className="conversation-entry" key={message.id}>
+              <MessageView message={message} onCopy={() => copyMessage(message)} onDelete={() => deleteMessage(message.id)} onRegenerate={() => regenerateMessage(message.id)} onSaveEdit={text => void saveMessageEdit(message.id, text)} />
+            </div>
           ))}
         </section>
         <div className="composer-wrap">

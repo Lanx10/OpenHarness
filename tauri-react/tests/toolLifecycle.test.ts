@@ -2,6 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { upsertStep } from '../src/components/stepLifecycle.ts';
 import type { StepEventLike } from '../src/components/StepEvent.ts';
+import { cleanMessageText } from '../src/utils/cleanMessageText.ts';
 
 test('upsertStep adds new steps in order', () => {
   const initial: StepEventLike[] = [];
@@ -43,6 +44,20 @@ test('upsertStep updates status and detail on existing step by id', () => {
   assert.equal(result.length, 1);
   assert.equal(result[0].status, 'done');
   assert.equal(result[0].detail, 'exit code 0');
+});
+
+test('cleanMessageText strips tool_call', () => {
+  const input = `Here you go.
+<​tool_call>
+{"name": "read_file", "arguments": {"path": "APP-COMPLETION-AUDIT.md"}}
+</​tool_call>`;
+  const out = cleanMessageText(input);
+  assert.equal(out, 'Here you go.');
+});
+
+test('cleanMessageText strips raw tool call objects', () => {
+  const capped = 'done ' + JSON.stringify({name:'read_file', arguments:{path:'src/main.rs'}});
+  assert.equal(cleanMessageText(capped).trim(), 'done');
 });
 
 test('upsertStep handles approval to running transition', () => {

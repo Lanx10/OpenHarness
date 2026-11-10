@@ -92,7 +92,20 @@ impl Sandbox {
             }
         }
 
-        let candidate = self.root.join(trimmed);
+        let path_obj = Path::new(trimmed);
+        let normalized = if let Ok(stripped) = path_obj.strip_prefix(&self.root) {
+            stripped
+        } else if let Some(root_name) = self.root.file_name() {
+            if let Ok(stripped) = path_obj.strip_prefix(root_name) {
+                stripped
+            } else {
+                path_obj
+            }
+        } else {
+            path_obj
+        };
+
+        let candidate = self.root.join(normalized);
         if candidate.exists() {
             let canonical = candidate.canonicalize().map_err(|e| {
                 format!(
@@ -535,6 +548,130 @@ impl GitContext {
 pub struct ToolDispatcher;
 
 impl ToolDispatcher {
+    pub fn native_tool_call(value: &serde_json::Value, next_id: usize) -> Option<ToolCall> {
+        let function = value.get("function").unwrap_or(value);
+        let raw_name = function
+            .get("name")
+            .or_else(|| function.get("tool"))
+            .or_else(|| function.get("action"))
+            .and_then(|v| v.as_str())?;
+
+        let canonical_name = match raw_name.to_lowercase().replace(['-', ' '], "_").as_str() {
+            "read_file" | "readfile" | "read" | "cat" | "view_file" => "read_file",
+            "write_file" | "writefile" | "write" | "edit_file" | "create_file" => "write_file",
+            "list_dir" | "listdir" | "ls" | "dir" | "list_directory" => "list_dir",
+            "grep_search" | "grep" | "search" | "grepsearch" => "grep_search",
+            "run_command" | "runcommand" | "bash" | "sh" | "terminal" | "exec" | "command" | "cmd" => {
+                "run_command"
+            }
+            "git_status" | "gitstatus" => "git_status",
+            "git_diff" | "gitdiff" => "git_diff",
+            "git_log" | "gitlog" => "git_log",
+            "git_branch" | "gitbranch" => "git_branch",
+            _ => return None,
+        };
+
+        let mut arguments = if let Some(args_val) = function
+            .get("arguments")
+            .or_else(|| function.get("parameters"))
+            .or_else(|| function.get("params"))
+            .or_else(|| function.get("args"))
+            .or_else(|| function.get("input"))
+        {
+            match args_val {
+                serde_json::Value::String(raw) => {
+                    serde_json::from_str(raw).unwrap_or_else(|_| serde_json::json!({}))
+                }
+                other => other.clone(),
+            }
+        } else {
+            let mut top = serde_json::Map::new();
+            if let Some(obj) = function.as_object() {
+                for (k, v) in obj {
+                    if !["name", "tool", "action", "id", "type", "function"].contains(&k.as_str()) {
+                        top.insert(k.clone(), v.clone());
+                    }
+                }
+            }
+            serde_json::Value::Object(top)
+        };
+
+        if let Some(obj) = arguments.as_object_mut() {
+            match canonical_name {
+                "read_file" | "write_file" => {
+                    if !obj.contains_key("path") {
+                        for alias in ["file_path", "filePath", "file", "filename", "rel_path", "target", "uri"] {
+                            if let Some(val) = obj.get(alias).cloned() {
+                                obj.insert("path".to_string(), val);
+                                break;
+                            }
+                        }
+                    }
+                    if let Some(p) = obj.get("path").and_then(|v| v.as_str()) {
+                        let cleaned = p
+                            .trim()
+                            .trim_matches(['"', '\''])
+                            .trim_start_matches("./")
+                            .trim_start_matches(".\\");
+                        obj.insert("path".to_string(), serde_json::json!(cleaned));
+                    }
+                    if canonical_name == "write_file" && !obj.contains_key("content") {
+                        for alias in ["text", "data", "body", "code"] {
+                            if let Some(val) = obj.get(alias).cloned() {
+                                obj.insert("content".to_string(), val);
+                                break;
+                            }
+                        }
+                    }
+                }
+                "list_dir" => {
+                    if !obj.contains_key("path") {
+                        for alias in ["dir", "directory", "folder"] {
+                            if let Some(val) = obj.get(alias).cloned() {
+                                obj.insert("path".to_string(), val);
+                                break;
+                            }
+                        }
+                    }
+                    if !obj.contains_key("path") {
+                        obj.insert("path".to_string(), serde_json::json!(""));
+                    }
+                }
+                "grep_search" => {
+                    if !obj.contains_key("query") {
+                        for alias in ["pattern", "search", "q", "regex", "text", "term"] {
+                            if let Some(val) = obj.get(alias).cloned() {
+                                obj.insert("query".to_string(), val);
+                                break;
+                            }
+                        }
+                    }
+                }
+                "run_command" => {
+                    for alias in ["cmd", "script", "exec"] {
+                        if !obj.contains_key("command")
+                            && let Some(val) = obj.get(alias).cloned()
+                        {
+                            obj.insert("command".to_string(), val);
+                            break;
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        Some(ToolCall {
+            id: value
+                .get("id")
+                .and_then(|id| id.as_str())
+                .map(str::to_string)
+                .unwrap_or_else(|| format!("call_{}", next_id)),
+            name: canonical_name.to_string(),
+            arguments,
+        })
+    }
+
     pub fn list_tools() -> Vec<ToolDefinition> {
         vec![
             ToolDefinition {
@@ -631,38 +768,271 @@ impl ToolDispatcher {
     }
 
     pub fn parse_tool_calls(text: &str) -> Vec<ToolCall> {
-        let mut calls = Vec::new();
-        let mut cursor = 0;
-        let tag_open = "<tool_call>";
-        let tag_close = "</tool_call>";
+        Self::parse_tool_calls_with_id(text, None)
+    }
 
-        while let Some(start_idx) = text[cursor..].find(tag_open) {
-            let actual_start = cursor + start_idx + tag_open.len();
-            if let Some(end_idx) = text[actual_start..].find(tag_close) {
-                let actual_end = actual_start + end_idx;
-                let payload = text[actual_start..actual_end].trim();
-                if let Ok(val) = serde_json::from_str::<serde_json::Value>(payload)
-                    && let Some(name) = val["name"].as_str()
-                {
-                    let id = val["id"]
-                        .as_str()
-                        .map(str::to_string)
-                        .unwrap_or_else(|| format!("call_{}", calls.len() + 1));
-                    let arguments = val
-                        .get("arguments")
-                        .cloned()
-                        .unwrap_or(serde_json::json!({}));
-                    calls.push(ToolCall {
-                        id,
-                        name: name.to_string(),
-                        arguments,
-                    });
+    pub fn parse_tool_calls_with_id(text: &str, native_id: Option<&str>) -> Vec<ToolCall> {
+        if let Ok(value) = serde_json::from_str::<serde_json::Value>(text)
+            && let Some(items) = value["tool_calls"].as_array()
+        {
+            let mut calls = Vec::new();
+            for (index, item) in items.iter().enumerate() {
+                if let Some(call) = Self::native_tool_call(item, index + 1) {
+                    calls.push(call);
                 }
-                cursor = actual_end + tag_close.len();
+            }
+            if !calls.is_empty() {
+                return calls;
+            }
+        }
+        if let Some(id) = native_id
+            && let Ok(value) = serde_json::from_str::<serde_json::Value>(text)
+            && let Some(mut call) = Self::native_tool_call(&value, 1)
+        {
+            call.id = id.to_string();
+            return vec![call];
+        }
+        let mut calls = Vec::new();
+        let tag_pairs = [
+            ("<tool_call>", "</tool_call>"),
+            ("<toolcall>", "</toolcall>"),
+            ("<tool_calls>", "</tool_calls>"),
+            ("<toolcalls>", "</toolcalls>"),
+            ("<tool-call>", "</tool-call>"),
+            ("<tool-calls>", "</tool-calls>"),
+        ];
+
+        for (open_tag, close_tag) in tag_pairs {
+            let mut cur = 0;
+            while let Some(start_idx) = text[cur..].to_lowercase().find(open_tag) {
+                let actual_start = cur + start_idx + open_tag.len();
+                if let Some(end_idx) = text[actual_start..].to_lowercase().find(close_tag) {
+                    let actual_end = actual_start + end_idx;
+                    let payload = text[actual_start..actual_end].trim();
+                    let clean_payload = if let Some(stripped) = payload.strip_prefix("```") {
+                        let c = stripped.find('\n').map(|nl| &stripped[nl + 1..]).unwrap_or(stripped);
+                        c.rfind("```").map(|end| &c[..end]).unwrap_or(c).trim()
+                    } else {
+                        payload
+                    };
+                    if let Ok(val) = serde_json::from_str::<serde_json::Value>(clean_payload) {
+                        if let Some(arr) = val.as_array() {
+                            for item in arr {
+                                if let Some(call) = Self::native_tool_call(item, calls.len() + 1) {
+                                    calls.push(call);
+                                }
+                            }
+                        } else if let Some(call) = Self::native_tool_call(&val, calls.len() + 1) {
+                            calls.push(call);
+                        }
+                    }
+                    cur = actual_end + close_tag.len();
+                } else {
+                    break;
+                }
+            }
+        }
+
+        if calls.is_empty() {
+            let known_xml_tools = [
+                ("read_file", "path"),
+                ("write_file", "path"),
+                ("list_dir", "path"),
+                ("grep_search", "query"),
+                ("grep", "query"),
+                ("run_command", "command"),
+                ("git_status", ""),
+                ("git_diff", "staged"),
+                ("git_log", "limit"),
+                ("git_branch", ""),
+            ];
+            for (tool_name, default_arg) in known_xml_tools {
+                let open_prefix = format!("<{}", tool_name);
+                let close_tag = format!("</{}>", tool_name);
+                let mut cur = 0;
+                while let Some(idx) = text[cur..].to_lowercase().find(&open_prefix) {
+                    let start = cur + idx;
+                    let after_tag = start + open_prefix.len();
+                    if after_tag < text.len() {
+                        let ch = text.as_bytes()[after_tag];
+                        if ch != b' ' && ch != b'>' && ch != b'/' && ch != b'\n' && ch != b'\r' {
+                            cur = after_tag;
+                            continue;
+                        }
+                    }
+
+                    if let Some(close_bracket) = text[start..].find('>') {
+                        let header = &text[start..start + close_bracket];
+                        if header.ends_with('/') {
+                            let mut args_map = serde_json::Map::new();
+                            for part in header.split_whitespace() {
+                                if let Some((k, v)) = part.split_once('=') {
+                                    let k = k.trim().to_lowercase();
+                                    let v = v.trim().trim_matches(['"', '\'']);
+                                    args_map.insert(k, serde_json::json!(v));
+                                }
+                            }
+                            if let Some(call) = Self::native_tool_call(
+                                &serde_json::json!({
+                                    "name": tool_name,
+                                    "arguments": serde_json::Value::Object(args_map)
+                                }),
+                                calls.len() + 1,
+                            ) {
+                                calls.push(call);
+                            }
+                            cur = start + close_bracket + 1;
+                            continue;
+                        }
+                    }
+
+                    if let Some(open_bracket) = text[start..].find('>') {
+                        let content_start = start + open_bracket + 1;
+                        if let Some(end_idx) = text[content_start..].to_lowercase().find(&close_tag) {
+                            let content_end = content_start + end_idx;
+                            let inner = text[content_start..content_end].trim();
+                            let clean_inner = if let Some(stripped) = inner.strip_prefix("```") {
+                                let c = stripped.find('\n').map(|nl| &stripped[nl + 1..]).unwrap_or(stripped);
+                                c.rfind("```").map(|end| &c[..end]).unwrap_or(c).trim()
+                            } else {
+                                inner
+                            };
+                            let call = if let Ok(val) = serde_json::from_str::<serde_json::Value>(clean_inner) {
+                                Self::native_tool_call(&serde_json::json!({
+                                    "name": tool_name,
+                                    "arguments": val
+                                }), calls.len() + 1)
+                            } else if !default_arg.is_empty() && !clean_inner.is_empty() {
+                                let mut map = serde_json::Map::new();
+                                map.insert(default_arg.to_string(), serde_json::json!(clean_inner));
+                                Self::native_tool_call(&serde_json::json!({
+                                    "name": tool_name,
+                                    "arguments": serde_json::Value::Object(map)
+                                }), calls.len() + 1)
+                            } else {
+                                Self::native_tool_call(&serde_json::json!({
+                                    "name": tool_name,
+                                    "arguments": {}
+                                }), calls.len() + 1)
+                            };
+                            if let Some(c) = call {
+                                calls.push(c);
+                            }
+                            cur = content_end + close_tag.len();
+                            continue;
+                        }
+                    }
+
+                    cur = start + open_prefix.len();
+                }
+            }
+        }
+
+        if !calls.is_empty() {
+            return calls;
+        }
+
+        fn extract_call(val: &serde_json::Value, next_id: usize) -> Option<ToolCall> {
+            if let Some(items) = val["tool_calls"].as_array() {
+                return items
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(i, item)| ToolDispatcher::native_tool_call(item, next_id + i))
+                    .next();
+            }
+            if val["function"].is_object() {
+                return ToolDispatcher::native_tool_call(val, next_id);
+            }
+            let name = val["name"].as_str().or_else(|| val["tool"].as_str())?;
+            let arguments = val.get("arguments").cloned().unwrap_or_else(|| val.clone());
+            let call = ToolDispatcher::native_tool_call(
+                &serde_json::json!({"id": val["id"], "name": name, "arguments": arguments}),
+                next_id,
+            )?;
+            Some(call)
+        }
+
+        // Check for markdown code blocks containing tool call JSON
+        let mut block_cur = 0;
+        while let Some(start) = text[block_cur..].find("```") {
+            let block_start = block_cur + start + 3;
+            let content_start = text[block_start..]
+                .find('\n')
+                .map(|nl| block_start + nl + 1)
+                .unwrap_or(block_start);
+            if let Some(end) = text[content_start..].find("```") {
+                let block_end = content_start + end;
+                let snippet = text[content_start..block_end].trim();
+                if let Ok(val) = serde_json::from_str::<serde_json::Value>(snippet) {
+                    if let Some(call) = extract_call(&val, calls.len() + 1) {
+                        calls.push(call);
+                    } else if let Some(arr) = val.as_array() {
+                        for item in arr {
+                            if let Some(call) = extract_call(item, calls.len() + 1) {
+                                calls.push(call);
+                            }
+                        }
+                    }
+                }
+                block_cur = block_end + 3;
             } else {
                 break;
             }
         }
+
+        if !calls.is_empty() {
+            return calls;
+        }
+
+        // Fallback: look for balanced JSON objects in text
+        let mut start_pos = 0;
+        while let Some(open_idx) = text[start_pos..].find('{') {
+            let abs_open = start_pos + open_idx;
+            let mut depth = 0;
+            let mut in_str = false;
+            let mut escaped = false;
+            let mut found_close = None;
+            for (i, c) in text[abs_open..].char_indices() {
+                if escaped {
+                    escaped = false;
+                    continue;
+                }
+                if c == '\\' {
+                    escaped = true;
+                    continue;
+                }
+                if c == '"' {
+                    in_str = !in_str;
+                    continue;
+                }
+                if in_str {
+                    continue;
+                }
+                if c == '{' {
+                    depth += 1;
+                } else if c == '}' {
+                    depth -= 1;
+                    if depth == 0 {
+                        found_close = Some(abs_open + i);
+                        break;
+                    }
+                }
+            }
+            if let Some(close_idx) = found_close {
+                let candidate = &text[abs_open..=close_idx];
+                if let Ok(val) = serde_json::from_str::<serde_json::Value>(candidate)
+                    && let Some(call) = extract_call(&val, calls.len() + 1)
+                {
+                    calls.push(call);
+                    start_pos = close_idx + 1;
+                    continue;
+                }
+                start_pos = abs_open + 1;
+            } else {
+                break;
+            }
+        }
+
         calls
     }
 
@@ -751,8 +1121,11 @@ impl ToolDispatcher {
                     },
                 }
             }
-            "grep_search" => {
-                let query = call.arguments["query"].as_str().unwrap_or("");
+            "grep_search" | "grep" => {
+                let query = call.arguments["query"]
+                    .as_str()
+                    .or_else(|| call.arguments["pattern"].as_str())
+                    .unwrap_or("");
                 let pattern = call.arguments["pattern"].as_str();
                 match sandbox.grep(query, pattern) {
                     Ok(matches) => ToolResult {
@@ -898,19 +1271,103 @@ impl ToolDispatcher {
         }
     }
 
+    pub fn strip_tool_calls(text: &str) -> String {
+        let normalized: String = text
+            .chars()
+            .filter(|c| !['\u{200b}', '\u{200c}', '\u{200d}', '\u{feff}'].contains(c))
+            .collect();
+        let text = &normalized;
+        let mut clean = String::new();
+        let lower = text.to_lowercase();
+        let tags = [
+            ("<tool_call>", "</tool_call>"),
+            ("<toolcall>", "</toolcall>"),
+            ("<tool_calls>", "</tool_calls>"),
+            ("<toolcalls>", "</toolcalls>"),
+        ];
+
+        let mut pos = 0;
+        while pos < text.len() {
+            let mut earliest_match = None;
+            for (open_tag, close_tag) in &tags {
+                if let Some(open_idx) = lower[pos..].find(open_tag) {
+                    let actual_open = pos + open_idx;
+                    match earliest_match {
+                        None => earliest_match = Some((actual_open, open_tag.len(), close_tag)),
+                        Some((earliest_pos, _, _)) if actual_open < earliest_pos => {
+                            earliest_match = Some((actual_open, open_tag.len(), close_tag));
+                        }
+                        _ => {}
+                    }
+                }
+            }
+
+            if let Some((open_pos, open_len, close_tag)) = earliest_match {
+                clean.push_str(&text[pos..open_pos]);
+                let after_open = open_pos + open_len;
+                if let Some(close_idx) = lower[after_open..].find(close_tag) {
+                    pos = after_open + close_idx + close_tag.len();
+                } else {
+                    pos = text.len();
+                }
+            } else {
+                clean.push_str(&text[pos..]);
+                break;
+            }
+        }
+
+        // Also strip any residual code blocks that were parsed as tool calls
+        let mut final_clean = String::new();
+        let mut b_pos = 0;
+        while let Some(start) = clean[b_pos..].find("```") {
+            let block_start = b_pos + start;
+            let after_start = block_start + 3;
+            if let Some(end) = clean[after_start..].find("```") {
+                let block_end = after_start + end + 3;
+                let block_content = &clean[block_start..block_end];
+                if !Self::parse_tool_calls(block_content).is_empty() {
+                    final_clean.push_str(&clean[b_pos..block_start]);
+                    b_pos = block_end;
+                    continue;
+                }
+            }
+            final_clean.push_str(&clean[b_pos..after_start]);
+            b_pos = after_start;
+        }
+        final_clean.push_str(&clean[b_pos..]);
+
+        let trimmed = final_clean.trim();
+        if trimmed.starts_with('{')
+            && trimmed.ends_with('}')
+            && let Ok(val) = serde_json::from_str::<serde_json::Value>(trimmed)
+            && (val.get("name").is_some() || val.get("tool").is_some())
+        {
+            return String::new();
+        }
+
+        final_clean.trim().to_string()
+    }
+
     pub fn build_system_prompt() -> String {
         let tools = Self::list_tools();
         let tools_json = serde_json::to_string_pretty(&tools).unwrap_or_default();
         format!(
-            "You are OpenHarness Coding Assistant, an expert autonomous software engineer.\n\
-            You have access to the user's project workspace through the following tools:\n\
+            "You are OpenHarness Coding Assistant, an expert autonomous software engineer with full tool access to the user's project workspace.\n\
+            You have access to the following tools:\n\
             {}\n\n\
-            To call a tool, output a block formatted exactly as:\n\
+            IMPORTANT INSTRUCTIONS:\n\
+            1. You ALWAYS have tool access active and available on every turn. Never claim that tool access is unavailable.\n\
+            2. When the user asks you to understand, read, explore, inspect, or modify the project or any files/directories, proactively call the appropriate tools (such as list_dir, read_file, grep_search, git_status) to inspect the actual files first.\n\
+            3. To call a tool, output a block formatted as:\n\
             <tool_call>\n\
             {{\"name\": \"tool_name\", \"arguments\": {{ ... }}}}\n\
-            </tool_call>\n\n\
-            You can read files, write edits, search the codebase, inspect git status/diff, and run terminal commands to test your work.\n\
-            After receiving a tool observation, continue your analysis or execution until the task is complete.",
+            </tool_call>\n\
+            For example, to read a file:\n\
+            <tool_call>\n\
+            {{\"name\": \"read_file\", \"arguments\": {{\"path\": \"README.md\"}}}}\n\
+            </tool_call>\n\
+            4. When calling a tool, do NOT add speculative explanations or final answers in the same message. Output the tool call block and wait for the tool observation before explaining.\n\
+            5. After receiving a tool observation, analyze the returned data and continue with additional tool calls if needed, or provide your final response.",
             tools_json
         )
     }
@@ -1002,6 +1459,93 @@ mod tests {
         assert_eq!(calls[0].name, "list_dir");
         assert_eq!(calls[1].name, "read_file");
         assert_eq!(calls[1].arguments["path"], "README.md");
+    }
+
+    #[test]
+    fn test_tool_call_parsing_raw_json() {
+        let message = r#"{"name":"read_file","arguments":{"path":"APP-COMPLETION-AUDIT.md"}}"#;
+        let calls = ToolDispatcher::parse_tool_calls(message);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "read_file");
+        assert_eq!(calls[0].arguments["path"], "APP-COMPLETION-AUDIT.md");
+    }
+
+    #[test]
+    fn test_tool_call_parsing_markdown_code_block() {
+        let message = "```json\n{\"name\": \"read_file\", \"arguments\": {\"path\": \"test.rs\"}}\n```";
+        let calls = ToolDispatcher::parse_tool_calls(message);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "read_file");
+        assert_eq!(calls[0].arguments["path"], "test.rs");
+    }
+
+    #[test]
+    fn test_tool_call_parsing_raw_json_with_prose() {
+        let message = "Sure, reading the file:\n{\"name\": \"read_file\", \"arguments\": {\"path\": \"src/main.rs\"}}";
+        let calls = ToolDispatcher::parse_tool_calls(message);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "read_file");
+        assert_eq!(calls[0].arguments["path"], "src/main.rs");
+    }
+
+    #[test]
+    fn test_tool_call_parsing_parameter_aliases() {
+        let message = "<tool_call>{\"name\": \"read_file\", \"parameters\": {\"file_path\": \"./src/lib.rs\"}}</tool_call>";
+        let calls = ToolDispatcher::parse_tool_calls(message);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "read_file");
+        assert_eq!(calls[0].arguments["path"], "src/lib.rs");
+    }
+
+    #[test]
+    fn test_tool_call_parsing_top_level_arguments() {
+        let message = "{\"tool\": \"read_file\", \"path\": \"Cargo.toml\"}";
+        let calls = ToolDispatcher::parse_tool_calls(message);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "read_file");
+        assert_eq!(calls[0].arguments["path"], "Cargo.toml");
+    }
+
+    #[test]
+    fn test_tool_call_parsing_direct_xml() {
+        let message = "Let me read that:\n<read_file path=\"Cargo.toml\" />";
+        let calls = ToolDispatcher::parse_tool_calls(message);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "read_file");
+        assert_eq!(calls[0].arguments["path"], "Cargo.toml");
+
+        let message_block = "<read_file>src/main.rs</read_file>";
+        let calls_block = ToolDispatcher::parse_tool_calls(message_block);
+        assert_eq!(calls_block.len(), 1);
+        assert_eq!(calls_block[0].name, "read_file");
+        assert_eq!(calls_block[0].arguments["path"], "src/main.rs");
+    }
+
+    #[test]
+    fn test_tool_call_parsing_grep_alias() {
+        let message = "<tool_call>{\"name\": \"grep\", \"arguments\": {\"pattern\": \"AppState\"}}</tool_call>";
+        let calls = ToolDispatcher::parse_tool_calls(message);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "grep_search");
+        assert_eq!(calls[0].arguments["query"], "AppState");
+    }
+
+    #[test]
+    fn test_strip_tool_calls_and_preserve_prose() {
+        let message = "Before <tool_call>{\"name\":\"read_file\"}</tool_call> After";
+        assert_eq!(ToolDispatcher::strip_tool_calls(message), "Before  After");
+    }
+
+    #[test]
+    fn test_strip_zero_width_tool_tags() {
+        let message = "<\u{200b}tool_call>{}</\u{200b}tool_call>";
+        assert!(ToolDispatcher::strip_tool_calls(message).is_empty());
+    }
+
+    #[test]
+    fn test_strip_keeps_regular_json_code() {
+        let message = "```json\\n{\\\"ok\\\": true}\\n```";
+        assert_eq!(ToolDispatcher::strip_tool_calls(message), message);
     }
 
     #[test]
