@@ -328,9 +328,9 @@ export async function apiCompactThread(threadId: string, modelId: string, provid
   return summary;
 }
 
-export async function apiAppendMessage(threadId: string, role: string, text: string): Promise<ChatMessageLike> {
-  if (isTauri()) return invoke('append_thread_message', { threadId, role, text });
-  const msg = { id: `msg-${Date.now()}`, role, text };
+export async function apiAppendMessage(threadId: string, role: string, text: string, attachments?: string[]): Promise<ChatMessageLike> {
+  if (isTauri()) return invoke('append_thread_message', { threadId, role, text, attachments: attachments ?? null });
+  const msg: ChatMessageLike = { id: `msg-${Date.now()}`, role, text, attachments: attachments ?? [] };
   localThreads = localThreads.map(thread => {
     if (thread.id !== threadId) return thread;
     const title = thread.title === 'New chat' && role === 'user' ? text.slice(0, 40) : thread.title;

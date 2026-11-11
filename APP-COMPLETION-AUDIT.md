@@ -87,3 +87,47 @@ OpenHarness has a functional shell, projects, provider storage, and a tauri upda
 - Attachments change the request payload.
 - Code blocks, syntax colors, and copy controls render correctly.
 - Project deletion, renaming, search, and provider-connection errors behave without unhandled failures.
+
+---
+
+## Agent Runtime Audit Update — 2026-11-11
+
+### Confirmed runtime findings
+
+- **Duplicate current user message (fixed):** `chat_send_stream` loaded persisted history and appended the active prompt again. Frontend now sends the persisted user message ID; Rust validates it belongs to the selected thread and excludes that entry from history.
+- **Attachment persistence (partially fixed):** user images now persist with the message and are reattached to the corresponding current turn. File contents are already included in the composed prompt; only image attachments are stored to avoid duplicate file text. Prior-turn images can be re-used, but binary attachment lifecycle and files referenced by path are not retained.
+- **Unbounded tool loop (fixed):** the agent loop now caps model requests at 12 per run and returns an explicit error after the cap. The request ceiling should be revisited if legitimate workflows need more iterations.
+- **Release logging (fixed):** Tauri logging now initializes in release builds at INFO level; debug builds use DEBUG. Startup/runtime log persistence destination and retention still need verification on packaged builds.
+- **Project instruction loading (improved):** `AGENTS.md` is loaded into system context when present. Its contents are explicitly labelled project-controlled, untrusted guidance; sandbox and approval requirements remain authoritative. Load failures other than absent/non-file are surfaced as errors.
+- **Token accounting remains cache-only:** current provider parsing and UI expose cached input tokens, not a per-request full input/output breakdown. There is no configured model-matched tokenizer. Do not interpret the displayed value as total tokens or compare it directly with another framework's total context usage. OpenAI-compatible cache details are parsed; Ollama usage is not currently propagated.
+- **Audit trail remains incomplete:** lifecycle logs cover run start, context component counts, tool registration, and request-cap events. There is no durable per-request audit record for every loaded component, tool outcome, memory reference, usage discrepancy, or final provider response.
+- **Startup validation remains partial:** app state loads at startup and runtime-selected skills are loaded before a run; required component readiness is not represented in a comprehensive startup validation report. Selected-skill names that are unavailable are silently omitted by the loader.
+- **Other context gaps:** historical image attachments were not included in reconstructed conversation context; now included for the active persisted message. Project-wide AGENTS.md discovery is root-only (no ancestor instruction merge). Context budgeting is compaction-based and does not use exact model tokenization.
+
+### Changes made
+
+- `tauri-react/src-tauri/src/lib.rs`: request cap and regression test; duplicate-message exclusion with message-ID validation; current-message image restoration; root AGENTS.md loading with untrusted-content framing; startup/run/context/tool lifecycle logs; release log plugin enabled.
+- `tauri-react/src/components/Canvas.tsx`: persist the active message for all selected-thread turns and retain image data attachments.
+- `tauri-react/src/services/tauriBridge.ts`: persist message attachment values in Tauri and web fallback.
+
+### Verification evidence
+
+- `cargo test --lib -- --test-threads=1`: **50 passed, 0 failed**.
+- `cargo check --lib`: passed.
+- `npx tsc --noEmit`: passed.
+- `npm run build`: passed (TypeScript compile and Vite production build).
+- `git diff --check`: passed; Git reported only LF-to-CRLF working-copy warnings.
+- `cargo fmt --check`: fails because Rust formatting differences exist throughout pre-existing `lib.rs` and `harness.rs`; formatting the entire file would create unrelated churn. Changed Rust expressions were reviewed; rerun after a scoped formatting policy is chosen.
+- `cargo clippy --lib -- -D warnings`: fails on existing warnings in `client.rs`, `harness.rs`, and `lib.rs` (including too-many-arguments and collapsible-if findings); no broad cleanup attempted.
+- `npm run lint` and `npm run typecheck`: unavailable scripts in `tauri-react/package.json`.
+- Existing GitHub issue update could not be posted: GitHub CLI is unauthenticated in this environment. This section is the prepared update for review; no issue status was changed.
+
+### Remaining limitations / next steps
+
+1. Add typed provider usage fields and aggregate per-request/run totals; keep estimated counts explicitly separate from provider-reported usage.
+2. Add model-appropriate tokenizers only for supported configured model families; otherwise report counts as unavailable rather than inventing estimates.
+3. Persist structured per-run audit records with redacted safe identifiers, component states, request outcomes, cache fields, and tool statuses.
+4. Validate critical configuration and component readiness at startup; report unavailable and disabled components distinctly.
+5. Test release log output destination and rotation on a packaged Windows build.
+6. Add mock/provider tests for prompt completeness, duplicate exclusion, prior-turn image reconstruction, cancellation, and request-cap termination.
+7. Reconcile the older completion-guide summary above with current implementation: chat persistence, streaming, multi-turn context, attachments, and project editing now exist; this audit update records the remaining runtime accounting and observability gaps.

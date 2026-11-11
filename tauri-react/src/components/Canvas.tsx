@@ -498,8 +498,13 @@ export function Canvas() {
       };
       setStopHandle(() => cancel);
       try {
-        persistedUserMessage = currentThreadId && !detail.threadId
-          ? await apiAppendMessage(currentThreadId, 'user', text)
+        persistedUserMessage = currentThreadId
+          ? await apiAppendMessage(
+              currentThreadId,
+              'user',
+              text,
+              detail.attachments?.filter(attachment => attachment.startsWith('data:image/')),
+            )
           : null;
         if (persistedUserMessage) setMessages(previous => previous.map(message => message.id === userMessage.id ? {...message, id: persistedUserMessage?.id ?? message.id} : message));
         await apiChatStream(text, detail.modelId, detail.provider, targetProjectId ?? undefined, currentThreadId ?? undefined, detail.attachments, detail.supportsVision, activeSkills, detail.approvalMode ?? 'manual', persistedUserMessage?.id, (token) => {
