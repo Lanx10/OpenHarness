@@ -2,10 +2,10 @@ export function cleanMessageText(text: string): string {
   if (!text) return '';
   let cleaned = text
     .replace(/<[^>]*tool[_\s-]?calls?\b[^>]*>/gi, '')
-    .replace(/```(?:json|tool_call|toolcall)?\s*\{[\s\S]*?"(?:name|tool)"\s*:\s*"(?:read_file|write_file|list_dir|grep|run_command|git_status|git_diff|git_log|git_branch)"[\s\S]*?```/gi, '');
+    .replace(/```(?:json|tool_call|toolcall)?\s*\{[\s\S]*?"(?:name|tool)"\s*:\s*"(?:read_file|write_file|patch_file|list_dir|grep|run_command|git_status|git_diff|git_log|git_branch)"[\s\S]*?```/gi, '');
 
   // Strip standalone or embedded JSON tool call objects with balanced braces
-  const knownTools = ['read_file', 'write_file', 'list_dir', 'grep', 'run_command', 'git_status', 'git_diff', 'git_log', 'git_branch'];
+  const knownTools = ['read_file', 'write_file', 'patch_file', 'list_dir', 'grep', 'run_command', 'git_status', 'git_diff', 'git_log', 'git_branch'];
   let cur = 0;
   let result = '';
   while (cur < cleaned.length) {

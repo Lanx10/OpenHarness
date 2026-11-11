@@ -3,9 +3,9 @@ import {getCurrentWindow} from '@tauri-apps/api/window';
 import {invoke, isTauri} from '@tauri-apps/api/core';
 import {XMarkIcon, MinusIcon, Square2StackIcon, Squares2X2Icon, CommandLineIcon, GlobeAltIcon, DocumentTextIcon} from '@heroicons/react/20/solid';
 
-type Props = {onMinimize: () => void; onToggleMaximize: () => void; onClose: () => void; updateAvailable?: boolean; onOpenSettings?: () => void};
+type Props = {onMinimize: () => void; onToggleMaximize: () => void; onClose: () => void; updateAvailable?: boolean; onOpenSettings?: () => void; trailingContent?: import('react').ReactNode};
 
-export function TitleBar({onMinimize, onToggleMaximize, onClose, updateAvailable, onOpenSettings}: Props) {
+export function TitleBar({onMinimize, onToggleMaximize, onClose, updateAvailable, onOpenSettings, trailingContent}: Props) {
   const [maximized, setMaximized] = useState(false);
   const [toolsOpen, setToolsOpen] = useState(false);
 
@@ -108,6 +108,7 @@ export function TitleBar({onMinimize, onToggleMaximize, onClose, updateAvailable
         </>}
       </div>
 
+      {trailingContent}
       <div className="window-controls" aria-label="Window controls">
         {updateAvailable && (
           <button

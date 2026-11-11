@@ -232,6 +232,8 @@ export async function apiChatStream(
   attachments?: string[],
   supportsVision: boolean | undefined = undefined,
   selectedSkills: string[] = [],
+  approvalMode: 'manual' | 'automatic' = 'manual',
+  userMessageId?: string,
   onToken?: (token: string) => void,
   onDone?: () => void,
   onError?: (error: string) => void,
@@ -245,7 +247,10 @@ export async function apiChatStream(
       if (message.error) onError?.(message.error);
       if (message.text) onToken?.(message.text);
       if (message.approval) onApproval?.(message.approval);
-      if (message.step) onStep?.(message.step);
+      if (message.step) {
+        onStep?.(message.step);
+        if (message.step.kind === 'learning' && threadId) void apiGetThread(threadId).then(thread => window.dispatchEvent(new CustomEvent('openharness:learning-ready', {detail: thread})));
+      }
       if (message.cached_input_tokens !== undefined) onUsage?.(message.cached_input_tokens ?? 0);
       if (message.done) onDone?.();
     };
@@ -258,6 +263,8 @@ export async function apiChatStream(
       attachments: attachments ?? null,
       supportsVision: supportsVision ?? false,
       selectedSkills,
+      approvalMode,
+      userMessageId: userMessageId ?? null,
       channel,
     });
     return;
@@ -272,8 +279,9 @@ export async function apiChatStream(
   onDone?.();
 }
 
+export type LearningCandidateLike = {summary:string; memory:string[]; skill_name?:string|null; skill_description?:string|null; skill_content?:string|null; memory_saved?:boolean; skill_saved?:boolean};
 export type ChatMessageLike = { id: string; role: string; text: string; attachments?: string[]; compacted_summary?: string | null };
-export type ChatThreadLike = { id: string; project_id: string; title: string; messages: ChatMessageLike[]; compacted_summary?: string | null; compacted_message_count?: number };
+export type ChatThreadLike = { id: string; project_id: string; title: string; messages: ChatMessageLike[]; compacted_summary?: string | null; compacted_message_count?: number; learning_candidates?: LearningCandidateLike[] };
 
 let localThreads: ChatThreadLike[] = [];
 
@@ -334,6 +342,26 @@ export async function apiAppendMessage(threadId: string, role: string, text: str
     return next;
   });
   return msg;
+}
+
+export async function apiUpdateThreadLearning(projectId: string, threadId: string, candidates: LearningCandidateLike[]): Promise<ChatThreadLike> {
+  if (!isTauri()) throw new Error('Learning approval requires the desktop workspace');
+  return invoke('update_thread_learning_candidates', {projectId, threadId, candidates});
+}
+
+export async function apiDismissThreadLearning(threadId: string): Promise<ChatThreadLike> {
+  if (!isTauri()) throw new Error('Learning dismissal requires the desktop workspace');
+  return invoke('dismiss_thread_learning_candidates', {threadId});
+}
+
+export async function apiGetApprovalMode(): Promise<'manual' | 'automatic'> {
+  if (!isTauri()) return localStorage.getItem('openharness:approval-mode') === 'automatic' ? 'automatic' : 'manual';
+  return invoke('get_tool_approval_mode');
+}
+
+export async function apiUpdateApprovalMode(mode: 'manual' | 'automatic'): Promise<void> {
+  if (isTauri()) await invoke('set_tool_approval_mode', {mode});
+  else localStorage.setItem('openharness:approval-mode', mode);
 }
 
 export async function apiEditMessage(

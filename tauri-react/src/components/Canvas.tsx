@@ -1,7 +1,7 @@
 import {useEffect, useRef, useState} from 'react';
 import { SafeMarkdown } from './SafeMarkdown';
 import { MessageCrumbs } from './MessageCrumbs';
-import { upsertStep } from './stepLifecycle';
+import { readQueuedPrompts, upsertStep, type QueuedPrompt } from './stepLifecycle';
 import type { Message } from '../types/message';
 import { cleanMessageText } from '../utils/cleanMessageText';
 import {isTauri} from '@tauri-apps/api/core';
@@ -23,6 +23,9 @@ import {
   apiGetThread,
   apiDeleteThread,
   apiGetProjects,
+  apiAppendMessage,
+  apiUpdateThreadLearning,
+  apiDismissThreadLearning,
   apiEditMessage,
   apiDeleteMessage,
   apiRespondToToolApproval,
@@ -34,6 +37,7 @@ import {
   apiListenTerminalOutput,
   apiListenTerminalExit,
   type ChatThreadLike,
+  type ChatMessageLike,
   type ApprovalRequestLike,
 } from '../services/tauriBridge';
 
@@ -164,6 +168,7 @@ function MessageView({message, onCopy, onDelete, onRegenerate, onSaveEdit}: Mess
                 <p>{message.text}</p>
               )}
             </div>
+            {(message.status === 'queued' || message.status === 'cancelled' || message.status === 'error') && <span className={`message-state message-state-${message.status}`}>{message.status === 'queued' ? 'Queued' : message.status === 'cancelled' ? 'Stopped' : 'Failed'}</span>}
           </article>
           <div className="chatgpt-user-actions">
             <button type="button" onClick={onCopy} aria-label="Copy" title="Copy"><ClipboardDocumentIcon width={13}/></button>
@@ -217,6 +222,17 @@ function MessageView({message, onCopy, onDelete, onRegenerate, onSaveEdit}: Mess
 
 type TerminalTab = {id: string; label: string; shell: 'powershell'|'cmd'; output: string; status: 'running'|'exited'};
 
+function LearningProposalCard({candidate, onApprove, onDismiss, saving}: {candidate: NonNullable<ChatThreadLike['learning_candidates']>[number]; onApprove: () => void; onDismiss: () => void; saving: boolean}) {
+  return <section className="learning-proposal" aria-label="Project learning proposal">
+    <div className="learning-proposal-head"><strong>Project learning proposal</strong><span>Nothing saved yet</span></div>
+    <p>{candidate.summary}</p>
+    {candidate.memory.length > 0 && <div><strong>Memory notes</strong><ul>{candidate.memory.map((item, index) => <li key={`${index}:${item}`}>{item}</li>)}</ul></div>}
+    {candidate.skill_name && <div><strong>Project skill: {candidate.skill_name}</strong><p>{candidate.skill_description}</p><pre>{candidate.skill_content}</pre></div>}
+    <div className="learning-proposal-actions"><button type="button" disabled={saving} onClick={onApprove}>{saving ? 'Saving…' : 'Approve and save to project'}</button><button type="button" disabled={saving} onClick={onDismiss}>Dismiss</button></div>
+    <small>Approval writes only to this project’s AGENTS.md and/or .agents/skills/ directory.</small>
+  </section>;
+}
+
 export function Canvas() {
   const [messages, setMessages] = useState<Message[]>([]);
   const [threads, setThreads] = useState<ChatThreadLike[]>([]);
@@ -264,7 +280,21 @@ export function Canvas() {
     });
   };
   const [stopHandle, setStopHandle] = useState<(() => void) | null>(null);
+  const [runInProgress, setRunInProgress] = useState(false);
+  const stopHandleRef = useRef(stopHandle);
+  const activeRunRef = useRef(false);
+  const runPromptRef = useRef<(detail: Omit<QueuedPrompt, 'id'>) => Promise<void>>(async () => {});
+  const queueRef = useRef<(id: string) => void>(() => {});
+  stopHandleRef.current = stopHandle;
+  const [queuedPrompts, setQueuedPrompts] = useState<QueuedPrompt[]>(() => {
+    try { return readQueuedPrompts(localStorage, 'openharness:queued-prompts'); } catch { return []; }
+  });
+  const queuedPromptsRef = useRef(queuedPrompts);
+  const processingQueueRef = useRef(false);
+  queuedPromptsRef.current = queuedPrompts;
   const [approval, setApproval] = useState<ApprovalRequestLike | null>(null);
+  const [learningCandidates, setLearningCandidates] = useState<NonNullable<ChatThreadLike['learning_candidates']>>([]);
+  const [learningBusy, setLearningBusy] = useState(false);
   const [workspaceStatus, setWorkspaceStatus] = useState('');
   const [gitDiff, setGitDiff] = useState('');
   const [activeTool, setActiveTool] = useState<'terminal'|'browser'|'files'|'git'|null>(null);
@@ -309,6 +339,24 @@ export function Canvas() {
   useEffect(() => { try { localStorage.setItem('openharness:browser-panel-width', String(browserPanelWidth)); } catch {} }, [browserPanelWidth]);
   useEffect(() => { try { localStorage.setItem('openharness:threads-width', String(threadsWidth)); } catch {} }, [threadsWidth]);
 
+  useEffect(() => {
+    try {
+      const validIds = new Set(queuedPrompts.map(prompt => prompt.id));
+      const abandoned = readQueuedPrompts(localStorage, 'openharness:queued-prompts').filter(prompt => !validIds.has(prompt.id));
+      const active = queuedPrompts.find(prompt => prompt.id.startsWith('active:'));
+      const pending = queuedPrompts.filter(prompt => !prompt.id.startsWith('active:'));
+      const nextQueue = active ? [active, ...pending] : [...abandoned, ...pending];
+      if (!nextQueue.length) localStorage.removeItem('openharness:queued-prompts');
+      else {
+        const compact = JSON.stringify(nextQueue);
+        if (compact.length <= 5_000_000) localStorage.setItem('openharness:queued-prompts', compact);
+        else toast('Queue is too large to persist. Remove a large attachment to avoid losing it on restart.');
+      }
+    } catch {
+      toast('Could not persist queued prompts; they may be lost if the app closes.');
+    }
+  }, [queuedPrompts]);
+
   const refreshWorkspaceGit = async (currentProjectId: string | null) => {
     if (!currentProjectId) {
       setWorkspaceStatus('');
@@ -331,6 +379,7 @@ export function Canvas() {
   const loadThreadMessages = (thread: ChatThreadLike, resetCachedTokens = true) => {
     updateThreadId(thread.id);
     if (resetCachedTokens) setCachedInputTokens(null);
+    setLearningCandidates(thread.learning_candidates ?? []);
     setMessages(thread.messages.map((message, index) => ({
       id: message.id || `${thread.id}:${index}`,
       role: message.role === 'assistant' ? 'assistant' : 'user',
@@ -400,13 +449,15 @@ export function Canvas() {
         setCompacting(false);
       }
     };
-    const onSend = async (event: Event) => {
-      const detail = (event as CustomEvent<{text: string; modelId: string; provider: string; projectId?: string; attachments?: string[]; supportsVision?: boolean; modelContextTokens?: number; modelOutputTokens?: number}>).detail;
+    const runPrompt = async (detail: {text: string; modelId: string; provider: string; projectId?: string | null; threadId?: string | null; attachments?: string[]; supportsVision?: boolean; modelContextTokens?: number; modelOutputTokens?: number; selectedSkills?: string[]; approvalMode?: 'manual' | 'automatic'}) => {
+      let persistedUserMessage: ChatMessageLike | null = null;
       if (detail.modelContextTokens) setTokenLimits({context: detail.modelContextTokens, output: detail.modelOutputTokens ?? 4_096});
       setCachedInputTokens(null);
       const text = String(detail?.text ?? '').trim();
-      if (!text) return;
+      if (!text && !(detail.attachments?.length)) return;
+      setRunInProgress(true);
       if ((detail.attachments?.some(attachment => attachment.includes('data:image/')) ?? false) && !detail.supportsVision) {
+        setRunInProgress(false);
         toast('Selected model is not configured for image input.');
         return;
       }
@@ -416,11 +467,14 @@ export function Canvas() {
         output: detail.modelOutputTokens ?? providerInfo?.max_output_tokens ?? tokenLimits.output,
       };
       setTokenLimits(activeLimits);
-      let currentThreadId = threadIdRef.current;
-      const selectedProjectAtStart = projectIdRef.current;
-      if (threadId !== threadIdRef.current || projectId !== selectedProjectAtStart) return;
-      const targetProjectId = projectId ?? detail?.projectId ?? null;
-      const activeSkills = selectedSkillNames;
+      let currentThreadId = detail.threadId ?? threadIdRef.current;
+      const selectedProjectAtStart = detail.projectId ?? projectIdRef.current;
+      if (!detail.threadId && (threadId !== threadIdRef.current || projectId !== selectedProjectAtStart)) {
+        setRunInProgress(false);
+        return;
+      }
+      const targetProjectId = Object.hasOwn(detail, 'projectId') ? detail.projectId ?? null : projectId;
+      const activeSkills = detail.selectedSkills ?? selectedSkillNames;
       if (!currentThreadId && targetProjectId) {
         try {
           const thread = await apiCreateThread(targetProjectId);
@@ -431,31 +485,36 @@ export function Canvas() {
           currentThreadId = thread.id;
           setThreads(prev => [thread, ...prev.filter(item => item.id !== thread.id)]);
           updateThreadId(thread.id);
-        } catch (error) { toast(`Could not create chat: ${String(error)}`); return; }
+          } catch (error) { setRunInProgress(false); toast(`Could not create chat: ${String(error)}`); return; }
       }
       if (currentThreadId) compactedThreadsRef.current.delete(currentThreadId);
-      const userMessage: Message = {id: `u-${Date.now()}`, role: 'user', text, status: 'done', attachments: detail.attachments};
-      setMessages(prev => [...prev, userMessage]);
+      const userMessage: Message = {id: `u-${Date.now()}`, role: 'user', text, status: 'queued', attachments: detail.attachments};
+      if (!detail.threadId) setMessages(prev => [...prev, userMessage]);
       const assistantId = `a-${Date.now()}`;
-      setMessages(prev => [...prev, {id: assistantId, role: 'assistant', text: '', status: 'thinking'}]);
+      if (detail.threadId) setMessages(previous => [...previous, {id: assistantId, role: 'assistant', text: '', status: 'thinking'}]);
+      else setMessages(prev => [...prev, {id: assistantId, role: 'assistant', text: '', status: 'thinking'}]);
       const cancel = () => {
         void apiCancelChatStream().catch(error => toast(`Could not stop: ${String(error)}`));
       };
       setStopHandle(() => cancel);
       try {
-        await apiChatStream(text, detail.modelId, detail.provider, targetProjectId ?? undefined, currentThreadId ?? undefined, detail.attachments, detail.supportsVision, activeSkills, (token) => {
+        persistedUserMessage = currentThreadId && !detail.threadId
+          ? await apiAppendMessage(currentThreadId, 'user', text)
+          : null;
+        if (persistedUserMessage) setMessages(previous => previous.map(message => message.id === userMessage.id ? {...message, id: persistedUserMessage?.id ?? message.id} : message));
+        await apiChatStream(text, detail.modelId, detail.provider, targetProjectId ?? undefined, currentThreadId ?? undefined, detail.attachments, detail.supportsVision, activeSkills, detail.approvalMode ?? 'manual', persistedUserMessage?.id, (token) => {
           setMessages(prev => prev.map(message => message.id === assistantId ? {...message, text: message.text + token, status: 'thinking'} : message));
         }, () => {
-          setMessages(prev => prev.map(message => message.id === assistantId ? {...message, status: 'done', steps: message.steps} : message));
+          setMessages(prev => prev.map(message => message.id === assistantId ? {...message, status: 'done', steps: message.steps} : message.id === userMessage.id || message.id === persistedUserMessage?.id ? {...message, status: 'done' as const} : message));
           void refreshWorkspaceGit(targetProjectId);
         }, (error) => {
           const errText = String(error);
           if (errText.includes('Generation stopped')) {
-            setMessages(prev => prev.map(message => message.id === assistantId ? {...message, status: 'done'} : message));
-            toast('Generation stopped');
+          setMessages(prev => prev.map(message => message.id === assistantId ? {...message, status: 'done'} : message.id === userMessage.id || message.id === persistedUserMessage?.id ? {...message, status: 'cancelled'} : message));
+          toast('Generation stopped');
           } else {
-            setMessages(prev => prev.map(message => message.id === assistantId ? {...message, text: errText, status: 'error'} : message));
-            toast(errText);
+          setMessages(prev => prev.map(message => message.id === assistantId ? {...message, text: errText, status: 'error'} : message.id === userMessage.id || message.id === persistedUserMessage?.id ? {...message, status: 'error'} : message));
+          toast(errText);
           }
         }, (approvalRequest) => setApproval(approvalRequest), step => {
           setMessages(prev => prev.map(message => message.id === assistantId ? {...message, steps: upsertStep(message.steps ?? [], step), status: 'thinking'} : message));
@@ -465,7 +524,7 @@ export function Canvas() {
       } catch (error) {
         const text = String(error);
         if (text.includes('Generation stopped')) {
-          setMessages(prev => prev.map(message => message.id === assistantId ? {...message, status: 'done'} : message));
+          setMessages(prev => prev.map(message => message.id === assistantId ? {...message, status: 'done'} : message.id === userMessage.id || message.id === persistedUserMessage?.id ? {...message, status: 'cancelled'} : message));
           toast('Generation stopped');
         } else {
           setMessages(prev => prev.map(message => message.id === assistantId ? {...message, text, status: 'error'} : message));
@@ -473,6 +532,7 @@ export function Canvas() {
         }
       } finally {
         setStopHandle(null);
+        setRunInProgress(false);
         if (currentThreadId) {
           try {
             const thread = await apiGetThread(currentThreadId);
@@ -486,6 +546,77 @@ export function Canvas() {
           void refreshThreads(targetProjectId);
         }
       }
+    };
+    const drainQueue = async (queueId: string) => {
+      if (processingQueueRef.current || activeRunRef.current || stopHandleRef.current) return;
+      const next = queuedPromptsRef.current.find(prompt => prompt.id.replace(/^active:/, '') === queueId);
+      if (!next) return;
+      processingQueueRef.current = true;
+      activeRunRef.current = true;
+      try {
+        if (next.threadId && next.threadId !== threadIdRef.current) {
+          const thread = await apiGetThread(next.threadId).catch(() => null);
+          if (!thread) {
+            toast('Queued prompt skipped: its thread no longer exists.');
+            setQueuedPrompts(previous => previous.filter(prompt => prompt.id !== next.id && prompt.id !== `active:${next.id}`));
+            activeRunRef.current = false;
+            processingQueueRef.current = false;
+            return;
+          }
+          loadThreadMessages(thread);
+          updateThreadId(next.threadId);
+        }
+        setRunInProgress(true);
+        setQueuedPrompts(previous => [{...next, id: `active:${next.id}`}, ...previous.filter(prompt => prompt.id !== next.id && prompt.id !== `active:${next.id}`)]);
+        await runPromptRef.current(next);
+        setRunInProgress(false);
+        setQueuedPrompts(previous => previous.filter(prompt => prompt.id !== next.id && prompt.id !== `active:${next.id}`));
+        activeRunRef.current = false;
+        processingQueueRef.current = false;
+        const following = queuedPromptsRef.current.find(prompt => prompt.id !== next.id && prompt.id !== `active:${next.id}`);
+        if (following) queueRef.current(following.id);
+      } catch (error) {
+        toast(`Queue paused: ${String(error)}`);
+        setRunInProgress(false);
+        activeRunRef.current = false;
+        processingQueueRef.current = false;
+      }
+    };
+    queueRef.current = id => { void drainQueue(id); };
+    runPromptRef.current = runPrompt;
+    const resumeQueue = window.setTimeout(() => {
+      const firstQueued = queuedPromptsRef.current.find(prompt => !prompt.id.startsWith('active:'));
+      if (firstQueued) queueRef.current(firstQueued.id);
+    }, 0);
+    const onSend = (event: Event) => {
+      const detail = (event as CustomEvent<Omit<QueuedPrompt, 'id' | 'threadId'>>).detail;
+      const queued = {...detail, projectId: detail.projectId ?? projectIdRef.current, threadId: threadIdRef.current};
+      const item = {id: `${Date.now()}-${Math.random().toString(36).slice(2)}`, ...queued};
+      const waitingBehindActive = activeRunRef.current || processingQueueRef.current;
+      if (waitingBehindActive || queuedPromptsRef.current.length > 0) {
+        if (waitingBehindActive) setQueuedPrompts(previous => [...previous.filter(prompt => prompt.id !== `active:${item.id}`), {...item, id: `active:${item.id}`}]);
+        else setQueuedPrompts(previous => [...previous, item]);
+        toast('Prompt queued for after the current run.');
+        return;
+      }
+      activeRunRef.current = true;
+      setQueuedPrompts(previous => [item, ...previous]);
+      void runPrompt(queued).finally(() => {
+        activeRunRef.current = false;
+        setQueuedPrompts(previous => previous.filter(prompt => prompt.id !== item.id));
+      const following = queuedPromptsRef.current.find(prompt => !prompt.id.startsWith('active:'));
+      if (following) queueRef.current(following.id);
+      });
+    };
+    const onApprovalModeChanged = (event: Event) => {
+      const mode = (event as CustomEvent<string>).detail;
+      if (mode === 'manual' || mode === 'automatic') {
+        window.dispatchEvent(new CustomEvent('openharness:skills-changed', {detail: {names: selectedSkillNames, approvalMode: mode}}));
+      }
+    };
+    const onLearningReady = (event: Event) => {
+      const thread = (event as CustomEvent<ChatThreadLike>).detail;
+      if (thread?.id && threadIdRef.current === thread.id) setLearningCandidates(thread.learning_candidates ?? []);
     };
     const onSkillsChanged = (event: Event) => {
       const detail = (event as CustomEvent<{names?: string[]}>).detail;
@@ -553,13 +684,15 @@ export function Canvas() {
     window.addEventListener('openharness:quick-files', handleQuickFiles);
     window.addEventListener('openharness:quick-git', handleQuickGit);
     window.addEventListener('openharness:quick-browser', handleQuickBrowser);
+    window.addEventListener('openharness:learning-ready', onLearningReady);
+    window.addEventListener('openharness:approval-mode-changed', onApprovalModeChanged);
     window.addEventListener('openharness:send-message', onSend as EventListener);
     window.addEventListener('openharness:new-chat', onNewChat);
     window.addEventListener('openharness:skills-changed', onSkillsChanged);
     window.addEventListener('openharness:select-project', onSelectProject as EventListener);
     window.addEventListener('openharness:open-thread', handleOpenThread);
     window.addEventListener('openharness:delete-thread', handleDeleteThread);
-    return () => { cancelled = true; window.removeEventListener('openharness:send-message', onSend as EventListener); window.removeEventListener('openharness:new-chat', onNewChat); window.removeEventListener('openharness:skills-changed', onSkillsChanged); window.removeEventListener('openharness:select-project', onSelectProject as EventListener); window.removeEventListener('openharness:open-thread', handleOpenThread); window.removeEventListener('openharness:delete-thread', handleDeleteThread); window.removeEventListener('openharness:quick-cmd', handleQuickCmd); window.removeEventListener('openharness:quick-files', handleQuickFiles); window.removeEventListener('openharness:quick-git', handleQuickGit); window.removeEventListener('openharness:quick-browser', handleQuickBrowser); };
+    return () => { cancelled = true; window.clearTimeout(resumeQueue); window.removeEventListener('openharness:learning-ready', onLearningReady); window.removeEventListener('openharness:approval-mode-changed', onApprovalModeChanged); window.removeEventListener('openharness:send-message', onSend as EventListener); window.removeEventListener('openharness:new-chat', onNewChat); window.removeEventListener('openharness:skills-changed', onSkillsChanged); window.removeEventListener('openharness:select-project', onSelectProject as EventListener); window.removeEventListener('openharness:open-thread', handleOpenThread); window.removeEventListener('openharness:delete-thread', handleDeleteThread); window.removeEventListener('openharness:quick-cmd', handleQuickCmd); window.removeEventListener('openharness:quick-files', handleQuickFiles); window.removeEventListener('openharness:quick-git', handleQuickGit); window.removeEventListener('openharness:quick-browser', handleQuickBrowser); };
   }, [threadId, projectId]);
 
   useEffect(() => {
@@ -711,6 +844,23 @@ export function Canvas() {
     setTerminalCommand('');
     try { await apiTerminalWrite(activeTerminalId, `${command}\r\n`); }
     catch (error) { toast(`Terminal input failed: ${String(error)}`); }
+  };
+
+  const reviewLearning = async (decision: 'approve' | 'dismiss') => {
+    if (!threadId || !projectId || learningBusy || !learningCandidates.length) return;
+    setLearningBusy(true);
+    try {
+      const updated = decision === 'approve'
+        ? await apiUpdateThreadLearning(projectId, threadId, learningCandidates)
+        : await apiDismissThreadLearning(threadId);
+      setLearningCandidates(updated.learning_candidates ?? []);
+      await refreshThreads(projectId);
+      toast(decision === 'approve' ? 'Approved project knowledge saved in project scope.' : 'Project learning proposal dismissed.');
+    } catch (error) {
+      toast(`Could not ${decision} project learning: ${String(error)}`);
+    } finally {
+      setLearningBusy(false);
+    }
   };
 
   const approveToolCall = async (allowed: boolean) => {
@@ -871,8 +1021,9 @@ export function Canvas() {
             </div>
           ))}
         </section>
+        {learningCandidates.length > 0 && <LearningProposalCard candidate={learningCandidates[0]} saving={learningBusy} onApprove={() => void reviewLearning('approve')} onDismiss={() => void reviewLearning('dismiss')} />}
         <div className="composer-wrap">
-          <Composer running={Boolean(stopHandle)} onStop={stopGenerating} />
+          <Composer running={runInProgress} onStop={stopGenerating} />
         </div>
         {approval && (
           <div className="approval-backdrop" role="alertdialog" aria-modal="true" aria-labelledby="tool-approval-title">
@@ -886,6 +1037,17 @@ export function Canvas() {
               </div>
             </div>
           </div>
+        )}
+        {queuedPrompts.length > 0 && (
+          <section className="prompt-queue" aria-label="Queued prompts">
+            <header><strong>Queued prompts ({queuedPrompts.length})</strong><span>Run in order after the active task</span></header>
+            <ol>{queuedPrompts.map((item, index) => <li key={item.id}>
+              <span className="prompt-queue-index">{item.id.startsWith('active:') ? 'Now' : index + 1}</span>
+              <span className="prompt-queue-text">{item.text || 'Image or file attachment'}</span>
+              {item.attachments.length > 0 && <span className="prompt-queue-attachments">{item.attachments.length} attachment{item.attachments.length === 1 ? '' : 's'}</span>}
+              <button type="button" aria-label={`Remove queued prompt ${index + 1}`} onClick={() => setQueuedPrompts(previous => previous.filter(prompt => prompt.id !== item.id))}>Remove</button>
+            </li>)}</ol>
+          </section>
         )}
         {activeTool === 'terminal' && (
           <section className="terminal-panel" aria-label="Terminal bottom panel" style={{height: `${terminalHeight}px`, right: '18px'}}>

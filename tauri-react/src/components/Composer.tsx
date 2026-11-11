@@ -1,6 +1,6 @@
 import {useEffect, useRef, useState} from 'react';
 import {ChevronDownIcon, ArrowUpIcon, PaperClipIcon, StopIcon} from '@heroicons/react/20/solid';
-import {apiListProviders, type ProviderInfo} from '../services/tauriBridge';
+import {apiGetApprovalMode, apiListProviders, apiListSkills, apiUpdateApprovalMode, type ProviderInfo} from '../services/tauriBridge';
 
 type Model = {
   id: string;
@@ -25,8 +25,21 @@ export function Composer({running = false, onStop}: {running?: boolean; onStop?:
   const [selectedModel, setSelectedModel] = useState<Model | null>(null);
   const [projectId, setProjectId] = useState<string | null>(null);
   const [attachments, setAttachments] = useState<AttachmentInfo[]>([]);
+  const [approvalMode, setApprovalMode] = useState<'manual' | 'automatic'>(() => localStorage.getItem('openharness:approval-mode') === 'automatic' ? 'automatic' : 'manual');
+  const [selectedSkills, setSelectedSkills] = useState<string[]>(() => {
+    try {
+      const value: unknown = JSON.parse(localStorage.getItem('openharness:global-skills') || '[]');
+      return Array.isArray(value) ? value.filter((item): item is string => typeof item === 'string') : [];
+    } catch { return []; }
+  });
+  const [skillPickerOpen, setSkillPickerOpen] = useState(false);
+  const [availableSkills, setAvailableSkills] = useState<{name: string; description: string}[]>([]);
   const pickerRef = useRef<HTMLDivElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const approvalModeRef = useRef(approvalMode);
+  approvalModeRef.current = approvalMode;
+  const selectedSkillsRef = useRef(selectedSkills);
+  selectedSkillsRef.current = selectedSkills;
 
   const loadModels = async () => {
     try {
@@ -49,7 +62,7 @@ export function Composer({running = false, onStop}: {running?: boolean; onStop?:
     }
   };
 
-  useEffect(() => { void loadModels(); }, []);
+  useEffect(() => { void loadModels(); void apiListSkills().then(setAvailableSkills).catch(() => setAvailableSkills([])); }, []);
   useEffect(() => {
     const refresh = () => { void loadModels(); };
     window.addEventListener('openharness:provider-saved', refresh);
@@ -66,6 +79,13 @@ export function Composer({running = false, onStop}: {running?: boolean; onStop?:
   }, []);
 
   useEffect(() => {
+    if (!skillPickerOpen) return;
+    const closeOnEscape = (event: KeyboardEvent) => { if (event.key === 'Escape') setSkillPickerOpen(false); };
+    document.addEventListener('keydown', closeOnEscape);
+    return () => document.removeEventListener('keydown', closeOnEscape);
+  }, [skillPickerOpen]);
+
+  useEffect(() => {
     if (!modelPickerOpen) return;
     const closeOnOutsidePointer = (event: PointerEvent) => {
       if (!pickerRef.current?.contains(event.target as Node)) setModelPickerOpen(false);
@@ -80,6 +100,47 @@ export function Composer({running = false, onStop}: {running?: boolean; onStop?:
       document.removeEventListener('keydown', closeOnEscape);
     };
   }, [modelPickerOpen]);
+
+  useEffect(() => {
+    let disposed = false;
+    const textarea = document.getElementById('prompt');
+    const paste = (event: ClipboardEvent) => {
+      const target = event.target;
+      if (!(target instanceof HTMLElement) || target.id !== 'prompt' || !textarea?.contains(target)) return;
+      const images = Array.from(event.clipboardData?.items ?? [])
+        .filter(item => item.type.startsWith('image/'))
+        .map(item => item.getAsFile())
+        .filter((file): file is File => file !== null);
+      if (images.length) {
+        event.preventDefault();
+        const transfer = new DataTransfer();
+        images.forEach(image => transfer.items.add(image));
+        void handleFiles(transfer.files);
+      }
+    };
+    void apiListSkills().then(skills => { if (!disposed) setAvailableSkills(skills); }).catch(() => {});
+    void apiGetApprovalMode().then(mode => {
+      approvalModeRef.current = mode;
+      if (!disposed) setApprovalMode(mode);
+    }).catch(() => {});
+    const updateSkills = (event: Event) => {
+      const detail = (event as CustomEvent<{names?: string[]; approvalMode?: 'manual' | 'automatic'}>).detail;
+      const names = detail?.names ?? [];
+      if (detail?.approvalMode) {
+        const mode = detail.approvalMode === 'automatic' ? 'automatic' : 'manual';
+        approvalModeRef.current = mode;
+          setApprovalMode(mode);
+      }
+      setSelectedSkills(names);
+    };
+    document.addEventListener('paste', paste);
+    window.addEventListener('openharness:skills-changed', updateSkills);
+    return () => {
+      document.removeEventListener('paste', paste);
+      window.removeEventListener('openharness:skills-changed', updateSkills);
+      disposed = true;
+    };
+  }, []);
 
   useEffect(() => {
     const setText = (event: Event) => setPrompt(String((event as CustomEvent<string>).detail || ''));
@@ -153,7 +214,7 @@ export function Composer({running = false, onStop}: {running?: boolean; onStop?:
       toastError('Selected model does not support images. Remove image attachments or choose a vision-capable model.');
       return;
     }
-    const detail = {text: combined, modelId: model.id, provider: model.provider, projectId, attachments: attachments.map(a => a.content), supportsVision: model.supportsVision, modelContextTokens: model.maxContextTokens, modelOutputTokens: model.maxOutputTokens};
+    const detail = {text: combined, modelId: model.id, provider: model.provider, projectId, attachments: attachments.map(a => a.content), supportsVision: model.supportsVision, modelContextTokens: model.maxContextTokens, modelOutputTokens: model.maxOutputTokens, selectedSkills, approvalMode: approvalModeRef.current};
     window.dispatchEvent(new CustomEvent('openharness:send-message', {detail}));
     setPrompt('');
     setAttachments([]);
@@ -187,19 +248,60 @@ export function Composer({running = false, onStop}: {running?: boolean; onStop?:
         aria-label="Message"
         placeholder="Message OpenHarness…  (Enter to send, Shift+Enter for a new line)"
         value={prompt}
-        onChange={(e) => setPrompt(e.target.value)}
+        onChange={(e) => {
+          const value = e.target.value;
+          setPrompt(value);
+          setSkillPickerOpen(/(?:^|\s)\/[\w-]*$/.test(value) && availableSkills.length > 0);
+        }}
         onKeyDown={(e) => {
-          if (e.key === 'Enter' && !e.shiftKey) {
+          if (e.key === 'Escape' && skillPickerOpen) {
+            setSkillPickerOpen(false);
+            return;
+          }
+          if (e.key === 'Enter' && !e.shiftKey && !skillPickerOpen) {
             e.preventDefault();
             send();
           }
         }}
       />
+      <div className="composer-hint" aria-label="Composer capabilities">Use /skill-name to invoke a skill · paste or attach images · drop files to add context</div>
+      {skillPickerOpen && (
+        <div className="composer-skill-menu" role="listbox" aria-label="Available skills">
+          {availableSkills.map(skill => (
+            <button type="button" role="option" aria-selected={selectedSkills.includes(skill.name)} key={skill.name} onClick={() => {
+              const next = selectedSkillsRef.current.includes(skill.name) ? selectedSkillsRef.current.filter(name => name !== skill.name) : [...selectedSkillsRef.current, skill.name];
+              selectedSkillsRef.current = next;
+              setSelectedSkills(next);
+              localStorage.setItem('openharness:global-skills', JSON.stringify(next));
+              window.dispatchEvent(new CustomEvent('openharness:skills-changed', {detail: {names: next}}));
+              setPrompt(value => value.replace(/(?:^|\s)\/[\w-]*$/, '').trimStart());
+              setSkillPickerOpen(false);
+            }}>{skill.name}<span>{skill.description}</span></button>
+          ))}
+        </div>
+      )}
+      {running && <span className="composer-running-label" role="status" aria-live="polite">Working — new prompts will queue</span>}
       <div className="composer-row">
         <input ref={fileInputRef} type="file" accept="image/*,.txt,.md,.json,.ts,.js,.rs,.py,.css,.html" multiple style={{display:'none'}} onChange={(e) => { void handleFiles(e.target.files); e.target.value = ''; }} />
         <button className="model-button" type="button" aria-label="Attach files or images" title="Attach files or images" onClick={() => fileInputRef.current?.click()}>
           <PaperClipIcon width={16} height={16} aria-hidden="true" />
         </button>
+        <label className="approval-mode-control" htmlFor="approval-mode">Approval
+          <select id="approval-mode" aria-label="Tool approval mode" value={approvalMode} onChange={event => {
+            const value = event.target.value === 'automatic' ? 'automatic' : 'manual';
+            approvalModeRef.current = value;
+            setApprovalMode(value);
+            void apiUpdateApprovalMode(value).catch(error => {
+              approvalModeRef.current = value === 'automatic' ? 'manual' : 'automatic';
+              const fallback = approvalModeRef.current;
+              setApprovalMode(fallback);
+              toastError(`Could not save approval mode: ${String(error)}`);
+            });
+          }}>
+            <option value="manual">Manual</option>
+            <option value="automatic">Automatic</option>
+          </select>
+        </label>
         <span className="composer-spacer" />
         <div ref={pickerRef} className="model-wrap">
           <button
@@ -235,15 +337,12 @@ export function Composer({running = false, onStop}: {running?: boolean; onStop?:
             })}
           </div>
         </div>
-        {running ? (
-          <button className="send-button stop-generation" type="button" onClick={onStop} aria-label="Stop generation" title="Stop generation">
-            <StopIcon width={14} aria-hidden="true" />
-          </button>
-        ) : (
-          <button className="send-button" type="submit" aria-label="Send message" title="Send">
-            <ArrowUpIcon width={16} height={16} aria-hidden="true" />
-          </button>
-        )}
+        {running && <button className="send-button stop-generation" type="button" onClick={onStop} aria-label="Stop generation" title="Stop generation">
+          <StopIcon width={14} aria-hidden="true" />
+        </button>}
+        <button className="send-button" type="submit" aria-label="Send message" title="Send">
+          <ArrowUpIcon width={16} height={16} aria-hidden="true" />
+        </button>
       </div>
     </form>
   );

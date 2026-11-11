@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
@@ -46,6 +47,35 @@ pub struct SkillInfo {
     pub path: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct LearningCandidate {
+    pub summary: String,
+    #[serde(default)]
+    pub memory: Vec<String>,
+    #[serde(default)]
+    pub skill_name: Option<String>,
+    #[serde(default)]
+    pub skill_description: Option<String>,
+    #[serde(default)]
+    pub skill_content: Option<String>,
+    #[serde(default)]
+    pub memory_saved: bool,
+    #[serde(default)]
+    pub skill_saved: bool,
+}
+
+impl LearningCandidate {
+    pub fn validate(&self) -> Result<(), String> {
+        if self.summary.trim().is_empty() || self.summary.len() > 4000 { return Err("Learning summary must contain 1–4000 bytes".into()); }
+        if self.memory.len() > 12 || self.memory.iter().any(|item| item.trim().is_empty() || item.len() > 1000) { return Err("Learning memory must contain at most 12 non-empty items of at most 1000 bytes".into()); }
+        match (&self.skill_name, &self.skill_description, &self.skill_content) {
+            (None, None, None) if !self.memory.is_empty() => Ok(()),
+            (Some(name), Some(description), Some(content)) if !self.memory.is_empty() && !name.is_empty() && name.len() <= 48 && name.chars().all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit() || ch == '-') && !description.trim().is_empty() && description.len() <= 300 && !content.trim().is_empty() && content.len() <= 16000 && content.starts_with("---\n") && content.contains(&format!("name: {}", name)) && content.contains(&format!("description: {}", description)) => Ok(()),
+            _ => Err("Learning proposal must contain memory notes or a complete class-level SKILL.md".into()),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolCall {
     pub id: String,
@@ -67,10 +97,25 @@ const MAX_GREP_MATCHES: usize = 100;
 const MAX_DIR_ENTRIES: usize = 250;
 const MAX_OUTPUT_BYTES: usize = 500_000;
 const MAX_SKILL_FILE_BYTES: usize = 100_000;
+const MAX_SKILL_SCAN_ENTRIES: usize = 2_000;
+const MAX_SKILL_METADATA_BYTES: usize = 16_000_000;
 const MAX_SELECTED_SKILLS: usize = 12;
 
 pub struct Sandbox {
     root: PathBuf,
+}
+
+static FILE_EDIT_LOCKS: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::HashMap<PathBuf, std::sync::Arc<std::sync::Mutex<()>>>>,
+> = std::sync::OnceLock::new();
+
+fn file_edit_lock(path: &Path) -> Result<std::sync::Arc<std::sync::Mutex<()>>, String> {
+    let locks = FILE_EDIT_LOCKS.get_or_init(Default::default);
+    let mut locks = locks.lock().map_err(|error| error.to_string())?;
+    Ok(locks
+        .entry(path.to_path_buf())
+        .or_insert_with(|| std::sync::Arc::new(std::sync::Mutex::new(())))
+        .clone())
 }
 
 impl Sandbox {
@@ -205,7 +250,96 @@ impl Sandbox {
         Ok(selected_lines.join("\n"))
     }
 
+    pub fn patch_file(
+        &self,
+        rel_path: &str,
+        old_text: &str,
+        new_text: &str,
+        replace_all: bool,
+    ) -> Result<usize, String> {
+        let path = self.resolve_path(rel_path.trim())?;
+        let lock = file_edit_lock(&path)?;
+        let _guard = lock.lock().map_err(|error| error.to_string())?;
+        self.patch_file_unlocked(rel_path, old_text, new_text, replace_all)
+    }
+
+    fn patch_file_unlocked(
+        &self,
+        rel_path: &str,
+        old_text: &str,
+        new_text: &str,
+        replace_all: bool,
+    ) -> Result<usize, String> {
+        if old_text.is_empty() {
+            return Err("Patch text to replace cannot be empty".to_string());
+        }
+        let full_path = self.resolve_path(rel_path.trim())?;
+        let metadata = fs::symlink_metadata(&full_path)
+            .map_err(|error| format!("Could not inspect '{}': {}", rel_path, error))?;
+        if !metadata.is_file() || metadata.file_type().is_symlink() {
+            return Err(
+                "Security error: Patching requires a regular, non-symlink file".to_string(),
+            );
+        }
+        if metadata.len() as usize > MAX_READ_BYTES {
+            return Err(format!(
+                "File exceeds the {} byte patch limit",
+                MAX_READ_BYTES
+            ));
+        }
+        let content = fs::read_to_string(&full_path)
+            .map_err(|error| format!("Could not read '{}': {}", rel_path, error))?;
+        let read_metadata = fs::symlink_metadata(&full_path)
+            .map_err(|error| format!("Could not recheck '{}': {}", rel_path, error))?;
+        if read_metadata.file_type().is_symlink()
+            || read_metadata.len() != metadata.len()
+            || read_metadata.modified().ok() != metadata.modified().ok()
+            || content.len() as u64 != read_metadata.len()
+        {
+            return Err("File changed while preparing patch; read it again and retry".to_string());
+        }
+        let matches = content.matches(old_text).count();
+        if matches == 0 {
+            return Err("Patch text was not found; file unchanged".to_string());
+        }
+        if matches > 1 && !replace_all {
+            return Err(format!(
+                "Patch text matched {} locations; provide a unique context or explicitly set replace_all",
+                matches
+            ));
+        }
+        let replacement_count = if replace_all { matches } else { 1 };
+        let updated = if replace_all {
+            content.replace(old_text, new_text)
+        } else {
+            content.replacen(old_text, new_text, 1)
+        };
+        self.write_file_unlocked(rel_path, &updated, Some(&content))?;
+        let verified = fs::read_to_string(&full_path)
+            .map_err(|error| format!("Could not verify '{}': {}", rel_path, error))?;
+        if verified != updated {
+            return Err("Patch verification failed after write".to_string());
+        }
+        Ok(replacement_count)
+    }
+
     pub fn write_file(&self, rel_path: &str, content: &str) -> Result<usize, String> {
+        let trimmed = rel_path.trim();
+        if trimmed.is_empty() {
+            return Err("File path cannot be empty".to_string());
+        }
+        let path = self.resolve_path(trimmed)?;
+        let lock = file_edit_lock(&path)?;
+        let _guard = lock.lock().map_err(|error| error.to_string())?;
+        self.write_file_unlocked(trimmed, content, None)
+    }
+
+    fn write_file_unlocked(
+        &self,
+        rel_path: &str,
+        content: &str,
+        expected_current: Option<&str>,
+    ) -> Result<usize, String> {
         let trimmed = rel_path.trim();
         if trimmed.is_empty() {
             return Err("File path cannot be empty".to_string());
@@ -236,15 +370,100 @@ impl Sandbox {
             return Err("Security error: Destination parent escapes project root".to_string());
         }
 
-        if full_path.exists() {
+        let original_metadata = if full_path.exists() {
             let meta = fs::symlink_metadata(&full_path).map_err(|e| e.to_string())?;
-            if meta.file_type().is_symlink() {
-                return Err("Security error: Writing to a symlink is forbidden".to_string());
+            if meta.file_type().is_symlink() || !meta.is_file() {
+                return Err(
+                    "Security error: Writing requires a regular, non-symlink file".to_string(),
+                );
+            }
+            Some(meta)
+        } else {
+            None
+        };
+        if let Some(expected) = expected_current {
+            let Some(metadata) = original_metadata.as_ref() else {
+                return Err("File was removed before the patch could be applied".to_string());
+            };
+            if metadata.len() as usize > MAX_READ_BYTES {
+                return Err(format!(
+                    "File exceeds the {} byte patch limit",
+                    MAX_READ_BYTES
+                ));
+            }
+            let current = fs::read_to_string(&full_path)
+                .map_err(|error| format!("Could not re-read '{}': {}", rel_path, error))?;
+            let rechecked = fs::symlink_metadata(&full_path).map_err(|error| error.to_string())?;
+            if current != expected
+                || rechecked.file_type().is_symlink()
+                || rechecked.len() != metadata.len()
+                || rechecked.modified().ok() != metadata.modified().ok()
+            {
+                return Err(
+                    "File changed while preparing patch; read it again and retry".to_string(),
+                );
             }
         }
 
-        fs::write(&full_path, content.as_bytes())
-            .map_err(|e| format!("Failed to write to '{}': {}", rel_path, e))?;
+        let suffix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let file_name = full_path
+            .file_name()
+            .ok_or_else(|| "Target path must name a file".to_string())?
+            .to_string_lossy();
+        let temp_path = parent.join(format!(
+            ".{}.openharness-{}-{}.tmp",
+            file_name,
+            std::process::id(),
+            suffix
+        ));
+        let write_result = (|| -> Result<(), String> {
+            let mut options = fs::OpenOptions::new();
+            options.write(true).create_new(true);
+            let mut temp = options.open(&temp_path).map_err(|e| {
+                format!("Failed to create temporary file for '{}': {}", rel_path, e)
+            })?;
+            temp.write_all(content.as_bytes())
+                .map_err(|e| format!("Failed to write temporary file for '{}': {}", rel_path, e))?;
+            temp.sync_all()
+                .map_err(|e| format!("Failed to sync temporary file for '{}': {}", rel_path, e))?;
+            drop(temp);
+            if let Some(metadata) = original_metadata.as_ref() {
+                fs::set_permissions(&temp_path, metadata.permissions()).map_err(|error| {
+                    format!("Failed to preserve permissions for '{}': {}", rel_path, error)
+                })?;
+            }
+            if full_path.exists() {
+                let current = fs::symlink_metadata(&full_path).map_err(|e| e.to_string())?;
+                if current.file_type().is_symlink() || !current.is_file() {
+                    return Err(
+                        "Security error: Destination changed to a non-regular file".to_string(),
+                    );
+                }
+                if let Some(expected) = expected_current {
+                    let current_content = fs::read_to_string(&full_path).map_err(|error| {
+                        format!("Could not recheck '{}' before replacement: {}", rel_path, error)
+                    })?;
+                    if current_content != expected {
+                        return Err(
+                            "File changed before patch replacement; re-read and retry".to_string()
+                        );
+                    }
+                }
+                fs::rename(&temp_path, &full_path)
+                    .map_err(|e| format!("Failed to replace '{}': {}", rel_path, e))?;
+            } else {
+                fs::rename(&temp_path, &full_path)
+                    .map_err(|e| format!("Failed to create '{}': {}", rel_path, e))?;
+            }
+            Ok(())
+        })();
+        if write_result.is_err() {
+            let _ = fs::remove_file(&temp_path);
+        }
+        write_result?;
         Ok(content.len())
     }
 
@@ -565,40 +784,139 @@ impl GitContext {
 pub struct ToolDispatcher;
 
 impl ToolDispatcher {
+    pub fn validate_approval_mode(mode: Option<&str>) -> Result<bool, String> {
+        match mode.unwrap_or("manual") {
+            "manual" => Ok(false),
+            "automatic" => Ok(true),
+            _ => Err("Approval mode must be manual or automatic".into()),
+        }
+    }
+
+    pub fn save_project_memory(root: &Path, memory: &[String]) -> Result<String, String> {
+        let sandbox = Sandbox::new(root.to_path_buf())?;
+        let path = "AGENTS.md";
+        let existing = match std::fs::read_to_string(root.join(path)) {
+            Ok(content) => content,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
+            Err(error) => return Err(format!("Could not read project memory: {}", error)),
+        };
+        let heading = "## OpenHarness learned project notes";
+        let mut additions: Vec<String> = Vec::new();
+        for item in memory.iter().map(|item| item.trim()).filter(|item| !item.is_empty() && item.len() <= 1000) {
+            let upper = item.to_ascii_uppercase();
+            if ["SECRET", "API_KEY", "TOKEN", "PASSWORD", "PRIVATE KEY", "BEARER "].iter().any(|pattern| upper.contains(pattern)) || item.contains("<tool_call>") { continue; }
+            if existing.to_lowercase().contains(&item.to_lowercase()) || additions.iter().any(|saved| saved.eq_ignore_ascii_case(item)) { continue; }
+            additions.push(item.to_string());
+        }
+        if additions.is_empty() { return Ok(String::new()); }
+        let section = format!("{}\n{}", heading, additions.iter().map(|item| format!("- {}", item)).collect::<Vec<_>>().join("\n"));
+        let updated = if existing.contains(heading) {
+            let start = existing.find(heading).unwrap_or(existing.len());
+            let section_end = existing[start..].find("\n## ").map(|offset| start + offset).unwrap_or(existing.len());
+            let existing_section = &existing[start..section_end];
+            let new_items: Vec<_> = additions.iter().filter(|item| !existing_section.to_lowercase().contains(&item.to_lowercase())).collect();
+            if new_items.is_empty() { return Ok(String::new()); }
+            format!("{}\n{}\n{}", existing[..section_end].trim_end(), new_items.iter().map(|item| format!("- {}", item)).collect::<Vec<_>>().join("\n"), &existing[section_end..].trim_start_matches('\n'))
+        } else if existing.trim().is_empty() { section } else { format!("{}\n\n{}", existing.trim_end(), section) };
+        if updated.len() > 100_000 { return Err("Project memory file exceeds 100 KB".into()); }
+        let target = sandbox.resolve_path(path)?;
+        if !target.starts_with(&sandbox.root) { return Err("Project memory path escapes workspace".into()); }
+        std::fs::write(&target, &updated).map_err(|error| format!("Could not save project memory: {}", error))?;
+        Ok(format!("AGENTS.md ({} new note(s))", additions.len()))
+    }
+
+    pub fn write_project_skill(root: &Path, candidate: &LearningCandidate) -> Result<String, String> {
+        candidate.validate()?;
+        let name = candidate.skill_name.as_deref().ok_or("Skill name is required")?;
+        let relative = format!(".agents/skills/{}/SKILL.md", name);
+        let sandbox = Sandbox::new(root.to_path_buf())?;
+        let target_dir = format!(".agents/skills/{}", name);
+        if sandbox.resolve_path(&target_dir).is_ok() { return Err(format!("Project skill already exists: {}", name)); }
+        match sandbox.resolve_path(&relative) {
+            Ok(path) if path.exists() => return Err(format!("Project skill already exists: {}", name)),
+            Ok(_) => {},
+            Err(error) if error.contains("not found") || error.contains("No such file") => {},
+            Err(error) => return Err(error),
+        }
+        sandbox.write_file(&relative, candidate.skill_content.as_deref().ok_or("Skill content is required")?)?;
+        Ok(relative)
+    }
+
     pub fn list_skills(root: &Path) -> Result<Vec<SkillInfo>, String> {
         let sandbox = Sandbox::new(root.to_path_buf())?;
         let mut skills = Vec::new();
         let mut scanned_entries = 0;
         let mut total_skill_bytes = 0;
         for directory in [".agents/skills", ".claude/skills", ".kilo/skills"] {
-            if sandbox.resolve_path(directory).is_err() {
-                continue;
-            }
-            let entries = match sandbox.list_dir(Some(directory)) {
+            let directory_path = match sandbox.resolve_path(directory) {
+                Ok(path) => path,
+                Err(_) => continue,
+            };
+            let entries = match fs::read_dir(&directory_path) {
                 Ok(entries) => entries,
                 Err(_) => continue,
             };
-            for entry in entries.into_iter().filter(|entry| entry.is_dir) {
+            for entry in entries.filter_map(Result::ok) {
                 scanned_entries += 1;
-                if scanned_entries > 250 { return Err("Skill directories exceed the 250-entry scan limit".into()); }
-                let skill_path = format!("{}/{}/SKILL.md", directory, entry.name);
-                let metadata = match sandbox.resolve_path(&skill_path).and_then(|path| fs::symlink_metadata(path).map_err(|error| error.to_string())) {
-                    Ok(metadata) if metadata.is_file() && !metadata.file_type().is_symlink() => metadata,
+                if scanned_entries > MAX_SKILL_SCAN_ENTRIES {
+                    return Err(format!(
+                        "Global skill entries exceed the {}-entry scan limit",
+                        MAX_SKILL_SCAN_ENTRIES
+                    ));
+                }
+                let name = entry.file_name().to_string_lossy().to_string();
+                match fs::symlink_metadata(entry.path()) {
+                    Ok(metadata)
+                        if metadata.is_dir()
+                            && !metadata.file_type().is_symlink()
+                            && entry
+                                .path()
+                                .canonicalize()
+                                .is_ok_and(|path| path.starts_with(&sandbox.root)) => {}
+                    _ => continue,
+                }
+                let skill_path = format!("{}/{}/SKILL.md", directory, name);
+                let unresolved_skill_path = directory_path.join(&name).join("SKILL.md");
+                let metadata = match fs::symlink_metadata(&unresolved_skill_path) {
+                    Ok(metadata) if metadata.is_file() && !metadata.file_type().is_symlink() => {
+                        metadata
+                    }
                     _ => continue,
                 };
-                if metadata.len() as usize > MAX_SKILL_FILE_BYTES { continue; }
+                let resolved_skill_path = match sandbox.resolve_path(&skill_path) {
+                    Ok(path) if path == unresolved_skill_path => path,
+                    _ => continue,
+                };
+                if metadata.len() as usize > MAX_SKILL_FILE_BYTES {
+                    continue;
+                }
                 total_skill_bytes += metadata.len() as usize;
-                if total_skill_bytes > MAX_SKILL_FILE_BYTES * 20 { return Err("Skill metadata scan exceeds 2 MB".into()); }
-                let content = match sandbox.read_file(&skill_path, None, None) {
+                if total_skill_bytes > MAX_SKILL_METADATA_BYTES {
+                    return Err(format!(
+                        "Global skill metadata exceeds the {} MB scan limit",
+                        MAX_SKILL_METADATA_BYTES / 1_000_000
+                    ));
+                }
+                let content = match fs::read_to_string(&resolved_skill_path) {
                     Ok(content) => content,
                     Err(_) => continue,
                 };
                 let description = content
                     .lines()
                     .find(|line| line.trim_start().starts_with("description:"))
-                    .map(|line| line.trim().trim_start_matches("description:").trim().trim_matches('"').to_string())
+                    .map(|line| {
+                        line.trim()
+                            .trim_start_matches("description:")
+                            .trim()
+                            .trim_matches('"')
+                            .to_string()
+                    })
                     .unwrap_or_default();
-                skills.push(SkillInfo { name: entry.name, description, path: skill_path });
+                skills.push(SkillInfo {
+                    name,
+                    description,
+                    path: skill_path,
+                });
             }
         }
         skills.sort_by_key(|skill| skill.name.to_lowercase());
@@ -608,7 +926,10 @@ impl ToolDispatcher {
 
     pub fn load_skills(root: &Path, selected: &[String]) -> Result<Vec<(String, String)>, String> {
         if selected.len() > MAX_SELECTED_SKILLS {
-            return Err(format!("Select no more than {} skills", MAX_SELECTED_SKILLS));
+            return Err(format!(
+                "Select no more than {} skills",
+                MAX_SELECTED_SKILLS
+            ));
         }
         let available = Self::list_skills(root)?;
         let mut loaded = Vec::new();
@@ -618,13 +939,24 @@ impl ToolDispatcher {
             };
             let sandbox = Sandbox::new(root.to_path_buf())?;
             let path = sandbox.resolve_path(&skill.path)?;
-            let metadata = fs::symlink_metadata(&path).map_err(|error| format!("Could not inspect skill {}: {}", name, error))?;
-            if metadata.file_type().is_symlink() || !metadata.is_file() || metadata.len() as usize > MAX_SKILL_FILE_BYTES {
-                return Err(format!("Skill {} is not a regular file within the {} byte limit", name, MAX_SKILL_FILE_BYTES));
+            let metadata = fs::symlink_metadata(&path)
+                .map_err(|error| format!("Could not inspect skill {}: {}", name, error))?;
+            if metadata.file_type().is_symlink()
+                || !metadata.is_file()
+                || metadata.len() as usize > MAX_SKILL_FILE_BYTES
+            {
+                return Err(format!(
+                    "Skill {} is not a regular file within the {} byte limit",
+                    name, MAX_SKILL_FILE_BYTES
+                ));
             }
-            let contents = fs::read_to_string(path).map_err(|error| format!("Could not read skill {}: {}", name, error))?;
+            let contents = fs::read_to_string(path)
+                .map_err(|error| format!("Could not read skill {}: {}", name, error))?;
             if contents.len() > MAX_SKILL_FILE_BYTES {
-                return Err(format!("Skill {} exceeds {} bytes", name, MAX_SKILL_FILE_BYTES));
+                return Err(format!(
+                    "Skill {} exceeds {} bytes",
+                    name, MAX_SKILL_FILE_BYTES
+                ));
             }
             loaded.push((name.clone(), contents));
         }
@@ -641,12 +973,14 @@ impl ToolDispatcher {
 
         let canonical_name = match raw_name.to_lowercase().replace(['-', ' '], "_").as_str() {
             "read_file" | "readfile" | "read" | "cat" | "view_file" => "read_file",
-            "write_file" | "writefile" | "write" | "edit_file" | "create_file" => "write_file",
+            "write_file" | "writefile" | "write" | "create_file" => "write_file",
+            "patch_file" | "patchfile" | "edit_file" | "replace_in_file" | "str_replace" => {
+                "patch_file"
+            }
             "list_dir" | "listdir" | "ls" | "dir" | "list_directory" => "list_dir",
             "grep_search" | "grep" | "search" | "grepsearch" => "grep_search",
-            "run_command" | "runcommand" | "bash" | "sh" | "terminal" | "exec" | "command" | "cmd" => {
-                "run_command"
-            }
+            "run_command" | "runcommand" | "bash" | "sh" | "terminal" | "exec" | "command"
+            | "cmd" => "run_command",
             "git_status" | "gitstatus" => "git_status",
             "git_diff" | "gitdiff" => "git_diff",
             "git_log" | "gitlog" => "git_log",
@@ -681,9 +1015,17 @@ impl ToolDispatcher {
 
         if let Some(obj) = arguments.as_object_mut() {
             match canonical_name {
-                "read_file" | "write_file" => {
+                "read_file" | "write_file" | "patch_file" => {
                     if !obj.contains_key("path") {
-                        for alias in ["file_path", "filePath", "file", "filename", "rel_path", "target", "uri"] {
+                        for alias in [
+                            "file_path",
+                            "filePath",
+                            "file",
+                            "filename",
+                            "rel_path",
+                            "target",
+                            "uri",
+                        ] {
                             if let Some(val) = obj.get(alias).cloned() {
                                 obj.insert("path".to_string(), val);
                                 break;
@@ -697,6 +1039,26 @@ impl ToolDispatcher {
                             .trim_start_matches("./")
                             .trim_start_matches(".\\");
                         obj.insert("path".to_string(), serde_json::json!(cleaned));
+                    }
+                    if canonical_name == "patch_file" {
+                        if !obj.contains_key("old_text") {
+                            for alias in ["old_string", "oldString", "search", "find", "old"] {
+                                if let Some(value) = obj.get(alias).cloned() {
+                                    obj.insert("old_text".to_string(), value);
+                                    break;
+                                }
+                            }
+                        }
+                        if !obj.contains_key("new_text") {
+                            for alias in
+                                ["new_string", "newString", "replace", "replacement", "new"]
+                            {
+                                if let Some(value) = obj.get(alias).cloned() {
+                                    obj.insert("new_text".to_string(), value);
+                                    break;
+                                }
+                            }
+                        }
                     }
                     if canonical_name == "write_file" && !obj.contains_key("content") {
                         for alias in ["text", "data", "body", "code"] {
@@ -759,7 +1121,7 @@ impl ToolDispatcher {
         vec![
             ToolDefinition {
                 name: "read_file".to_string(),
-                description: "Read content from a file inside the project workspace".to_string(),
+                description: "Read text from a workspace file. Use offset and limit to page long files; read the target before editing so replacements use exact current content.".to_string(),
                 parameters: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -771,8 +1133,22 @@ impl ToolDispatcher {
                 }),
             },
             ToolDefinition {
+                name: "patch_file".to_string(),
+                description: "Make a targeted edit to an existing workspace file (preferred over writing a shell command). Read the file first, then supply the exact current old_text and intended new_text, including enough surrounding context to be unique. Missing or ambiguous matches fail without changing the file. Explicit replace_all=true updates every matching occurrence. Edits require user approval; OpenHarness checks the file is unchanged immediately before replacement and verifies the result, though external concurrent edits cannot be fully serialized.".to_string(),
+                parameters: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "path": { "type": "string", "description": "Workspace-relative existing file path" },
+                        "old_text": { "type": "string", "description": "Exact text to find in the file" },
+                        "new_text": { "type": "string", "description": "Replacement text" },
+                        "replace_all": { "type": "boolean", "description": "Replace every exact match instead of requiring a unique match" }
+                    },
+                    "required": ["path", "old_text", "new_text"]
+                }),
+            },
+            ToolDefinition {
                 name: "write_file".to_string(),
-                description: "Write or overwrite content into a file inside the project workspace. Requires submission of the full content string.".to_string(),
+                description: "Create a workspace file or replace an entire file when necessary. For targeted edits to an existing file, prefer patch_file after reading it. Requires explicit user approval.".to_string(),
                 parameters: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -795,7 +1171,7 @@ impl ToolDispatcher {
             },
             ToolDefinition {
                 name: "grep_search".to_string(),
-                description: "Search file contents across workspace files".to_string(),
+                description: "Search text in workspace files and return matching paths with line numbers. Use this to find symbols or source snippets before reading or editing files.".to_string(),
                 parameters: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -893,7 +1269,10 @@ impl ToolDispatcher {
                     let actual_end = actual_start + end_idx;
                     let payload = text[actual_start..actual_end].trim();
                     let clean_payload = if let Some(stripped) = payload.strip_prefix("```") {
-                        let c = stripped.find('\n').map(|nl| &stripped[nl + 1..]).unwrap_or(stripped);
+                        let c = stripped
+                            .find('\n')
+                            .map(|nl| &stripped[nl + 1..])
+                            .unwrap_or(stripped);
                         c.rfind("```").map(|end| &c[..end]).unwrap_or(c).trim()
                     } else {
                         payload
@@ -920,6 +1299,7 @@ impl ToolDispatcher {
             let known_xml_tools = [
                 ("read_file", "path"),
                 ("write_file", "path"),
+                ("patch_file", "path"),
                 ("list_dir", "path"),
                 ("grep_search", "query"),
                 ("grep", "query"),
@@ -971,32 +1351,47 @@ impl ToolDispatcher {
 
                     if let Some(open_bracket) = text[start..].find('>') {
                         let content_start = start + open_bracket + 1;
-                        if let Some(end_idx) = text[content_start..].to_lowercase().find(&close_tag) {
+                        if let Some(end_idx) = text[content_start..].to_lowercase().find(&close_tag)
+                        {
                             let content_end = content_start + end_idx;
                             let inner = text[content_start..content_end].trim();
                             let clean_inner = if let Some(stripped) = inner.strip_prefix("```") {
-                                let c = stripped.find('\n').map(|nl| &stripped[nl + 1..]).unwrap_or(stripped);
+                                let c = stripped
+                                    .find('\n')
+                                    .map(|nl| &stripped[nl + 1..])
+                                    .unwrap_or(stripped);
                                 c.rfind("```").map(|end| &c[..end]).unwrap_or(c).trim()
                             } else {
                                 inner
                             };
-                            let call = if let Ok(val) = serde_json::from_str::<serde_json::Value>(clean_inner) {
-                                Self::native_tool_call(&serde_json::json!({
-                                    "name": tool_name,
-                                    "arguments": val
-                                }), calls.len() + 1)
+                            let call = if let Ok(val) =
+                                serde_json::from_str::<serde_json::Value>(clean_inner)
+                            {
+                                Self::native_tool_call(
+                                    &serde_json::json!({
+                                        "name": tool_name,
+                                        "arguments": val
+                                    }),
+                                    calls.len() + 1,
+                                )
                             } else if !default_arg.is_empty() && !clean_inner.is_empty() {
                                 let mut map = serde_json::Map::new();
                                 map.insert(default_arg.to_string(), serde_json::json!(clean_inner));
-                                Self::native_tool_call(&serde_json::json!({
-                                    "name": tool_name,
-                                    "arguments": serde_json::Value::Object(map)
-                                }), calls.len() + 1)
+                                Self::native_tool_call(
+                                    &serde_json::json!({
+                                        "name": tool_name,
+                                        "arguments": serde_json::Value::Object(map)
+                                    }),
+                                    calls.len() + 1,
+                                )
                             } else {
-                                Self::native_tool_call(&serde_json::json!({
-                                    "name": tool_name,
-                                    "arguments": {}
-                                }), calls.len() + 1)
+                                Self::native_tool_call(
+                                    &serde_json::json!({
+                                        "name": tool_name,
+                                        "arguments": {}
+                                    }),
+                                    calls.len() + 1,
+                                )
                             };
                             if let Some(c) = call {
                                 calls.push(c);
@@ -1120,7 +1515,9 @@ impl ToolDispatcher {
     }
 
     pub fn execute_tool(root: &Path, call: &ToolCall, approved: bool) -> ToolResult {
-        if (call.name == "write_file" || call.name == "run_command") && !approved {
+        if (call.name == "write_file" || call.name == "patch_file" || call.name == "run_command")
+            && !approved
+        {
             return ToolResult {
                 tool_call_id: call.id.clone(),
                 name: call.name.clone(),
@@ -1162,6 +1559,31 @@ impl ToolDispatcher {
                         success: false,
                         output: String::new(),
                         error: Some(e),
+                    },
+                }
+            }
+            "patch_file" => {
+                let path = call.arguments["path"].as_str().unwrap_or("");
+                let old_text = call.arguments["old_text"].as_str().unwrap_or("");
+                let new_text = call.arguments["new_text"].as_str().unwrap_or("");
+                let replace_all = call.arguments["replace_all"].as_bool().unwrap_or(false);
+                match sandbox.patch_file(path, old_text, new_text, replace_all) {
+                    Ok(count) => ToolResult {
+                        tool_call_id: call.id.clone(),
+                        name: call.name.clone(),
+                        success: true,
+                        output: format!(
+                            "Replaced {} exact match(es) in '{}' and verified the file",
+                            count, path
+                        ),
+                        error: None,
+                    },
+                    Err(error) => ToolResult {
+                        tool_call_id: call.id.clone(),
+                        name: call.name.clone(),
+                        success: false,
+                        output: String::new(),
+                        error: Some(error),
                     },
                 }
             }
@@ -1432,33 +1854,58 @@ impl ToolDispatcher {
     }
 
     pub fn build_system_prompt() -> String {
-        let tools = Self::list_tools();
-        let tools_json = serde_json::to_string_pretty(&tools).unwrap_or_default();
-        format!(
-            "You are OpenHarness Coding Assistant, an expert autonomous software engineer with full tool access to the user's project workspace.\n\
-            You have access to the following tools:\n\
-            {}\n\n\
-            IMPORTANT INSTRUCTIONS:\n\
-            1. You ALWAYS have tool access active and available on every turn. Never claim that tool access is unavailable.\n\
-            2. When the user asks you to understand, read, explore, inspect, or modify the project or any files/directories, proactively call the appropriate tools (such as list_dir, read_file, grep_search, git_status) to inspect the actual files first.\n\
-            3. To call a tool, output a block formatted as:\n\
-            <tool_call>\n\
-            {{\"name\": \"tool_name\", \"arguments\": {{ ... }}}}\n\
-            </tool_call>\n\
-            For example, to read a file:\n\
-            <tool_call>\n\
-            {{\"name\": \"read_file\", \"arguments\": {{\"path\": \"README.md\"}}}}\n\
-            </tool_call>\n\
-            4. When calling a tool, do NOT add speculative explanations or final answers in the same message. Output the tool call block and wait for the tool observation before explaining.\n\
-            5. After receiving a tool observation, analyze the returned data and continue with additional tool calls if needed, or provide your final response.",
-            tools_json
-        )
+        "You are OpenHarness Coding Assistant, an expert autonomous software engineer with full tool access to the user's project workspace.\n\
+        IMPORTANT INSTRUCTIONS:\n\
+        1. You ALWAYS have tool access active and available on every turn. Never claim that tool access is unavailable.\n\
+        2. For project work, use read_file, list_dir, grep_search, git_status, and other tools directly. Read the current target before editing. For focused edits to existing files, prefer patch_file over run_command or rewriting the entire file. patch_file requires one exact unique match unless replace_all=true and leaves files unchanged when text is missing or ambiguous. Use write_file for new files or deliberate full-file replacements.\n\
+        3. To call a tool, output a block formatted as:\n\
+        <tool_call>\n\
+        {{\"name\": \"tool_name\", \"arguments\": {{ ... }}}}\n\
+        </tool_call>\n\
+        For example, to read a file:\n\
+        <tool_call>\n\
+        {{\"name\": \"read_file\", \"arguments\": {{\"path\": \"README.md\"}}}}\n\
+        </tool_call>\n\
+        4. When calling a tool, do NOT add speculative explanations or final answers in the same message. Output the tool call block and wait for the tool observation before explaining.\n\
+        5. After receiving a tool observation, analyze the returned data and continue with additional tool calls if needed, or provide your final response."
+            .to_string()
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn system_prompt_does_not_duplicate_request_tool_schemas() {
+        let tools = ToolDispatcher::list_tools();
+        let schemas = serde_json::to_string_pretty(&tools).unwrap();
+
+        assert!(!ToolDispatcher::build_system_prompt().contains(&schemas));
+    }
+
+    #[test]
+    fn lists_skills_across_the_full_global_metadata_budget() {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("target")
+            .join(format!("large_skills_test_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let skills_dir = root.join(".agents/skills");
+        fs::create_dir_all(&skills_dir).unwrap();
+        let description = "x".repeat(15_000);
+        for index in 0..700 {
+            let skill_dir = skills_dir.join(format!("skill-{index:03}"));
+            fs::create_dir_all(&skill_dir).unwrap();
+            fs::write(
+                skill_dir.join("SKILL.md"),
+                format!("---\nname: skill-{index:03}\ndescription: {description}\n---\n"),
+            )
+            .unwrap();
+        }
+        let skills = ToolDispatcher::list_skills(&root).unwrap();
+        assert_eq!(skills.len(), 700);
+        let _ = fs::remove_dir_all(&root);
+    }
 
     #[test]
     fn lists_skills_from_user_global_locations() {
@@ -1487,23 +1934,38 @@ mod tests {
 
     #[test]
     fn lists_and_loads_only_valid_workspace_skills() {
-        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target").join(format!("skill_test_{}", std::process::id()));
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("target")
+            .join(format!("skill_test_{}", std::process::id()));
         let _ = fs::remove_dir_all(&root);
         fs::create_dir_all(root.join(".agents/skills/sample")).unwrap();
-        fs::write(root.join(".agents/skills/sample/SKILL.md"), "---\nname: sample\ndescription: Sample guidance\n---\nUse this skill.").unwrap();
+        fs::write(
+            root.join(".agents/skills/sample/SKILL.md"),
+            "---\nname: sample\ndescription: Sample guidance\n---\nUse this skill.",
+        )
+        .unwrap();
         fs::create_dir_all(root.join(".agent/skills/no-skill-file")).unwrap();
         let skills = ToolDispatcher::list_skills(&root).unwrap();
         assert_eq!(skills.len(), 1);
         assert_eq!(skills[0].name, "sample");
         assert_eq!(skills[0].description, "Sample guidance");
-        assert_eq!(ToolDispatcher::load_skills(&root, &["sample".into()]).unwrap()[0].1, "---\nname: sample\ndescription: Sample guidance\n---\nUse this skill.");
-        assert!(ToolDispatcher::load_skills(&root, &["missing".into()]).unwrap().is_empty());
+        assert_eq!(
+            ToolDispatcher::load_skills(&root, &["sample".into()]).unwrap()[0].1,
+            "---\nname: sample\ndescription: Sample guidance\n---\nUse this skill."
+        );
+        assert!(
+            ToolDispatcher::load_skills(&root, &["missing".into()])
+                .unwrap()
+                .is_empty()
+        );
         let _ = fs::remove_dir_all(&root);
     }
 
     #[test]
     fn lists_and_loads_workspace_skill_instructions() {
-        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target").join(format!("skill_test_{}", std::process::id()));
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("target")
+            .join(format!("skill_test_{}", std::process::id()));
         let _ = fs::remove_dir_all(&root);
         fs::create_dir_all(root.join(".agents/skills/sample")).unwrap();
         let skill = "---\nname: sample\ndescription: Sample guidance\n---\nUse this skill.";
@@ -1512,8 +1974,15 @@ mod tests {
         assert_eq!(skills.len(), 1);
         assert_eq!(skills[0].name, "sample");
         assert_eq!(skills[0].description, "Sample guidance");
-        assert_eq!(ToolDispatcher::load_skills(&root, &["sample".into()]).unwrap()[0].1, skill);
-        assert!(ToolDispatcher::load_skills(&root, &["missing".into()]).unwrap().is_empty());
+        assert_eq!(
+            ToolDispatcher::load_skills(&root, &["sample".into()]).unwrap()[0].1,
+            skill
+        );
+        assert!(
+            ToolDispatcher::load_skills(&root, &["missing".into()])
+                .unwrap()
+                .is_empty()
+        );
         let _ = fs::remove_dir_all(&root);
     }
 
@@ -1539,6 +2008,96 @@ mod tests {
         assert!(sandbox.resolve_path("sub/../../escape").is_err());
 
         let _ = fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn patch_file_replace_all_updates_every_match_when_explicit() {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("target")
+            .join(format!(
+                "patch_all_test_{}_{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_nanos()
+            ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("source.rs"), "old old old\n").unwrap();
+        let sandbox = Sandbox::new(root.clone()).unwrap();
+
+        assert_eq!(
+            sandbox.patch_file("source.rs", "old", "new", true).unwrap(),
+            3
+        );
+        assert_eq!(
+            fs::read_to_string(root.join("source.rs")).unwrap(),
+            "new new new\n"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn patch_file_replaces_one_exact_match_and_preserves_other_content() {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("target")
+            .join(format!(
+                "patch_test_{}_{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_nanos()
+            ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("source.rs"), "before\nold value\nafter\n").unwrap();
+        let sandbox = Sandbox::new(root.clone()).unwrap();
+
+        let result = sandbox.patch_file("source.rs", "old value", "new value", false);
+
+        assert_eq!(result.unwrap(), 1);
+        assert_eq!(
+            fs::read_to_string(root.join("source.rs")).unwrap(),
+            "before\nnew value\nafter\n"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn patch_file_refuses_ambiguous_or_missing_match_without_modifying_file() {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("target")
+            .join(format!(
+                "patch_guard_test_{}_{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_nanos()
+            ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        let original = "duplicate\nduplicate\n";
+        fs::write(root.join("source.rs"), original).unwrap();
+        let sandbox = Sandbox::new(root.clone()).unwrap();
+
+        assert!(
+            sandbox
+                .patch_file("source.rs", "duplicate", "changed", false)
+                .is_err()
+        );
+        assert!(
+            sandbox
+                .patch_file("source.rs", "missing", "changed", false)
+                .is_err()
+        );
+        assert_eq!(
+            fs::read_to_string(root.join("source.rs")).unwrap(),
+            original
+        );
+        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -1584,6 +2143,27 @@ mod tests {
     }
 
     #[test]
+    fn approval_mode_defaults_manual_and_rejects_unknown_values() {
+        assert!(!ToolDispatcher::validate_approval_mode(None).unwrap());
+        assert!(!ToolDispatcher::validate_approval_mode(Some("manual")).unwrap());
+        assert!(ToolDispatcher::validate_approval_mode(Some("automatic")).unwrap());
+        assert!(ToolDispatcher::validate_approval_mode(Some("always")).is_err());
+    }
+
+    #[test]
+    fn project_memory_is_deduplicated_and_filters_secret_like_notes() {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target").join(format!("openharness-learn-{}-{}", std::process::id(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        assert!(ToolDispatcher::save_project_memory(&root, &["Run cargo test --lib".into(), "API_KEY=secret".into()]).unwrap().contains("1 new note"));
+        let saved = fs::read_to_string(root.join("AGENTS.md")).unwrap();
+        assert!(saved.contains("Run cargo test --lib"));
+        assert!(!saved.contains("API_KEY"));
+        assert!(ToolDispatcher::save_project_memory(&root, &["Run cargo test --lib".into()]).unwrap().is_empty());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn test_tool_call_parsing() {
         let message = "Let me check the files first.\n\
             <tool_call>\n\
@@ -1612,7 +2192,8 @@ mod tests {
 
     #[test]
     fn test_tool_call_parsing_markdown_code_block() {
-        let message = "```json\n{\"name\": \"read_file\", \"arguments\": {\"path\": \"test.rs\"}}\n```";
+        let message =
+            "```json\n{\"name\": \"read_file\", \"arguments\": {\"path\": \"test.rs\"}}\n```";
         let calls = ToolDispatcher::parse_tool_calls(message);
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].name, "read_file");
@@ -1626,6 +2207,17 @@ mod tests {
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].name, "read_file");
         assert_eq!(calls[0].arguments["path"], "src/main.rs");
+    }
+
+    #[test]
+    fn test_patch_tool_call_parsing_aliases() {
+        let message = "<tool_call>{\"name\": \"edit_file\", \"arguments\": {\"file_path\": \"src/lib.rs\", \"old_string\": \"old\", \"new_string\": \"new\"}}</tool_call>";
+        let calls = ToolDispatcher::parse_tool_calls(message);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "patch_file");
+        assert_eq!(calls[0].arguments["path"], "src/lib.rs");
+        assert_eq!(calls[0].arguments["old_text"], "old");
+        assert_eq!(calls[0].arguments["new_text"], "new");
     }
 
     #[test]
@@ -1689,10 +2281,25 @@ mod tests {
     }
 
     #[test]
+    fn project_memory_merge_is_deduplicated_and_secret_filtered() {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target").join(format!("openharness-learning-{}-{}", std::process::id(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+        std::fs::create_dir_all(&root).unwrap();
+        let saved = ToolDispatcher::save_project_memory(&root, &["Run cargo test --lib".into(), "API_KEY=unsafe".into()]).unwrap();
+        assert!(saved.contains("1 new note"));
+        let contents = std::fs::read_to_string(root.join("AGENTS.md")).unwrap();
+        assert!(contents.contains("Run cargo test --lib"));
+        assert!(!contents.contains("API_KEY"));
+        let second = ToolDispatcher::save_project_memory(&root, &["Run cargo test --lib".into()]).unwrap();
+        assert!(second.is_empty());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn test_execution_engine_echo() {
         let temp_dir = std::env::temp_dir();
         #[cfg(target_os = "windows")]
-        let res = ExecutionEngine::run_command(&temp_dir, "Write-Output harness_ok", Some(5)).unwrap();
+        let res =
+            ExecutionEngine::run_command(&temp_dir, "Write-Output harness_ok", Some(5)).unwrap();
         #[cfg(not(target_os = "windows"))]
         let res = ExecutionEngine::run_command(&temp_dir, "echo harness_ok", Some(5)).unwrap();
 
@@ -1704,7 +2311,12 @@ mod tests {
     #[test]
     fn execution_engine_handles_powershell_pipeline() {
         let temp_dir = std::env::temp_dir();
-        let res = ExecutionEngine::run_command(&temp_dir, "'one', 'two' | ForEach-Object { $_.ToUpper() }", Some(5)).unwrap();
+        let res = ExecutionEngine::run_command(
+            &temp_dir,
+            "'one', 'two' | ForEach-Object { $_.ToUpper() }",
+            Some(5),
+        )
+        .unwrap();
 
         assert_eq!(res.exit_code, Some(0));
         assert!(res.stdout.contains("ONE"));

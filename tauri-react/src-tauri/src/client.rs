@@ -353,7 +353,7 @@ pub async fn query_llm_stream(
     on_token: impl Fn(String) + Send + Sync + 'static,
     on_cached_input_tokens: impl Fn(u32) + Send + Sync + 'static,
 ) -> Result<String, String> {
-    query_llm_stream_with_tools(provider, model_id, messages, api_key, base_url, &[], max_output_tokens, attachments, supports_vision, on_token, on_cached_input_tokens).await
+    query_llm_stream_with_tools(provider, model_id, messages, api_key, base_url, &[], max_output_tokens, attachments, supports_vision, on_token, on_cached_input_tokens, |_| {}).await
 }
 
 pub async fn query_llm_stream_with_tools(
@@ -368,6 +368,7 @@ pub async fn query_llm_stream_with_tools(
     supports_vision: bool,
     on_token: impl Fn(String) + Send + Sync + 'static,
     on_usage: impl Fn(u32) + Send + Sync + 'static,
+    on_activity: impl Fn(String) + Send + Sync + 'static,
 ) -> Result<String, String> {
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(120))
@@ -531,6 +532,9 @@ pub async fn query_llm_stream_with_tools(
                             && let Some(tokens) = cached_input_tokens(usage)
                         {
                             on_usage(tokens);
+                        }
+                        if let Some(reasoning) = json["choices"][0]["delta"]["reasoning"].as_str().filter(|s| !s.is_empty()) {
+                            on_activity(format!("[agent-step]{}", reasoning));
                         }
                         if let Some(content) = json["choices"][0]["delta"]["content"].as_str().filter(|s| !s.is_empty()) {
                             accumulated.push_str(content);

@@ -1,2 +1,2 @@
 import type { StepEventLike } from '../components/StepEvent';
-export type Message = {id: string; role: 'user'|'assistant'; text: string; status?: 'thinking'|'done'|'error'; attachments?: string[]; steps?: StepEventLike[]};
+export type Message = {id: string; role: 'user'|'assistant'; text: string; status?: 'thinking'|'done'|'error'|'queued'|'cancelled'; attachments?: string[]; steps?: StepEventLike[]};

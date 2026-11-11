@@ -4,19 +4,20 @@ import {apiListSkills, type SkillInfoLike} from './services/tauriBridge';
 import {Rail} from './components/Rail';
 import {Drawer} from './components/Drawer';
 import {ChatWindow} from './components/ChatWindow';
+import {TitleBar} from './components/Chrome';
+import {invoke, isTauri} from '@tauri-apps/api/core';
 import {SettingsPage} from './components/Settings/SettingsPage';
 
 type SkillInfo = SkillInfoLike;
 
-function SkillsPage({skills, loading, error, selected, search, onSearch, onToggle, onRefresh, onClose}: {
+function SkillsPage({skills, loading, error, selected, search, onSearch, onToggle}: {
   skills: SkillInfo[]; loading: boolean; error: string | null; selected: Set<string>; search: string;
-  onSearch: (value: string) => void; onToggle: (name: string) => void; onRefresh: () => void; onClose: () => void;
+  onSearch: (value: string) => void; onToggle: (name: string) => void;
 }) {
   const filtered = skills.filter(skill => `${skill.name} ${skill.description}`.toLowerCase().includes(search.toLowerCase()));
   return <section className="skills-page" aria-labelledby="skills-title">
     <header className="skills-header">
       <div><span className="skills-eyebrow">GLOBAL AGENT LIBRARY</span><h1 id="skills-title">Skills</h1><p>Choose skills from your user-level agent directory to load into the coding agent’s instructions.</p></div>
-      <div className="skills-header-actions"><button type="button" className="skills-refresh" onClick={onRefresh} aria-label="Refresh skills" title="Refresh skills"><ArrowPathIcon width={16} height={16} aria-hidden="true" /></button><button type="button" className="skills-refresh" onClick={onClose} aria-label="Close skills and return to chat" title="Back to chat"><XMarkIcon width={16} height={16} aria-hidden="true" /></button></div>
     </header>
     <label className="skills-search"><MagnifyingGlassIcon width={16} height={16} aria-hidden="true"/><span className="visually-hidden">Search skills</span><input value={search} onChange={event => onSearch(event.target.value)} placeholder="Search skills…" /></label>
     {error && <p className="skills-error" role="alert">{error}</p>}
@@ -47,6 +48,7 @@ export function OpenHarness() {
   const visibleSelectedSkills = new Set(selectedSkills);
   const selectedSkillsRef = useRef(selectedSkills);
   const [initialSection, setInitialSection] = useState('Providers');
+  const [updateAvailable, setUpdateAvailable] = useState(false);
   selectedSkillsRef.current = selectedSkills;
 
   const refreshSkills = async () => {
@@ -78,9 +80,11 @@ export function OpenHarness() {
       setSelectedSkills(names);
       try { localStorage.setItem('openharness:global-skills', JSON.stringify(names)); } catch {}
     };
+    const updateWindowAvailability = (event: Event) => setUpdateAvailable(Boolean((event as CustomEvent<boolean>).detail));
+    window.addEventListener('openharness:update-availability', updateWindowAvailability);
     window.addEventListener('openharness:skills-changed', updateSkills);
-    return () => { window.removeEventListener('openharness:skills-changed', updateSkills); };
-  }, [skillsOpen]);
+    return () => { window.removeEventListener('openharness:update-availability', updateWindowAvailability); window.removeEventListener('openharness:skills-changed', updateSkills); };
+  }, []);
 
   useEffect(() => {
     const openSettings = (event?: Event) => {
@@ -121,7 +125,7 @@ export function OpenHarness() {
   return (
     <div className="app">
       <Rail onGearClick={() => { setSkillsOpen(false); setSettingsOpen(value => !value); }} gearActive={settingsOpen} skillsActive={skillsOpen}/>
-      {skillsOpen ? <><Drawer /><SkillsPage skills={skills} loading={loadingSkills} error={skillsError} selected={visibleSelectedSkills} search={skillSearch} onSearch={setSkillSearch} onToggle={toggleSkill} onRefresh={() => void refreshSkills()} onClose={() => setSkillsOpen(false)} /></> : <><Drawer /><ChatWindow /></>}
+      {skillsOpen ? <><Drawer /><main className="workspace skills-workspace"><TitleBar onMinimize={() => { if (isTauri()) void invoke('app_minimize'); }} onToggleMaximize={() => { if (isTauri()) void invoke('app_toggle_maximize'); }} onClose={() => { if (isTauri()) void invoke('app_close'); }} updateAvailable={updateAvailable} onOpenSettings={() => window.dispatchEvent(new CustomEvent('openharness:open-settings', {detail: {section: 'Update'}}))} trailingContent={<div className="skills-header-actions"><button type="button" className="window-control" onClick={() => void refreshSkills()} aria-label="Refresh skills" title="Refresh skills"><ArrowPathIcon width={15} height={15} aria-hidden="true" /></button><button type="button" className="window-control" onClick={() => setSkillsOpen(false)} aria-label="Back to chat" title="Back to chat"><XMarkIcon width={15} height={15} aria-hidden="true" /></button></div>} /><SkillsPage skills={skills} loading={loadingSkills} error={skillsError} selected={visibleSelectedSkills} search={skillSearch} onSearch={setSkillSearch} onToggle={toggleSkill} /></main></> : <><Drawer /><ChatWindow /></>}
       {settingsOpen && <SettingsPage onClose={() => setSettingsOpen(false)} initialSection={initialSection}/>}
     </div>
   );
