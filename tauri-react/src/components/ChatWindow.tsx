@@ -7,20 +7,11 @@ export function ChatWindow() {
   const [updateAvailable, setUpdateAvailable] = useState(false);
 
   useEffect(() => {
-    const updateProjectTab = (event: Event) => {
-      const project = (event as CustomEvent<{name?: string}>).detail;
-      const projectElement = document.getElementById('breadcrumb-project');
-      if (projectElement) projectElement.textContent = project?.name || 'OpenHarness';
-    };
     const updateCheck = (event: Event) => {
       setUpdateAvailable(Boolean((event as CustomEvent<boolean>).detail));
     };
-    window.addEventListener('openharness:select-project', updateProjectTab);
     window.addEventListener('openharness:update-availability', updateCheck);
-    return () => {
-      window.removeEventListener('openharness:select-project', updateProjectTab);
-      window.removeEventListener('openharness:update-availability', updateCheck);
-    };
+    return () => window.removeEventListener('openharness:update-availability', updateCheck);
   }, []);
 
   const windowControls = {

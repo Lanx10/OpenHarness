@@ -1,5 +1,5 @@
 import {useEffect, useRef, useState} from 'react';
-import {ChevronDownIcon, ArrowUpIcon, PaperClipIcon, StopIcon} from '@heroicons/react/20/solid';
+import {ChevronDownIcon, ArrowUpIcon, PaperClipIcon, StopIcon, CheckIcon} from '@heroicons/react/20/solid';
 import {apiGetApprovalMode, apiListProviders, apiListSkills, apiUpdateApprovalMode, type ProviderInfo} from '../services/tauriBridge';
 
 type Model = {
@@ -236,7 +236,8 @@ export function Composer({running = false, onStop}: {running?: boolean; onStop?:
         <div className="attachments" aria-label="Attachments">
           {attachments.map((item, index) => (
             <span key={`${item.name}:${index}`} className="attachment-chip">
-              <span title={item.name}>{item.name} · {Math.max(1, Math.ceil(item.size / 1024))} KB</span>
+              {item.isImage && <span className="attachment-chip-thumb" style={{backgroundImage:`url(${item.content.match(/data:image\/[^)]+/)?.[0] ?? ''})`}} aria-hidden="true" />}
+              <span title={item.name}>{item.name} <em>{Math.max(1, Math.ceil(item.size / 1024))} KB</em></span>
               <button type="button" onClick={() => removeAttachment(index)} aria-label={`Remove ${item.name}`} title="Remove attachment">×</button>
             </span>
           ))}
@@ -244,6 +245,8 @@ export function Composer({running = false, onStop}: {running?: boolean; onStop?:
       )}
       <textarea
         id="prompt"
+        aria-controls="composer-skill-menu"
+        aria-expanded={skillPickerOpen}
         rows={2}
         aria-label="Message"
         placeholder="Message OpenHarness…  (Enter to send, Shift+Enter for a new line)"
@@ -258,15 +261,24 @@ export function Composer({running = false, onStop}: {running?: boolean; onStop?:
             setSkillPickerOpen(false);
             return;
           }
+          if (skillPickerOpen && (e.key === 'ArrowDown' || e.key === 'ArrowUp')) {
+            e.preventDefault();
+            const buttons = Array.from(document.querySelectorAll<HTMLButtonElement>('.composer-skill-menu [role="option"]'));
+            const currentIndex = buttons.findIndex(button => button === document.activeElement);
+            const delta = e.key === 'ArrowDown' ? 1 : -1;
+            const nextIndex = Math.max(0, Math.min(buttons.length - 1, currentIndex + delta));
+            buttons[nextIndex]?.focus();
+            return;
+          }
           if (e.key === 'Enter' && !e.shiftKey && !skillPickerOpen) {
             e.preventDefault();
             send();
           }
         }}
       />
-      <div className="composer-hint" aria-label="Composer capabilities">Use /skill-name to invoke a skill · paste or attach images · drop files to add context</div>
+      <div className="composer-hint" aria-label="Composer capabilities">Use <kbd>/</kbd> for skills <span aria-hidden="true">·</span> attach images or files <span aria-hidden="true">·</span> <kbd>Shift+Enter</kbd> for a new line</div>
       {skillPickerOpen && (
-        <div className="composer-skill-menu" role="listbox" aria-label="Available skills">
+        <div id="composer-skill-menu" className="composer-skill-menu" role="listbox" aria-label="Available skills">
           {availableSkills.map(skill => (
             <button type="button" role="option" aria-selected={selectedSkills.includes(skill.name)} key={skill.name} onClick={() => {
               const next = selectedSkillsRef.current.includes(skill.name) ? selectedSkillsRef.current.filter(name => name !== skill.name) : [...selectedSkillsRef.current, skill.name];
@@ -280,13 +292,15 @@ export function Composer({running = false, onStop}: {running?: boolean; onStop?:
           ))}
         </div>
       )}
-      {running && <span className="composer-running-label" role="status" aria-live="polite">Working — new prompts will queue</span>}
       <div className="composer-row">
         <input ref={fileInputRef} type="file" accept="image/*,.txt,.md,.json,.ts,.js,.rs,.py,.css,.html" multiple style={{display:'none'}} onChange={(e) => { void handleFiles(e.target.files); e.target.value = ''; }} />
-        <button className="model-button" type="button" aria-label="Attach files or images" title="Attach files or images" onClick={() => fileInputRef.current?.click()}>
+        <button className="model-button attach-button" type="button" aria-label="Attach files or images" title="Attach files or images" onClick={() => fileInputRef.current?.click()}>
           <PaperClipIcon width={16} height={16} aria-hidden="true" />
         </button>
-        <label className="approval-mode-control" htmlFor="approval-mode">Approval
+        {running && <span className="composer-running-label" role="status" aria-live="polite">Working <span aria-hidden="true">·</span> new prompts queue</span>}
+        <label className={`approval-mode-control approval-mode-${approvalMode}`} htmlFor="approval-mode">
+          <span className="approval-mode-icon" aria-hidden="true"><CheckIcon width={13} height={13} /></span>
+          <span className="approval-mode-copy"><span className="approval-mode-title">Tool approval</span><span className="approval-mode-status">{approvalMode === 'automatic' ? 'Automatic' : 'Ask each time'}</span></span>
           <select id="approval-mode" aria-label="Tool approval mode" value={approvalMode} onChange={event => {
             const value = event.target.value === 'automatic' ? 'automatic' : 'manual';
             approvalModeRef.current = value;
@@ -298,9 +312,10 @@ export function Composer({running = false, onStop}: {running?: boolean; onStop?:
               toastError(`Could not save approval mode: ${String(error)}`);
             });
           }}>
-            <option value="manual">Manual</option>
+            <option value="manual">Ask each time</option>
             <option value="automatic">Automatic</option>
           </select>
+          <ChevronDownIcon className="approval-mode-chevron" width={12} height={12} aria-hidden="true" />
         </label>
         <span className="composer-spacer" />
         <div ref={pickerRef} className="model-wrap">
@@ -308,15 +323,19 @@ export function Composer({running = false, onStop}: {running?: boolean; onStop?:
             className="model-button"
             id="model-button"
             type="button"
+            aria-label={selectedModel ? `Model: ${selectedModel.provider}, ${selectedModel.id}` : 'Choose model'}
             aria-haspopup="listbox"
+            aria-controls="model-menu"
             aria-expanded={modelPickerOpen}
             onClick={() => setModelPickerOpen((open) => !open)}
           >
-            <span id="model-label">{selectedModel ? selectedModel.name : 'No models configured'}</span>
-            <ChevronDownIcon width={12} height={12} aria-hidden="true" />
+            <span className="model-provider-mark" aria-hidden="true">{selectedModel?.provider.slice(0, 1) ?? 'M'}</span>
+            <span className="model-button-copy"><span className="model-provider-label">{selectedModel?.provider ?? 'Model'}</span><span className="model-label" id="model-label">{selectedModel ? selectedModel.id : 'No models configured'}</span></span>
+            <ChevronDownIcon className="model-chevron" width={13} height={13} aria-hidden="true" />
           </button>
-          <div className={`model-menu ${modelPickerOpen ? 'open' : ''}`} id="model-menu" role="listbox" aria-label="Choose model">
-            {models.length === 0 ? <div className="model-option">Add a provider in Settings</div> : models.map((m) => {
+          <div className={`model-menu ${modelPickerOpen ? 'open' : ''}`} id="model-menu" role="listbox" aria-label="Choose model" aria-hidden={!modelPickerOpen}>
+            <div className="model-menu-heading">Choose a model</div>
+            {models.length === 0 ? <div className="model-option-empty">Add a provider in Settings</div> : models.map((m) => {
               const isChosen = selectedModel?.id === m.id && selectedModel?.provider === m.provider;
               return (
                 <button
@@ -331,7 +350,9 @@ export function Composer({running = false, onStop}: {running?: boolean; onStop?:
                     localStorage.setItem('openharness:default-model', JSON.stringify(m));
                   }}
                 >
-                  {m.name}{m.supportsVision ? ' · Images' : ''}
+                  <span className="model-option-mark" aria-hidden="true">{m.provider.slice(0, 1)}</span>
+                  <span className="model-option-copy"><span>{m.id}</span><small>{m.provider}{m.supportsVision ? ' · Image input' : ''}</small></span>
+                  {isChosen && <CheckIcon className="model-option-check" width={15} height={15} aria-hidden="true" />}
                 </button>
               );
             })}

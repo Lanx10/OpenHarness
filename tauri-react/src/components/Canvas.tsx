@@ -1,7 +1,7 @@
 import {useEffect, useRef, useState} from 'react';
 import { SafeMarkdown } from './SafeMarkdown';
 import { MessageCrumbs } from './MessageCrumbs';
-import { readQueuedPrompts, upsertStep, type QueuedPrompt } from './stepLifecycle';
+import { readQueuedPrompts, upsertStep, markPromptActive, estimateMessageTokens, type QueuedPrompt } from './stepLifecycle';
 import type { Message } from '../types/message';
 import { cleanMessageText } from '../utils/cleanMessageText';
 import {isTauri} from '@tauri-apps/api/core';
@@ -244,6 +244,12 @@ export function Canvas() {
   };
   const [tokenLimits, setTokenLimits] = useState({context: 128_000, output: 4_096});
   const [cachedInputTokens, setCachedInputTokens] = useState<number | null>(null);
+  const activeThread = threads.find(thread => thread.id === threadId) ?? null;
+  const uncompactedMessages = activeThread?.messages.slice(activeThread.compacted_message_count ?? 0) ?? [];
+  const estimatedContextTokens = uncompactedMessages.reduce((total, message) => total + estimateMessageTokens(message.text, message.attachments ?? []), 0)
+    + estimateMessageTokens(activeThread?.compacted_summary ?? '');
+  const contextPercent = Math.min(100, (estimatedContextTokens / Math.max(1, tokenLimits.context)) * 100);
+  const nearContextLimit = contextPercent >= 85;
   const [compacting, setCompacting] = useState(false);
   const compactingRef = useRef(false);
   const compactedThreadsRef = useRef(new Set<string>());
@@ -342,7 +348,9 @@ export function Canvas() {
   useEffect(() => {
     try {
       const validIds = new Set(queuedPrompts.map(prompt => prompt.id));
-      const abandoned = readQueuedPrompts(localStorage, 'openharness:queued-prompts').filter(prompt => !validIds.has(prompt.id));
+      const activeIds = new Set(queuedPrompts.filter(prompt => prompt.id.startsWith('active:')).map(prompt => prompt.id));
+      const abandoned = readQueuedPrompts(localStorage, 'openharness:queued-prompts')
+        .filter(prompt => !validIds.has(prompt.id) && !validIds.has(`active:${prompt.id}`) && !activeIds.has(prompt.id));
       const active = queuedPrompts.find(prompt => prompt.id.startsWith('active:'));
       const pending = queuedPrompts.filter(prompt => !prompt.id.startsWith('active:'));
       const nextQueue = active ? [active, ...pending] : [...abandoned, ...pending];
@@ -454,10 +462,17 @@ export function Canvas() {
       if (detail.modelContextTokens) setTokenLimits({context: detail.modelContextTokens, output: detail.modelOutputTokens ?? 4_096});
       setCachedInputTokens(null);
       const text = String(detail?.text ?? '').trim();
-      if (!text && !(detail.attachments?.length)) return;
+      if (!text && !(detail.attachments?.length)) {
+      setRunInProgress(false);
+      processingQueueRef.current = false;
+      activeRunRef.current = false;
+      return;
+    }
       setRunInProgress(true);
       if ((detail.attachments?.some(attachment => attachment.includes('data:image/')) ?? false) && !detail.supportsVision) {
         setRunInProgress(false);
+        processingQueueRef.current = false;
+        activeRunRef.current = false;
         toast('Selected model is not configured for image input.');
         return;
       }
@@ -471,6 +486,8 @@ export function Canvas() {
       const selectedProjectAtStart = detail.projectId ?? projectIdRef.current;
       if (!detail.threadId && (threadId !== threadIdRef.current || projectId !== selectedProjectAtStart)) {
         setRunInProgress(false);
+        processingQueueRef.current = false;
+        activeRunRef.current = false;
         return;
       }
       const targetProjectId = Object.hasOwn(detail, 'projectId') ? detail.projectId ?? null : projectId;
@@ -485,7 +502,13 @@ export function Canvas() {
           currentThreadId = thread.id;
           setThreads(prev => [thread, ...prev.filter(item => item.id !== thread.id)]);
           updateThreadId(thread.id);
-          } catch (error) { setRunInProgress(false); toast(`Could not create chat: ${String(error)}`); return; }
+          } catch (error) {
+            setRunInProgress(false);
+            processingQueueRef.current = false;
+            activeRunRef.current = false;
+            toast(`Could not create chat: ${String(error)}`);
+            return;
+          }
       }
       if (currentThreadId) compactedThreadsRef.current.delete(currentThreadId);
       const userMessage: Message = {id: `u-${Date.now()}`, role: 'user', text, status: 'queued', attachments: detail.attachments};
@@ -572,7 +595,7 @@ export function Canvas() {
           updateThreadId(next.threadId);
         }
         setRunInProgress(true);
-        setQueuedPrompts(previous => [{...next, id: `active:${next.id}`}, ...previous.filter(prompt => prompt.id !== next.id && prompt.id !== `active:${next.id}`)]);
+        setQueuedPrompts(previous => [markPromptActive(next), ...previous.filter(prompt => prompt.id !== next.id && prompt.id !== `active:${next.id}`)]);
         await runPromptRef.current(next);
         setRunInProgress(false);
         setQueuedPrompts(previous => previous.filter(prompt => prompt.id !== next.id && prompt.id !== `active:${next.id}`));
@@ -599,7 +622,7 @@ export function Canvas() {
       const item = {id: `${Date.now()}-${Math.random().toString(36).slice(2)}`, ...queued};
       const waitingBehindActive = activeRunRef.current || processingQueueRef.current;
       if (waitingBehindActive || queuedPromptsRef.current.length > 0) {
-        if (waitingBehindActive) setQueuedPrompts(previous => [...previous.filter(prompt => prompt.id !== `active:${item.id}`), {...item, id: `active:${item.id}`}]);
+        if (waitingBehindActive) setQueuedPrompts(previous => [...previous.filter(prompt => prompt.id !== `active:${item.id}`), markPromptActive(item)]);
         else setQueuedPrompts(previous => [...previous, item]);
         toast('Prompt queued for after the current run.');
         return;
@@ -628,9 +651,10 @@ export function Canvas() {
       setSelectedSkillNames(Array.isArray(detail?.names) ? detail.names.filter((name): name is string => typeof name === 'string') : []);
     };
     const startNewThread = () => {
-       setMessages([]);
-       setCachedInputTokens(null);
-       updateThreadId(null);
+        setMessages([]);
+        setCachedInputTokens(null);
+        updateThreadId(null);
+        window.dispatchEvent(new CustomEvent('openharness:thread-title-updated', {detail: {title: 'OpenHarness'}}));
     };
     const onNewChat = startNewThread;
     const onOpenThread = async (selectedThreadId: string) => {
@@ -639,6 +663,7 @@ export function Canvas() {
         if (!cancelled) {
           loadThreadMessages(thread);
           updateThreadId(thread.id);
+          window.dispatchEvent(new CustomEvent('openharness:select-project', {detail: {name: thread.title || 'OpenHarness'}}));
         }
       } catch (error) { toast(String(error)); }
     };
@@ -650,8 +675,8 @@ export function Canvas() {
         const names: unknown = JSON.parse(localStorage.getItem('openharness:global-skills') || '[]');
         setSelectedSkillNames(Array.isArray(names) ? names.filter((name): name is string => typeof name === 'string') : []);
       } catch { setSelectedSkillNames([]); }
-      setProjectName(project?.name ?? project?.title ?? '');
-      window.dispatchEvent(new CustomEvent('openharness:active-project', {detail: {id: nextProjectId, name: project?.name ?? project?.title ?? ''}}));
+          setProjectName(project?.name ?? project?.title ?? '');
+          window.dispatchEvent(new CustomEvent('openharness:active-project', {detail: {id: nextProjectId, name: project?.name ?? project?.title ?? ''}}));
       updateThreadId(null);
         setMessages([]);
        setCachedInputTokens(null);
@@ -994,11 +1019,18 @@ export function Canvas() {
             ))}
           </ul>
           {!threads.length && <p className="thread-empty">No chats saved yet.</p>}
-          <section className="session-context-card" aria-label="Session token context">
-            <span className="session-context-eyebrow">TOKEN CONTEXT</span>
-            <strong>{`${cachedInputTokens?.toLocaleString() ?? '—'} cached input tokens`}</strong>
+          <section className="session-context-card" aria-label="Session token context" aria-live="polite">
+            <div className="session-context-heading"><span className="session-context-eyebrow">TOKEN CONTEXT</span><span className="session-context-model">{(tokenLimits.context / 1000).toFixed(0)}K WINDOW</span></div>
+            <div className="session-context-values">
+              <div><strong>{estimatedContextTokens.toLocaleString()}</strong><span>estimated in context</span></div>
+              <div><strong>{cachedInputTokens?.toLocaleString() ?? '—'}</strong><span>cached input</span></div>
+            </div>
+            <div className={`session-context-meter${nearContextLimit ? ' near-limit' : ''}`} role="progressbar" aria-label="Estimated context usage" aria-valuemin={0} aria-valuemax={100} aria-valuenow={Math.round(contextPercent)}>
+              <span style={{width: `${contextPercent}%`}} />
+            </div>
+            <div className="session-context-meta"><span>{contextPercent.toFixed(1)}% estimated</span><span>{Math.max(0, tokenLimits.context - estimatedContextTokens).toLocaleString()} available</span></div>
             {compacting && <span className="session-context-detail">Compacting session…</span>}
-            <span className="session-context-detail">{projectId ? (threads.find(thread => thread.id === threadId)?.title || 'New thread') : 'Select a project to show context.'}</span>
+            <span className="session-context-detail">{activeThread?.title || (projectId ? 'New thread' : 'Select a project to show context.')}</span>
           </section>
         </aside>
       )}
@@ -1027,6 +1059,17 @@ export function Canvas() {
           ))}
         </section>
         {learningCandidates.length > 0 && <LearningProposalCard candidate={learningCandidates[0]} saving={learningBusy} onApprove={() => void reviewLearning('approve')} onDismiss={() => void reviewLearning('dismiss')} />}
+        {queuedPrompts.length > 0 && (
+          <section className="prompt-queue" aria-label="Queued prompts">
+            <header><strong>Queued prompts ({queuedPrompts.length})</strong><span>Run in order after the active task</span></header>
+            <ol>{queuedPrompts.map((item, index) => <li key={item.id}>
+              <span className="prompt-queue-index">{item.id.startsWith('active:') ? 'Now' : index + 1}</span>
+              <span className="prompt-queue-text">{item.text || 'Image or file attachment'}</span>
+              {item.attachments.length > 0 && <span className="prompt-queue-attachments">{item.attachments.length} attachment{item.attachments.length === 1 ? '' : 's'}</span>}
+              <button type="button" aria-label={`Remove queued prompt ${index + 1}`} onClick={() => setQueuedPrompts(previous => previous.filter(prompt => prompt.id !== item.id))}>Remove</button>
+            </li>)}</ol>
+          </section>
+        )}
         <div className="composer-wrap">
           <Composer running={runInProgress} onStop={stopGenerating} />
         </div>
@@ -1042,17 +1085,6 @@ export function Canvas() {
               </div>
             </div>
           </div>
-        )}
-        {queuedPrompts.length > 0 && (
-          <section className="prompt-queue" aria-label="Queued prompts">
-            <header><strong>Queued prompts ({queuedPrompts.length})</strong><span>Run in order after the active task</span></header>
-            <ol>{queuedPrompts.map((item, index) => <li key={item.id}>
-              <span className="prompt-queue-index">{item.id.startsWith('active:') ? 'Now' : index + 1}</span>
-              <span className="prompt-queue-text">{item.text || 'Image or file attachment'}</span>
-              {item.attachments.length > 0 && <span className="prompt-queue-attachments">{item.attachments.length} attachment{item.attachments.length === 1 ? '' : 's'}</span>}
-              <button type="button" aria-label={`Remove queued prompt ${index + 1}`} onClick={() => setQueuedPrompts(previous => previous.filter(prompt => prompt.id !== item.id))}>Remove</button>
-            </li>)}</ol>
-          </section>
         )}
         {activeTool === 'terminal' && (
           <section className="terminal-panel" aria-label="Terminal bottom panel" style={{height: `${terminalHeight}px`, right: '18px'}}>

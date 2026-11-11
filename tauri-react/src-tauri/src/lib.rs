@@ -1057,7 +1057,7 @@ struct ApprovalDecision {
     response: Option<String>,
 }
 
-const MAX_AGENT_REQUESTS: usize = 12;
+const MAX_AGENT_REQUESTS: usize = 64;
 
 fn agent_request_limit_reached(request_count: usize) -> bool {
     request_count >= MAX_AGENT_REQUESTS
@@ -1330,8 +1330,15 @@ async fn run_agent_loop(
     let mut request_count = 0usize;
     loop {
         if agent_request_limit_reached(request_count) {
-            log::warn!("event=agent_request_limit_reached requests={}", request_count);
-            return Err(format!("Agent stopped after {} model requests to prevent an unbounded tool loop", MAX_AGENT_REQUESTS));
+            log::warn!(
+                "event=agent_request_limit_reached requests={} limit={}",
+                request_count,
+                MAX_AGENT_REQUESTS
+            );
+            return Err(format!(
+                "Agent reached the {} model-request limit for this run. Split the task into a smaller follow-up prompt.",
+                MAX_AGENT_REQUESTS
+            ));
         }
         request_count += 1;
         let token_emitter = emitter.clone();
@@ -2379,8 +2386,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn agent_request_limit_bounds_tool_loops() {
-        assert!(!agent_request_limit_reached(0));
+    fn agent_request_limit_allows_long_tool_workflows_but_remains_bounded() {
+        assert_eq!(MAX_AGENT_REQUESTS, 64);
+        assert!(!agent_request_limit_reached(12));
         assert!(!agent_request_limit_reached(MAX_AGENT_REQUESTS - 1));
         assert!(agent_request_limit_reached(MAX_AGENT_REQUESTS));
         assert!(agent_request_limit_reached(MAX_AGENT_REQUESTS + 1));

@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { readQueuedPrompts, upsertStep, type QueuedPrompt } from '../src/components/stepLifecycle.ts';
+import { readQueuedPrompts, upsertStep, markPromptActive, estimateMessageTokens, type QueuedPrompt } from '../src/components/stepLifecycle.ts';
 import type { StepEventLike } from '../src/components/StepEvent.ts';
 import { cleanMessageText } from '../src/utils/cleanMessageText.ts';
 
@@ -21,6 +21,32 @@ test('restores queued prompts with attachments, model context and selected skill
   const storage = {getItem: () => JSON.stringify([prompt])};
 
   assert.deepEqual(readQueuedPrompts(storage, 'queue'), [prompt]);
+});
+
+test('message token estimate includes attachments and is empty-safe', () => {
+  assert.equal(estimateMessageTokens('', []), 0);
+  assert.equal(estimateMessageTokens('1234', []), 1);
+  assert.equal(estimateMessageTokens('1234', ['5678']), 3);
+});
+
+test('active prompt markers keep queued prompt data and are idempotent', () => {
+  const prompt: QueuedPrompt = {
+    id: 'prompt-1',
+    text: 'Continue the build',
+    attachments: [],
+    modelId: 'model',
+    provider: 'OpenRouter',
+    supportsVision: false,
+    modelContextTokens: 128_000,
+    modelOutputTokens: 4_096,
+    selectedSkills: [],
+  };
+
+  const active = markPromptActive(prompt);
+  assert.equal(active.id, 'active:prompt-1');
+  assert.equal(markPromptActive(active).id, active.id);
+  assert.equal(active.text, prompt.text);
+  assert.deepEqual(markPromptActive(active), active);
 });
 
 test('drops malformed queued prompt records without throwing', () => {

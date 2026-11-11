@@ -35,6 +35,16 @@ export function readQueuedPrompts(storage: Pick<Storage, 'getItem'>, key: string
   }
 }
 
+export function estimateMessageTokens(text: string, attachments: string[] = []): number {
+  const content = [text, ...attachments].join('\n');
+  return content.trim() ? Math.ceil(content.length / 4) : 0;
+}
+
+export function markPromptActive(prompt: QueuedPrompt): QueuedPrompt {
+  const baseId = prompt.id.replace(/^active:/, '');
+  return {...prompt, id: `active:${baseId}`};
+}
+
 export function upsertStep(steps: StepEventLike[], step: StepEventLike): StepEventLike[] {
   const index = steps.findIndex(item => item.id === step.id);
   if (index === -1) return [...steps, step];

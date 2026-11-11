@@ -10,6 +10,16 @@ export function TitleBar({onMinimize, onToggleMaximize, onClose, updateAvailable
   const [toolsOpen, setToolsOpen] = useState(false);
 
   useEffect(() => {
+    const updateProjectName = (event: Event) => {
+      const project = (event as CustomEvent<{name?: string}>).detail;
+      const projectElement = document.getElementById('breadcrumb-project');
+      if (projectElement) projectElement.textContent = project?.name?.trim() || 'OpenHarness';
+    };
+    window.addEventListener('openharness:select-project', updateProjectName);
+    return () => window.removeEventListener('openharness:select-project', updateProjectName);
+  }, []);
+
+  useEffect(() => {
     let unlisten: (() => void) | undefined;
     let mounted = true;
     if (isTauri()) {

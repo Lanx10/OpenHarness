@@ -187,8 +187,7 @@ export function Drawer() {
         {drawerCollapsed ? (
           <div className="drawer-collapsed-actions">
             <button type="button" className="collapsed-drawer-action" onClick={toggleDrawer} aria-label="Expand project sidebar" title="Expand project sidebar"><ChevronRightIcon width={15} height={15} aria-hidden="true" /></button>
-            <button type="button" className="collapsed-drawer-action collapsed-drawer-primary" onClick={() => window.dispatchEvent(new Event('openharness:new-chat'))} aria-label="New chat" title="New chat"><PlusIcon width={17} height={17} aria-hidden="true" /></button>
-            <button type="button" className="collapsed-drawer-action" onClick={() => window.dispatchEvent(new Event('openharness:new-project'))} aria-label="New project" title="New project"><FolderIcon width={16} height={16} aria-hidden="true" /></button>
+            <button type="button" className="collapsed-drawer-action collapsed-drawer-primary" onClick={() => window.dispatchEvent(new Event('openharness:new-chat'))} aria-label="New thread" title="New thread"><PlusIcon width={17} height={17} aria-hidden="true" /></button>
             <button type="button" className="collapsed-drawer-action" onClick={handleCollapsedSearchClick} aria-label="Search projects" title="Search projects"><MagnifyingGlassIcon width={16} height={16} aria-hidden="true" /></button>
           </div>
         ) : <>
@@ -221,11 +220,8 @@ export function Drawer() {
         </div>
 
         <div className="actions">
-          <button className="action-button new-chat-primary" id="new-chat" type="button" data-od-id="new-chat-button" onClick={() => window.dispatchEvent(new Event('openharness:new-chat'))}>
-            <PlusIcon width={14} height={14} aria-hidden="true" /> New chat
-          </button>
-          <button className="action-button" id="new-project" type="button" data-od-id="new-project-button" onClick={() => window.dispatchEvent(new Event('openharness:new-project'))}>
-            <FolderIcon width={14} height={14} aria-hidden="true" /> New project
+          <button className="action-button new-thread-primary" id="new-thread" type="button" data-od-id="new-thread-button" onClick={() => window.dispatchEvent(new Event('openharness:new-chat'))}>
+            <PlusIcon width={14} height={14} aria-hidden="true" /> New thread
           </button>
         </div>
 
