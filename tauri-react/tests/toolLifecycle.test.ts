@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { readQueuedPrompts, upsertStep, markPromptActive, estimateMessageTokens, type QueuedPrompt } from '../src/components/stepLifecycle.ts';
+import { readQueuedPrompts, upsertStep, markPromptActive, estimateMessageTokens, removeQueuedPrompt, nextQueuedPrompt, queuedPromptsForThread, type QueuedPrompt } from '../src/components/stepLifecycle.ts';
 import type { StepEventLike } from '../src/components/StepEvent.ts';
 import { cleanMessageText } from '../src/utils/cleanMessageText.ts';
 
@@ -21,6 +21,41 @@ test('restores queued prompts with attachments, model context and selected skill
   const storage = {getItem: () => JSON.stringify([prompt])};
 
   assert.deepEqual(readQueuedPrompts(storage, 'queue'), [prompt]);
+});
+
+test('queued prompts stay isolated to their originating thread', () => {
+  const prompt = (id: string, threadId: string, text: string): QueuedPrompt => ({
+    id,
+    text,
+    attachments: [],
+    modelId: 'model',
+    provider: 'OpenRouter',
+    supportsVision: false,
+    modelContextTokens: 128_000,
+    modelOutputTokens: 4_096,
+    projectId: 'project-1',
+    threadId,
+    selectedSkills: [],
+  });
+  const threadOne = prompt('one', 'thread-1', 'first thread');
+  const threadTwo = prompt('two', 'thread-2', 'second thread');
+
+  assert.deepEqual(queuedPromptsForThread([threadOne, threadTwo], 'thread-2'), [threadTwo]);
+  assert.deepEqual(queuedPromptsForThread([threadOne], null), []);
+});
+
+test('removing a queued prompt only removes its exact queue item', () => {
+  const first = {id: 'active:first', text: 'first'} as QueuedPrompt;
+  const second = {id: 'second', text: 'second'} as QueuedPrompt;
+  assert.deepEqual(removeQueuedPrompt([first, second], 'first'), [second]);
+  assert.deepEqual(removeQueuedPrompt([first, second], 'missing'), [first, second]);
+});
+
+test('queue drain skips already-active and missing entries', () => {
+  const active = {id: 'active:running', text: 'running'} as QueuedPrompt;
+  const pending = {id: 'pending', text: 'pending'} as QueuedPrompt;
+  assert.equal(nextQueuedPrompt([active, pending])?.id, 'pending');
+  assert.equal(nextQueuedPrompt([active]), undefined);
 });
 
 test('message token estimate includes attachments and is empty-safe', () => {

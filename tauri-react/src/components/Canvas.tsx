@@ -1,7 +1,7 @@
 import {useEffect, useRef, useState} from 'react';
 import { SafeMarkdown } from './SafeMarkdown';
 import { MessageCrumbs } from './MessageCrumbs';
-import { readQueuedPrompts, upsertStep, markPromptActive, estimateMessageTokens, type QueuedPrompt } from './stepLifecycle';
+import { readQueuedPrompts, upsertStep, markPromptActive, estimateMessageTokens, removeQueuedPrompt, nextQueuedPrompt, queuedPromptsForThread, type QueuedPrompt } from './stepLifecycle';
 import type { Message } from '../types/message';
 import { cleanMessageText } from '../utils/cleanMessageText';
 import {isTauri} from '@tauri-apps/api/core';
@@ -297,7 +297,23 @@ export function Canvas() {
   });
   const queuedPromptsRef = useRef(queuedPrompts);
   const processingQueueRef = useRef(false);
-  queuedPromptsRef.current = queuedPrompts;
+  const updateQueuedPrompts = (update: (prompts: QueuedPrompt[]) => QueuedPrompt[]) => {
+    const next = update(queuedPromptsRef.current);
+    queuedPromptsRef.current = next;
+    setQueuedPrompts(next);
+    try {
+      if (!next.length) localStorage.removeItem('openharness:queued-prompts');
+      else if (JSON.stringify(next).length <= 5_000_000) localStorage.setItem('openharness:queued-prompts', JSON.stringify(next));
+    } catch {}
+  };
+  const visibleQueuedPrompts = queuedPromptsForThread(queuedPrompts, threadId);
+  const setQueueForThread = (ownerThreadId: string | null, update: (prompts: QueuedPrompt[]) => QueuedPrompt[]) => {
+    updateQueuedPrompts(previous => {
+      const owned = queuedPromptsForThread(previous, ownerThreadId);
+      const otherThreads = previous.filter(prompt => prompt.threadId !== ownerThreadId);
+      return [...otherThreads, ...update(owned)];
+    });
+  };
   const [approval, setApproval] = useState<ApprovalRequestLike | null>(null);
   const [learningCandidates, setLearningCandidates] = useState<NonNullable<ChatThreadLike['learning_candidates']>>([]);
   const [learningBusy, setLearningBusy] = useState(false);
@@ -345,25 +361,16 @@ export function Canvas() {
   useEffect(() => { try { localStorage.setItem('openharness:browser-panel-width', String(browserPanelWidth)); } catch {} }, [browserPanelWidth]);
   useEffect(() => { try { localStorage.setItem('openharness:threads-width', String(threadsWidth)); } catch {} }, [threadsWidth]);
 
+
+
   useEffect(() => {
-    try {
-      const validIds = new Set(queuedPrompts.map(prompt => prompt.id));
-      const activeIds = new Set(queuedPrompts.filter(prompt => prompt.id.startsWith('active:')).map(prompt => prompt.id));
-      const abandoned = readQueuedPrompts(localStorage, 'openharness:queued-prompts')
-        .filter(prompt => !validIds.has(prompt.id) && !validIds.has(`active:${prompt.id}`) && !activeIds.has(prompt.id));
-      const active = queuedPrompts.find(prompt => prompt.id.startsWith('active:'));
-      const pending = queuedPrompts.filter(prompt => !prompt.id.startsWith('active:'));
-      const nextQueue = active ? [active, ...pending] : [...abandoned, ...pending];
-      if (!nextQueue.length) localStorage.removeItem('openharness:queued-prompts');
-      else {
-        const compact = JSON.stringify(nextQueue);
-        if (compact.length <= 5_000_000) localStorage.setItem('openharness:queued-prompts', compact);
-        else toast('Queue is too large to persist. Remove a large attachment to avoid losing it on restart.');
-      }
-    } catch {
-      toast('Could not persist queued prompts; they may be lost if the app closes.');
-    }
-  }, [queuedPrompts]);
+    const activePrompt = queuedPrompts.find(prompt => prompt.id.startsWith('active:'));
+    const owner = activePrompt?.threadId ?? threadId;
+    const owned = queuedPromptsForThread(queuedPrompts, owner);
+    if (!owned.length || processingQueueRef.current || activeRunRef.current || stopHandleRef.current) return;
+    const firstQueued = nextQueuedPrompt(owned);
+    if (firstQueued) queueRef.current(firstQueued.id);
+  }, [threadId, queuedPrompts]);
 
   const refreshWorkspaceGit = async (currentProjectId: string | null) => {
     if (!currentProjectId) {
@@ -575,9 +582,9 @@ export function Canvas() {
         }
       }
     };
-    const drainQueue = async (queueId: string) => {
+    const drainQueue = async (_queueId: string) => {
       if (processingQueueRef.current || activeRunRef.current || stopHandleRef.current) return;
-      const next = queuedPromptsRef.current.find(prompt => prompt.id.replace(/^active:/, '') === queueId);
+      const next = nextQueuedPrompt(queuedPromptsRef.current.filter(prompt => prompt.threadId === threadIdRef.current));
       if (!next) return;
       processingQueueRef.current = true;
       activeRunRef.current = true;
@@ -586,7 +593,7 @@ export function Canvas() {
           const thread = await apiGetThread(next.threadId).catch(() => null);
           if (!thread) {
             toast('Queued prompt skipped: its thread no longer exists.');
-            setQueuedPrompts(previous => previous.filter(prompt => prompt.id !== next.id && prompt.id !== `active:${next.id}`));
+            setQueueForThread(next.threadId ?? null, prompts => removeQueuedPrompt(prompts, next.id));
             activeRunRef.current = false;
             processingQueueRef.current = false;
             return;
@@ -595,13 +602,13 @@ export function Canvas() {
           updateThreadId(next.threadId);
         }
         setRunInProgress(true);
-        setQueuedPrompts(previous => [markPromptActive(next), ...previous.filter(prompt => prompt.id !== next.id && prompt.id !== `active:${next.id}`)]);
+        setQueueForThread(next.threadId ?? null, prompts => [markPromptActive(next), ...removeQueuedPrompt(prompts, next.id)]);
         await runPromptRef.current(next);
         setRunInProgress(false);
-        setQueuedPrompts(previous => previous.filter(prompt => prompt.id !== next.id && prompt.id !== `active:${next.id}`));
+        setQueueForThread(next.threadId ?? null, prompts => removeQueuedPrompt(prompts, next.id));
         activeRunRef.current = false;
         processingQueueRef.current = false;
-        const following = queuedPromptsRef.current.find(prompt => prompt.id !== next.id && prompt.id !== `active:${next.id}`);
+        const following = nextQueuedPrompt(queuedPromptsRef.current.filter(prompt => prompt.threadId === (next.threadId ?? threadIdRef.current)));
         if (following) queueRef.current(following.id);
       } catch (error) {
         toast(`Queue paused: ${String(error)}`);
@@ -613,7 +620,7 @@ export function Canvas() {
     queueRef.current = id => { void drainQueue(id); };
     runPromptRef.current = runPrompt;
     const resumeQueue = window.setTimeout(() => {
-      const firstQueued = queuedPromptsRef.current.find(prompt => !prompt.id.startsWith('active:'));
+      const firstQueued = nextQueuedPrompt(queuedPromptsRef.current.filter(prompt => prompt.threadId === threadIdRef.current));
       if (firstQueued) queueRef.current(firstQueued.id);
     }, 0);
     const onSend = (event: Event) => {
@@ -621,18 +628,18 @@ export function Canvas() {
       const queued = {...detail, projectId: detail.projectId ?? projectIdRef.current, threadId: threadIdRef.current};
       const item = {id: `${Date.now()}-${Math.random().toString(36).slice(2)}`, ...queued};
       const waitingBehindActive = activeRunRef.current || processingQueueRef.current;
-      if (waitingBehindActive || queuedPromptsRef.current.length > 0) {
-        if (waitingBehindActive) setQueuedPrompts(previous => [...previous.filter(prompt => prompt.id !== `active:${item.id}`), markPromptActive(item)]);
-        else setQueuedPrompts(previous => [...previous, item]);
+      const ownedQueue = queuedPromptsForThread(queuedPromptsRef.current, queued.threadId ?? null);
+      if (waitingBehindActive || ownedQueue.length > 0) {
+        setQueueForThread(queued.threadId ?? null, prompts => [...prompts, item]);
         toast('Prompt queued for after the current run.');
         return;
       }
       activeRunRef.current = true;
-      setQueuedPrompts(previous => [item, ...previous]);
+      setQueueForThread(queued.threadId ?? null, prompts => [item, ...prompts]);
       void runPrompt(queued).finally(() => {
         activeRunRef.current = false;
-        setQueuedPrompts(previous => previous.filter(prompt => prompt.id !== item.id));
-      const following = queuedPromptsRef.current.find(prompt => !prompt.id.startsWith('active:'));
+        setQueueForThread(queued.threadId ?? null, prompts => removeQueuedPrompt(prompts, item.id));
+      const following = nextQueuedPrompt(queuedPromptsRef.current.filter(prompt => prompt.threadId === (queued.threadId ?? null)));
       if (following) queueRef.current(following.id);
       });
     };
@@ -686,7 +693,9 @@ export function Canvas() {
     const onDeleteThread = async (selectedThreadId: string) => {
       if (!window.confirm('Delete this chat?')) return;
       try {
-        const remaining = await apiDeleteThread(selectedThreadId);
+            const remaining = await apiDeleteThread(selectedThreadId);
+            updateQueuedPrompts(previous => previous.filter(prompt => prompt.threadId !== selectedThreadId));
+
         const filtered = projectId ? remaining.filter(t => t.project_id === projectId) : remaining;
         setThreads(filtered);
                 if (threadIdRef.current === selectedThreadId) {
@@ -1059,14 +1068,14 @@ export function Canvas() {
           ))}
         </section>
         {learningCandidates.length > 0 && <LearningProposalCard candidate={learningCandidates[0]} saving={learningBusy} onApprove={() => void reviewLearning('approve')} onDismiss={() => void reviewLearning('dismiss')} />}
-        {queuedPrompts.length > 0 && (
+        {visibleQueuedPrompts.length > 0 && (
           <section className="prompt-queue" aria-label="Queued prompts">
-            <header><strong>Queued prompts ({queuedPrompts.length})</strong><span>Run in order after the active task</span></header>
-            <ol>{queuedPrompts.map((item, index) => <li key={item.id}>
+            <header><strong>Queued prompts ({visibleQueuedPrompts.length})</strong><span>Run in order after the active task</span></header>
+            <ol>{visibleQueuedPrompts.map((item, index) => <li key={item.id}>
               <span className="prompt-queue-index">{item.id.startsWith('active:') ? 'Now' : index + 1}</span>
               <span className="prompt-queue-text">{item.text || 'Image or file attachment'}</span>
               {item.attachments.length > 0 && <span className="prompt-queue-attachments">{item.attachments.length} attachment{item.attachments.length === 1 ? '' : 's'}</span>}
-              <button type="button" aria-label={`Remove queued prompt ${index + 1}`} onClick={() => setQueuedPrompts(previous => previous.filter(prompt => prompt.id !== item.id))}>Remove</button>
+              <button type="button" aria-label={`Remove queued prompt ${index + 1}`} onClick={() => updateQueuedPrompts(previous => removeQueuedPrompt(previous, item.id))}>Remove</button>
             </li>)}</ol>
           </section>
         )}

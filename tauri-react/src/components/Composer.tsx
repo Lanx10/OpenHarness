@@ -26,6 +26,9 @@ export function Composer({running = false, onStop}: {running?: boolean; onStop?:
   const [projectId, setProjectId] = useState<string | null>(null);
   const [attachments, setAttachments] = useState<AttachmentInfo[]>([]);
   const [approvalMode, setApprovalMode] = useState<'manual' | 'automatic'>(() => localStorage.getItem('openharness:approval-mode') === 'automatic' ? 'automatic' : 'manual');
+  const [approvalPickerOpen, setApprovalPickerOpen] = useState(false);
+  const approvalPickerRef = useRef<HTMLDivElement>(null);
+  const approvalTriggerRef = useRef<HTMLButtonElement>(null);
   const [selectedSkills, setSelectedSkills] = useState<string[]>(() => {
     try {
       const value: unknown = JSON.parse(localStorage.getItem('openharness:global-skills') || '[]');
@@ -84,6 +87,22 @@ export function Composer({running = false, onStop}: {running?: boolean; onStop?:
     document.addEventListener('keydown', closeOnEscape);
     return () => document.removeEventListener('keydown', closeOnEscape);
   }, [skillPickerOpen]);
+
+  useEffect(() => {
+    if (!approvalPickerOpen) return;
+    const closeOutside = (event: PointerEvent) => {
+      if (!approvalPickerRef.current?.contains(event.target as Node)) setApprovalPickerOpen(false);
+    };
+    const closeEscape = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') setApprovalPickerOpen(false);
+    };
+    document.addEventListener('pointerdown', closeOutside);
+    document.addEventListener('keydown', closeEscape);
+    return () => {
+      document.removeEventListener('pointerdown', closeOutside);
+      document.removeEventListener('keydown', closeEscape);
+    };
+  }, [approvalPickerOpen]);
 
   useEffect(() => {
     if (!modelPickerOpen) return;
@@ -276,7 +295,7 @@ export function Composer({running = false, onStop}: {running?: boolean; onStop?:
           }
         }}
       />
-      <div className="composer-hint" aria-label="Composer capabilities">Use <kbd>/</kbd> for skills <span aria-hidden="true">·</span> attach images or files <span aria-hidden="true">·</span> <kbd>Shift+Enter</kbd> for a new line</div>
+      <div className="composer-hint" aria-label="Composer capabilities"><span>Use <kbd>/</kbd> for skills</span><span>Attach images or files</span><span><kbd>Shift+Enter</kbd> for a new line</span></div>
       {skillPickerOpen && (
         <div id="composer-skill-menu" className="composer-skill-menu" role="listbox" aria-label="Available skills">
           {availableSkills.map(skill => (
@@ -294,29 +313,52 @@ export function Composer({running = false, onStop}: {running?: boolean; onStop?:
       )}
       <div className="composer-row">
         <input ref={fileInputRef} type="file" accept="image/*,.txt,.md,.json,.ts,.js,.rs,.py,.css,.html" multiple style={{display:'none'}} onChange={(e) => { void handleFiles(e.target.files); e.target.value = ''; }} />
-        <button className="model-button attach-button" type="button" aria-label="Attach files or images" title="Attach files or images" onClick={() => fileInputRef.current?.click()}>
+        <button className="model-button attach-button" type="button" aria-label="Attach files or images" title="Attach files or images" onClick={() => fileInputRef.current?.click()} disabled={running}>
           <PaperClipIcon width={16} height={16} aria-hidden="true" />
         </button>
-        {running && <span className="composer-running-label" role="status" aria-live="polite">Working <span aria-hidden="true">·</span> new prompts queue</span>}
-        <label className={`approval-mode-control approval-mode-${approvalMode}`} htmlFor="approval-mode">
-          <span className="approval-mode-icon" aria-hidden="true"><CheckIcon width={13} height={13} /></span>
-          <span className="approval-mode-copy"><span className="approval-mode-title">Tool approval</span><span className="approval-mode-status">{approvalMode === 'automatic' ? 'Automatic' : 'Ask each time'}</span></span>
-          <select id="approval-mode" aria-label="Tool approval mode" value={approvalMode} onChange={event => {
-            const value = event.target.value === 'automatic' ? 'automatic' : 'manual';
-            approvalModeRef.current = value;
-            setApprovalMode(value);
-            void apiUpdateApprovalMode(value).catch(error => {
-              approvalModeRef.current = value === 'automatic' ? 'manual' : 'automatic';
-              const fallback = approvalModeRef.current;
-              setApprovalMode(fallback);
-              toastError(`Could not save approval mode: ${String(error)}`);
-            });
-          }}>
-            <option value="manual">Ask each time</option>
-            <option value="automatic">Automatic</option>
-          </select>
-          <ChevronDownIcon className="approval-mode-chevron" width={12} height={12} aria-hidden="true" />
-        </label>
+        {running && <span className="composer-running-label" role="status" aria-live="polite">Working · new prompts queue</span>}
+        <div className="approval-picker" ref={approvalPickerRef}>
+          <button
+            className={`approval-mode-control approval-mode-${approvalMode}`}
+            type="button"
+            aria-label="Tool approval mode"
+            aria-haspopup="listbox"
+            ref={approvalTriggerRef}
+            aria-controls="approval-mode-menu"
+            aria-expanded={approvalPickerOpen}
+            onClick={() => setApprovalPickerOpen(open => !open)}
+          >
+            <span className="approval-mode-icon" aria-hidden="true"><CheckIcon width={13} height={13} /></span>
+            <span className="approval-mode-copy"><span className="approval-mode-title">Tool approval</span><span className="approval-mode-status">{approvalMode === 'automatic' ? 'Automatic' : 'Ask each time'}</span></span>
+            <ChevronDownIcon className="approval-mode-chevron" width={12} height={12} aria-hidden="true" />
+          </button>
+          {approvalPickerOpen && <div id="approval-mode-menu" className="approval-mode-menu" role="listbox" aria-label="Tool approval mode">
+            {(['manual', 'automatic'] as const).map(mode => (
+              <button
+                key={mode}
+                className={`approval-mode-option${approvalMode === mode ? ' selected' : ''}`}
+                type="button"
+                role="option"
+                aria-selected={approvalMode === mode}
+                onClick={() => {
+                  approvalModeRef.current = mode;
+                  setApprovalMode(mode);
+                  setApprovalPickerOpen(false);
+                  approvalTriggerRef.current?.focus();
+                  void apiUpdateApprovalMode(mode).catch(error => {
+                    const fallback = mode === 'automatic' ? 'manual' : 'automatic';
+                    approvalModeRef.current = fallback;
+                    setApprovalMode(fallback);
+                    toastError(`Could not save approval mode: ${String(error)}`);
+                  });
+                }}
+              >
+                <span className="approval-option-copy"><strong>{mode === 'automatic' ? 'Automatic' : 'Ask each time'}</strong><small>{mode === 'automatic' ? 'Run approved tools without pausing' : 'Review every tool before it runs'}</small></span>
+                {approvalMode === mode && <CheckIcon width={15} height={15} aria-hidden="true" />}
+              </button>
+            ))}
+          </div>}
+        </div>
         <span className="composer-spacer" />
         <div ref={pickerRef} className="model-wrap">
           <button
@@ -327,6 +369,8 @@ export function Composer({running = false, onStop}: {running?: boolean; onStop?:
             aria-haspopup="listbox"
             aria-controls="model-menu"
             aria-expanded={modelPickerOpen}
+            aria-busy={running}
+            disabled={running}
             onClick={() => setModelPickerOpen((open) => !open)}
           >
             <span className="model-provider-mark" aria-hidden="true">{selectedModel?.provider.slice(0, 1) ?? 'M'}</span>
@@ -344,6 +388,7 @@ export function Composer({running = false, onStop}: {running?: boolean; onStop?:
                   className={`model-option ${isChosen ? 'chosen' : ''}`}
                   role="option"
                   aria-selected={isChosen}
+                  disabled={running}
                   onClick={() => {
                     setSelectedModel(m);
                     setModelPickerOpen(false);
@@ -361,7 +406,7 @@ export function Composer({running = false, onStop}: {running?: boolean; onStop?:
         {running && <button className="send-button stop-generation" type="button" onClick={onStop} aria-label="Stop generation" title="Stop generation">
           <StopIcon width={14} aria-hidden="true" />
         </button>}
-        <button className="send-button" type="submit" aria-label="Send message" title="Send">
+        <button className="send-button" type="submit" aria-label="Send message" title="Send" disabled={!prompt.trim() && attachments.length === 0 || !selectedModel}>
           <ArrowUpIcon width={16} height={16} aria-hidden="true" />
         </button>
       </div>

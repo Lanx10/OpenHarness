@@ -35,6 +35,21 @@ export function readQueuedPrompts(storage: Pick<Storage, 'getItem'>, key: string
   }
 }
 
+export function queuedPromptsForThread(prompts: QueuedPrompt[], threadId: string | null): QueuedPrompt[] {
+  if (!threadId) return [];
+  return prompts.filter(prompt => prompt.threadId === threadId);
+}
+
+export function removeQueuedPrompt(prompts: QueuedPrompt[], id: string): QueuedPrompt[] {
+  const targetId = id.replace(/^active:/, '');
+  return prompts.filter(prompt => prompt.id.replace(/^active:/, '') !== targetId);
+}
+
+export function nextQueuedPrompt(prompts: QueuedPrompt[]): QueuedPrompt | undefined {
+  return prompts.find(prompt => !prompt.id.startsWith('active:'));
+}
+
+
 export function estimateMessageTokens(text: string, attachments: string[] = []): number {
   const content = [text, ...attachments].join('\n');
   return content.trim() ? Math.ceil(content.length / 4) : 0;
