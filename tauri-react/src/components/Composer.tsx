@@ -29,6 +29,7 @@ export function Composer({running = false, onStop}: {running?: boolean; onStop?:
   const [approvalPickerOpen, setApprovalPickerOpen] = useState(false);
   const approvalPickerRef = useRef<HTMLDivElement>(null);
   const approvalTriggerRef = useRef<HTMLButtonElement>(null);
+  const approvalOptionsRef = useRef<Array<HTMLButtonElement | null>>([]);
   const [selectedSkills, setSelectedSkills] = useState<string[]>(() => {
     try {
       const value: unknown = JSON.parse(localStorage.getItem('openharness:global-skills') || '[]');
@@ -89,12 +90,15 @@ export function Composer({running = false, onStop}: {running?: boolean; onStop?:
   }, [skillPickerOpen]);
 
   useEffect(() => {
-    if (!approvalPickerOpen) return;
+    if (approvalPickerOpen) approvalOptionsRef.current[approvalMode === 'automatic' ? 1 : 0]?.focus();
     const closeOutside = (event: PointerEvent) => {
       if (!approvalPickerRef.current?.contains(event.target as Node)) setApprovalPickerOpen(false);
     };
     const closeEscape = (event: KeyboardEvent) => {
-      if (event.key === 'Escape') setApprovalPickerOpen(false);
+      if (event.key === 'Escape') {
+        setApprovalPickerOpen(false);
+        approvalTriggerRef.current?.focus();
+      }
     };
     document.addEventListener('pointerdown', closeOutside);
     document.addEventListener('keydown', closeEscape);
@@ -102,7 +106,17 @@ export function Composer({running = false, onStop}: {running?: boolean; onStop?:
       document.removeEventListener('pointerdown', closeOutside);
       document.removeEventListener('keydown', closeEscape);
     };
-  }, [approvalPickerOpen]);
+  }, [approvalPickerOpen, approvalMode]);
+
+  const handleApprovalMenuKeyDown = (event: React.KeyboardEvent<HTMLDivElement>) => {
+    if (event.key !== 'ArrowDown' && event.key !== 'ArrowUp') return;
+    event.preventDefault();
+    const options = approvalOptionsRef.current.filter((option): option is HTMLButtonElement => Boolean(option));
+    const currentIndex = options.findIndex(option => option === document.activeElement);
+    const delta = event.key === 'ArrowDown' ? 1 : -1;
+    const nextIndex = Math.max(0, Math.min(options.length - 1, currentIndex + delta));
+    options[nextIndex]?.focus();
+  };
 
   useEffect(() => {
     if (!modelPickerOpen) return;
@@ -332,9 +346,10 @@ export function Composer({running = false, onStop}: {running?: boolean; onStop?:
             <span className="approval-mode-copy"><span className="approval-mode-title">Tool approval</span><span className="approval-mode-status">{approvalMode === 'automatic' ? 'Automatic' : 'Ask each time'}</span></span>
             <ChevronDownIcon className="approval-mode-chevron" width={12} height={12} aria-hidden="true" />
           </button>
-          {approvalPickerOpen && <div id="approval-mode-menu" className="approval-mode-menu" role="listbox" aria-label="Tool approval mode">
-            {(['manual', 'automatic'] as const).map(mode => (
+          {approvalPickerOpen && <div id="approval-mode-menu" className="approval-mode-menu" role="listbox" aria-label="Tool approval mode" onKeyDown={handleApprovalMenuKeyDown}>
+            {(['manual', 'automatic'] as const).map((mode, index) => (
               <button
+                ref={element => { approvalOptionsRef.current[index] = element; }}
                 key={mode}
                 className={`approval-mode-option${approvalMode === mode ? ' selected' : ''}`}
                 type="button"

@@ -1,7 +1,7 @@
 import {useEffect, useRef, useState} from 'react';
 import { SafeMarkdown } from './SafeMarkdown';
 import { MessageCrumbs } from './MessageCrumbs';
-import { readQueuedPrompts, upsertStep, markPromptActive, estimateMessageTokens, removeQueuedPrompt, nextQueuedPrompt, queuedPromptsForThread, type QueuedPrompt } from './stepLifecycle';
+import { readQueuedPrompts, upsertStep, markPromptActive, estimateMessageTokens, removeQueuedPrompt, nextQueuedPrompt, queuedPromptById, queuedPromptsForThread, persistQueuedPrompts, type QueuedPrompt } from './stepLifecycle';
 import type { Message } from '../types/message';
 import { cleanMessageText } from '../utils/cleanMessageText';
 import {isTauri} from '@tauri-apps/api/core';
@@ -301,10 +301,9 @@ export function Canvas() {
     const next = update(queuedPromptsRef.current);
     queuedPromptsRef.current = next;
     setQueuedPrompts(next);
-    try {
-      if (!next.length) localStorage.removeItem('openharness:queued-prompts');
-      else if (JSON.stringify(next).length <= 5_000_000) localStorage.setItem('openharness:queued-prompts', JSON.stringify(next));
-    } catch {}
+    if (!persistQueuedPrompts(localStorage, 'openharness:queued-prompts', next)) {
+      toast('Queue is too large to save. Remove a large attachment before it is lost.');
+    }
   };
   const visibleQueuedPrompts = queuedPromptsForThread(queuedPrompts, threadId);
   const setQueueForThread = (ownerThreadId: string | null, update: (prompts: QueuedPrompt[]) => QueuedPrompt[]) => {
@@ -582,9 +581,12 @@ export function Canvas() {
         }
       }
     };
-    const drainQueue = async (_queueId: string) => {
+    const drainQueue = async (queueId: string) => {
       if (processingQueueRef.current || activeRunRef.current || stopHandleRef.current) return;
-      const next = nextQueuedPrompt(queuedPromptsRef.current.filter(prompt => prompt.threadId === threadIdRef.current));
+      const requested = queuedPromptById(queuedPromptsRef.current, queueId);
+      const activePrompt = queuedPromptsRef.current.find(prompt => prompt.id.startsWith('active:'));
+      const owner = activePrompt?.threadId ?? requested?.threadId ?? threadIdRef.current;
+      const next = nextQueuedPrompt(queuedPromptsRef.current.filter(prompt => prompt.threadId === owner));
       if (!next) return;
       processingQueueRef.current = true;
       activeRunRef.current = true;
@@ -608,19 +610,22 @@ export function Canvas() {
         setQueueForThread(next.threadId ?? null, prompts => removeQueuedPrompt(prompts, next.id));
         activeRunRef.current = false;
         processingQueueRef.current = false;
-        const following = nextQueuedPrompt(queuedPromptsRef.current.filter(prompt => prompt.threadId === (next.threadId ?? threadIdRef.current)));
+        setRunInProgress(false);
+        const following = nextQueuedPrompt(queuedPromptsRef.current.filter(prompt => prompt.threadId === owner && !prompt.id.startsWith('active:')));
         if (following) queueRef.current(following.id);
       } catch (error) {
         toast(`Queue paused: ${String(error)}`);
-        setRunInProgress(false);
         activeRunRef.current = false;
         processingQueueRef.current = false;
+        setRunInProgress(false);
       }
     };
     queueRef.current = id => { void drainQueue(id); };
     runPromptRef.current = runPrompt;
     const resumeQueue = window.setTimeout(() => {
-      const firstQueued = nextQueuedPrompt(queuedPromptsRef.current.filter(prompt => prompt.threadId === threadIdRef.current));
+      const activePrompt = queuedPromptsRef.current.find(prompt => prompt.id.startsWith('active:'));
+      const owner = activePrompt?.threadId ?? threadIdRef.current;
+      const firstQueued = nextQueuedPrompt(queuedPromptsRef.current.filter(prompt => prompt.threadId === owner));
       if (firstQueued) queueRef.current(firstQueued.id);
     }, 0);
     const onSend = (event: Event) => {

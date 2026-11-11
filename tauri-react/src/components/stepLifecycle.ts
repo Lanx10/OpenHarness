@@ -45,8 +45,37 @@ export function removeQueuedPrompt(prompts: QueuedPrompt[], id: string): QueuedP
   return prompts.filter(prompt => prompt.id.replace(/^active:/, '') !== targetId);
 }
 
+export function queuedPromptById(prompts: QueuedPrompt[], id: string): QueuedPrompt | undefined {
+  const targetId = id.replace(/^active:/, '');
+  return prompts.find(prompt => prompt.id.replace(/^active:/, '') === targetId);
+}
+
 export function nextQueuedPrompt(prompts: QueuedPrompt[]): QueuedPrompt | undefined {
   return prompts.find(prompt => !prompt.id.startsWith('active:'));
+}
+
+export function persistQueuedPrompts(
+  storage: Pick<Storage, 'setItem' | 'removeItem'>,
+  key: string,
+  prompts: QueuedPrompt[],
+  maxBytes = 5_000_000,
+): boolean {
+  if (!prompts.length) {
+    storage.removeItem(key);
+    return true;
+  }
+  const serialized = JSON.stringify(prompts);
+  if (serialized.length > maxBytes) {
+    storage.removeItem(key);
+    return false;
+  }
+  try {
+    storage.setItem(key, serialized);
+    return true;
+  } catch {
+    storage.removeItem(key);
+    return false;
+  }
 }
 
 

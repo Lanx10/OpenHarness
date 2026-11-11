@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { readQueuedPrompts, upsertStep, markPromptActive, estimateMessageTokens, removeQueuedPrompt, nextQueuedPrompt, queuedPromptsForThread, type QueuedPrompt } from '../src/components/stepLifecycle.ts';
+import { readQueuedPrompts, upsertStep, markPromptActive, estimateMessageTokens, removeQueuedPrompt, nextQueuedPrompt, queuedPromptById, queuedPromptsForThread, persistQueuedPrompts, type QueuedPrompt } from '../src/components/stepLifecycle.ts';
 import type { StepEventLike } from '../src/components/StepEvent.ts';
 import { cleanMessageText } from '../src/utils/cleanMessageText.ts';
 
@@ -56,6 +56,25 @@ test('queue drain skips already-active and missing entries', () => {
   const pending = {id: 'pending', text: 'pending'} as QueuedPrompt;
   assert.equal(nextQueuedPrompt([active, pending])?.id, 'pending');
   assert.equal(nextQueuedPrompt([active]), undefined);
+  assert.equal(nextQueuedPrompt([active, {...pending, threadId: 'thread-b'}].filter(prompt => prompt.threadId === 'thread-a')), undefined);
+  assert.equal(nextQueuedPrompt([{...active, threadId: 'thread-a'}, {...pending, threadId: 'thread-a'}])?.id, pending.id);
+});
+
+test('queued prompt lookup resolves active marker to its owner prompt', () => {
+  const prompt = {id: 'active:prompt-1', text: 'continue'} as QueuedPrompt;
+  assert.equal(queuedPromptById([prompt], 'prompt-1')?.id, prompt.id);
+});
+
+test('persisting an oversized queue clears the stale stored queue', () => {
+  const prompt = {id: 'large', text: 'x'} as QueuedPrompt;
+  let stored: string | null = JSON.stringify([prompt]);
+  const storage = {
+    setItem: (_key: string, value: string) => { stored = value; },
+    removeItem: () => { stored = null; },
+  };
+
+  assert.equal(persistQueuedPrompts(storage, 'queue', [prompt], 2), false);
+  assert.equal(stored, null);
 });
 
 test('message token estimate includes attachments and is empty-safe', () => {
