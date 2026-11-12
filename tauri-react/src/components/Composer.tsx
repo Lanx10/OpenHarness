@@ -66,7 +66,12 @@ export function Composer({running = false, onStop}: {running?: boolean; onStop?:
     }
   };
 
-  useEffect(() => { void loadModels(); void apiListSkills().then(setAvailableSkills).catch(() => setAvailableSkills([])); }, []);
+  useEffect(() => { void loadModels(); }, []);
+  useEffect(() => {
+    let disposed = false;
+    void apiListSkills(projectId).then(skills => { if (!disposed) setAvailableSkills(skills); }).catch(() => { if (!disposed) setAvailableSkills([]); });
+    return () => { disposed = true; };
+  }, [projectId]);
   useEffect(() => {
     const refresh = () => { void loadModels(); };
     window.addEventListener('openharness:provider-saved', refresh);
@@ -151,7 +156,6 @@ export function Composer({running = false, onStop}: {running?: boolean; onStop?:
         void handleFiles(transfer.files);
       }
     };
-    void apiListSkills().then(skills => { if (!disposed) setAvailableSkills(skills); }).catch(() => {});
     void apiGetApprovalMode().then(mode => {
       approvalModeRef.current = mode;
       if (!disposed) setApprovalMode(mode);
@@ -186,6 +190,10 @@ export function Composer({running = false, onStop}: {running?: boolean; onStop?:
     const next: AttachmentInfo[] = [];
     for (const file of Array.from(files)) {
       const isImg = file.type.startsWith('image/') || /\.(png|jpe?g|webp|gif|svg)$/i.test(file.name);
+      if (isImg && !['image/png', 'image/jpeg', 'image/webp', 'image/gif'].includes(file.type)) {
+        toastError(`Unsupported image: ${file.name}. Use PNG, JPEG, WebP, or GIF (SVG is not supported).`);
+        continue;
+      }
       const maxSize = isImg ? 4 * 1024 * 1024 : 256 * 1024;
       if (file.size > maxSize) {
         toastError(`Attachment too large: ${file.name} (max ${isImg ? '4MB' : '256KB'})`);

@@ -131,3 +131,31 @@ OpenHarness has a functional shell, projects, provider storage, and a tauri upda
 5. Test release log output destination and rotation on a packaged Windows build.
 6. Add mock/provider tests for prompt completeness, duplicate exclusion, prior-turn image reconstruction, cancellation, and request-cap termination.
 7. Reconcile the older completion-guide summary above with current implementation: chat persistence, streaming, multi-turn context, attachments, and project editing now exist; this audit update records the remaining runtime accounting and observability gaps.
+
+## Sandbox Hardening Audit — 2026-11-12
+
+### Findings and changes
+
+- **Absolute path interpretation (fixed):** `Sandbox::resolve_path` previously stripped leading separators, so an absolute-looking path could be reinterpreted as workspace-relative. It now rejects slash-rooted, backslash-rooted, drive-prefixed paths, traversal components, ADS colons, trailing dots/spaces, and Windows device names (device names on Windows). Backslashes normalize as separators. Tests cover representative drive, UNC, POSIX, ADS, reserved-name, and valid-relative paths.
+- **Symlink escape coverage (improved):** Unix tests verify reads/writes through an out-of-root symlink are rejected and the outside file remains unchanged. Directory discovery rejects symlinks and canonicalized paths outside root.
+- **Unbounded subprocess output (fixed at app-level):** stdout/stderr retain at most 500 KB each; crossing either cap terminates and reaps the command instead of continuing to drain an unbounded stream. Timeout paths kill, wait, and join readers. Infinite-output regression test passes. Command execution still runs shell commands with the current user’s OS privileges and is not OS-sandboxed.
+- **Error privacy:** subprocess spawn errors no longer echo the command string.
+
+### Verification evidence
+
+- `cargo fmt --check`: passed from `tauri-react/src-tauri`.
+- `cargo check --locked`: passed.
+- `cargo test --locked --lib`: 58 passed, 0 failed, 1 ignored (manual benchmark).
+- Targeted absolute-path, symlink, output-cap, and infinite-output tests passed. Unix symlink behavior exercised; Windows reparse-point behavior not exercised.
+- `cargo build --release --locked`: passed.
+- `cargo clippy --all-targets --all-features --locked -- -D warnings`: still fails on 5 `clippy::too_many_arguments` findings in `client.rs` and `lib.rs`. Four safe `collapsible_if` findings were simplified; remaining API argument-count warnings need a scoped API redesign to avoid changing frontend contracts.
+- `cargo audit`: unavailable; cargo-audit is not installed.
+- `npm test -- --run`: 26 passed; `npx tsc --noEmit` and `npm run build`: passed.
+- `git diff --check`: passed. Changes were made alongside existing uncommitted work; no pre-existing edits were reverted.
+
+### Residual security limitations
+
+- Sandbox checks use path canonicalization before later filesystem operations; this leaves a symlink/rename TOCTOU window. Secure handle-relative operations are still required for adversarial concurrent writers.
+- Shell subprocesses have full OS-user access, network access, and inherited environment; workspace current-directory does not isolate them. Approval prompts are not OS sandboxing.
+- Windows junction/reparse-point behavior and release-package runtime behavior were not exercised in this environment.
+- Full end-to-end provider/model behavior, tokenizer accuracy, comprehensive durable audit trail, and startup readiness validation remain unverified/incomplete.

@@ -40,11 +40,19 @@ pub struct ToolDefinition {
     pub parameters: serde_json::Value,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SkillOrigin {
+    Project,
+    Global,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SkillInfo {
     pub name: String,
     pub description: String,
     pub path: String,
+    pub origin: SkillOrigin,
     pub purpose: String,
     pub activation: String,
     pub resources: Vec<String>,
@@ -144,6 +152,12 @@ pub struct Sandbox {
     root: PathBuf,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProjectInstruction {
+    pub path: PathBuf,
+    pub content: String,
+}
+
 static FILE_EDIT_LOCKS: std::sync::OnceLock<
     std::sync::Mutex<std::collections::HashMap<PathBuf, std::sync::Arc<std::sync::Mutex<()>>>>,
 > = std::sync::OnceLock::new();
@@ -171,6 +185,80 @@ impl Sandbox {
         Ok(Self {
             root: canonical_root,
         })
+    }
+
+    /// Load AGENTS.md files from the project root down to the task directory.
+    /// Ancestors are applied first; nearer files therefore take precedence.
+    pub fn load_project_instructions(
+        &self,
+        working_dir: &Path,
+    ) -> Result<Vec<ProjectInstruction>, String> {
+        let requested = if working_dir.is_absolute() {
+            working_dir.to_path_buf()
+        } else {
+            self.root.join(working_dir)
+        };
+        let task_dir = requested
+            .canonicalize()
+            .map_err(|error| format!("Invalid instruction working directory: {error}"))?;
+        if !task_dir.starts_with(&self.root) || !task_dir.is_dir() {
+            return Err("Security error: Instruction working directory is outside project root or not a directory".into());
+        }
+        let mut directories = task_dir
+            .ancestors()
+            .take_while(|directory| directory.starts_with(&self.root))
+            .collect::<Vec<_>>();
+        directories.reverse();
+        let mut instructions = Vec::new();
+        for directory in directories {
+            let candidate = directory.join("AGENTS.md");
+            let metadata = match fs::symlink_metadata(&candidate) {
+                Ok(metadata) => metadata,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => {
+                    return Err(format!(
+                        "Could not inspect instruction file '{}': {error}",
+                        candidate.display()
+                    ));
+                }
+            };
+            if metadata.file_type().is_symlink() || !metadata.is_file() {
+                return Err(format!(
+                    "Security error: Instruction file '{}' must be a regular non-symlink file",
+                    candidate.display()
+                ));
+            }
+            if metadata.len() as usize > MAX_READ_BYTES {
+                return Err(format!(
+                    "Instruction file '{}' exceeds {} bytes",
+                    candidate.display(),
+                    MAX_READ_BYTES
+                ));
+            }
+            let canonical = candidate.canonicalize().map_err(|error| {
+                format!(
+                    "Could not resolve instruction file '{}': {error}",
+                    candidate.display()
+                )
+            })?;
+            if !canonical.starts_with(&self.root) || canonical.parent() != Some(directory) {
+                return Err(format!(
+                    "Security error: Instruction file '{}' escapes its directory or project root",
+                    candidate.display()
+                ));
+            }
+            let content = fs::read_to_string(&canonical).map_err(|error| {
+                format!(
+                    "Could not read instruction file '{}': {error}",
+                    canonical.display()
+                )
+            })?;
+            instructions.push(ProjectInstruction {
+                path: canonical,
+                content,
+            });
+        }
+        Ok(instructions)
     }
 
     pub fn resolve_path(&self, rel_path: &str) -> Result<PathBuf, String> {
@@ -1078,11 +1166,61 @@ impl ToolDispatcher {
         Ok(relative)
     }
 
+    #[cfg(test)]
     pub fn list_skills(root: &Path) -> Result<Vec<SkillInfo>, String> {
-        Self::list_skills_inner(root, true)
+        Self::list_skills_inner(root, true, SkillOrigin::Global)
     }
 
-    fn list_skills_inner(root: &Path, require_metadata: bool) -> Result<Vec<SkillInfo>, String> {
+    pub fn list_skills_from_roots(
+        project_root: Option<&Path>,
+        global_root: Option<&Path>,
+    ) -> Result<Vec<SkillInfo>, String> {
+        let mut skills = Vec::new();
+        for (root, origin) in [
+            (project_root, SkillOrigin::Project),
+            (global_root, SkillOrigin::Global),
+        ] {
+            if let Some(root) = root {
+                match Self::list_skills_inner(root, true, origin) {
+                    Ok(found) => skills.extend(found),
+                    Err(error) => log::warn!(
+                        "event=skill_discovery_failed origin={:?} error={}",
+                        origin,
+                        error
+                    ),
+                }
+            }
+        }
+        skills.sort_by_key(|skill| {
+            (
+                skill.name.to_lowercase(),
+                skill.origin != SkillOrigin::Project,
+                skill.path.clone(),
+            )
+        });
+        let mut selected = Vec::new();
+        for skill in skills {
+            if selected
+                .iter()
+                .any(|existing: &SkillInfo| existing.name.eq_ignore_ascii_case(&skill.name))
+            {
+                log::warn!(
+                    "event=skill_duplicate_ignored name={} origin={:?}",
+                    skill.name,
+                    skill.origin
+                );
+            } else {
+                selected.push(skill);
+            }
+        }
+        Ok(selected)
+    }
+
+    fn list_skills_inner(
+        root: &Path,
+        require_metadata: bool,
+        origin: SkillOrigin,
+    ) -> Result<Vec<SkillInfo>, String> {
         let sandbox = Sandbox::new(root.to_path_buf())?;
         let mut skills = Vec::new();
         let mut scanned_entries = 0;
@@ -1105,6 +1243,13 @@ impl ToolDispatcher {
                     ));
                 }
                 let name = entry.file_name().to_string_lossy().to_string();
+                if !Self::safe_skill_name(&name) {
+                    log::warn!(
+                        "event=skill_discovery_skipped reason=invalid_name origin={:?}",
+                        origin
+                    );
+                    continue;
+                }
                 match fs::symlink_metadata(entry.path()) {
                     Ok(metadata)
                         if metadata.is_dir()
@@ -1121,7 +1266,23 @@ impl ToolDispatcher {
                     Ok(metadata) if metadata.is_file() && !metadata.file_type().is_symlink() => {
                         metadata
                     }
-                    _ => continue,
+                    Ok(_) => {
+                        log::warn!(
+                            "event=skill_discovery_skipped name={} origin={:?} reason=missing_or_nonregular_skill_md",
+                            name,
+                            origin
+                        );
+                        continue;
+                    }
+                    Err(error) => {
+                        log::warn!(
+                            "event=skill_discovery_skipped name={} origin={:?} reason=skill_md_unavailable error={}",
+                            name,
+                            origin,
+                            error
+                        );
+                        continue;
+                    }
                 };
                 let resolved_skill_path = match sandbox.resolve_path(&skill_path) {
                     Ok(path) if path == unresolved_skill_path => path,
@@ -1139,7 +1300,15 @@ impl ToolDispatcher {
                 }
                 let content = match fs::read_to_string(&resolved_skill_path) {
                     Ok(content) => content,
-                    Err(_) => continue,
+                    Err(error) => {
+                        log::warn!(
+                            "event=skill_discovery_skipped name={} origin={:?} reason=skill_md_unreadable error={}",
+                            name,
+                            origin,
+                            error
+                        );
+                        continue;
+                    }
                 };
                 let (metadata, body) = Self::parse_skill_frontmatter(&content);
                 let description = metadata.get("description").cloned().unwrap_or_default();
@@ -1149,11 +1318,19 @@ impl ToolDispatcher {
                 if require_metadata && !available {
                     continue;
                 }
-                let resources = Self::skill_resources(&entry.path(), &sandbox.root);
+                let resources = Self::skill_resources(&entry.path());
+                log::info!(
+                    "event=skill_discovered name={} origin={:?} path={} resources={}",
+                    name,
+                    origin,
+                    skill_path,
+                    resources.len()
+                );
                 skills.push(SkillInfo {
                     name,
                     description,
                     path: skill_path,
+                    origin,
                     purpose: metadata
                         .get("purpose")
                         .cloned()
@@ -1164,7 +1341,18 @@ impl ToolDispatcher {
                 });
             }
         }
-        skills.sort_by_key(|skill| skill.name.to_lowercase());
+        log::info!(
+            "event=skill_catalog_discovered origin={:?} count={}",
+            origin,
+            skills.len()
+        );
+        skills.sort_by_key(|skill| {
+            (
+                skill.name.to_lowercase(),
+                skill.origin != SkillOrigin::Project,
+                skill.path.clone(),
+            )
+        });
         skills.dedup_by(|left, right| left.name.eq_ignore_ascii_case(&right.name));
         Ok(skills)
     }
@@ -1177,14 +1365,35 @@ impl ToolDispatcher {
                 .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
     }
 
-    fn skill_resources(directory: &Path, root: &Path) -> Vec<(String, String)> {
-        fn walk(directory: &Path, root: &Path, prefix: &str, output: &mut Vec<(String, String)>) {
-            for entry in fs::read_dir(directory)
-                .ok()
-                .into_iter()
-                .flatten()
-                .filter_map(Result::ok)
-            {
+    fn skill_resources(directory: &Path) -> Vec<(String, String)> {
+        let Ok(skill_root) = directory.canonicalize() else {
+            return Vec::new();
+        };
+        let mut pending = vec![(directory.to_path_buf(), String::new())];
+        let mut resources = Vec::new();
+        let mut scanned = 0usize;
+        while let Some((current, prefix)) = pending.pop() {
+            let entries = match fs::read_dir(&current) {
+                Ok(entries) => entries,
+                Err(error) => {
+                    log::warn!(
+                        "event=skill_resource_discovery_failed path={} error={}",
+                        current.display(),
+                        error
+                    );
+                    continue;
+                }
+            };
+            for entry in entries.filter_map(Result::ok) {
+                scanned += 1;
+                if scanned > MAX_SKILL_SCAN_ENTRIES {
+                    log::warn!(
+                        "event=skill_resource_discovery_truncated path={} limit={}",
+                        skill_root.display(),
+                        MAX_SKILL_SCAN_ENTRIES
+                    );
+                    return resources;
+                }
                 let path = entry.path();
                 let name = entry.file_name().to_string_lossy().to_string();
                 let relative = if prefix.is_empty() {
@@ -1196,23 +1405,26 @@ impl ToolDispatcher {
                     Ok(metadata) if metadata.file_type().is_symlink() => {}
                     Ok(metadata)
                         if metadata.is_dir()
-                            && path.canonicalize().is_ok_and(|path| path.starts_with(root)) =>
+                            && path
+                                .canonicalize()
+                                .is_ok_and(|resolved| resolved.starts_with(&skill_root)) =>
                     {
-                        walk(&path, root, &relative, output)
+                        pending.push((path, relative))
                     }
                     Ok(metadata)
                         if metadata.is_file()
                             && name != "SKILL.md"
-                            && path.canonicalize().is_ok_and(|path| path.starts_with(root)) =>
+                            && path
+                                .canonicalize()
+                                .is_ok_and(|resolved| resolved.starts_with(&skill_root)) =>
                     {
-                        output.push((relative.clone(), relative))
+                        resources.push((relative.clone(), relative))
                     }
                     _ => {}
                 }
             }
         }
-        let mut resources = Vec::new();
-        walk(directory, root, "", &mut resources);
+        resources.sort_by(|left, right| left.0.cmp(&right.0));
         resources
     }
 
@@ -1239,8 +1451,9 @@ impl ToolDispatcher {
     const MAX_SKILL_INSTRUCTION_BYTES: usize = 100_000;
     const MAX_SKILL_RESOURCE_BYTES: usize = 100_000;
 
-    fn skill_activation(
-        root: &Path,
+    fn skill_activation_from_roots(
+        project_root: Option<&Path>,
+        global_root: Option<&Path>,
         name: &str,
         resources: &[String],
     ) -> Result<(String, Vec<(String, String)>), String> {
@@ -1249,26 +1462,69 @@ impl ToolDispatcher {
                 "Skill name must be 1-48 lowercase ASCII letters, digits, or hyphens".into(),
             );
         }
-        let skill = Self::list_skills_inner(root, false)?
+        let skill = Self::list_skills_from_roots(project_root, global_root)?
             .into_iter()
             .find(|skill| skill.name == name && skill.available)
             .ok_or_else(|| format!("Skill is unavailable or unknown: {}", name))?;
-        let mut instructions = Self::load_skills(root, &[name.to_string()])?
-            .into_iter()
-            .next()
-            .map(|(_, content)| content)
-            .ok_or_else(|| format!("Skill instructions could not be loaded: {}", name))?;
+        let root = match skill.origin {
+            SkillOrigin::Project => project_root
+                .ok_or_else(|| format!("Project skill has no project root: {}", name))?,
+            SkillOrigin::Global => {
+                global_root.ok_or_else(|| format!("Global skill has no global root: {}", name))?
+            }
+        };
+        let sandbox = Sandbox::new(root.to_path_buf())?;
+        let instruction_path = sandbox.resolve_path(&skill.path)?;
+        let metadata = fs::symlink_metadata(&instruction_path)
+            .map_err(|error| format!("Could not inspect skill {}: {}", name, error))?;
+        if !metadata.is_file()
+            || metadata.file_type().is_symlink()
+            || metadata.len() as usize > MAX_SKILL_FILE_BYTES
+        {
+            return Err(format!(
+                "Skill {} is not a regular file within the {} byte limit",
+                name, MAX_SKILL_FILE_BYTES
+            ));
+        }
+        log::info!(
+            "event=skill_selected name={} origin={:?} path={}",
+            name,
+            skill.origin,
+            skill.path
+        );
+        let instruction_file = fs::File::open(&instruction_path).map_err(|error| {
+            log::warn!("event=skill_activation_failed name={} origin={:?} reason=instruction_open error={}", name, skill.origin, error);
+            format!("Could not load skill {}: {}", name, error)
+        })?;
+        if !instruction_file
+            .metadata()
+            .map_err(|error| error.to_string())?
+            .is_file()
+        {
+            return Err(format!("Skill {} is not a regular file", name));
+        }
+        let mut instructions = String::new();
+        instruction_file.take((MAX_SKILL_FILE_BYTES + 1) as u64).read_to_string(&mut instructions)
+            .map_err(|error| {
+                log::warn!("event=skill_activation_failed name={} origin={:?} reason=instruction_read error={}", name, skill.origin, error);
+                format!("Could not load skill {}: {}", name, error)
+            })?;
         if instructions.len() > Self::MAX_SKILL_INSTRUCTION_BYTES {
-            instructions.truncate(Self::MAX_SKILL_INSTRUCTION_BYTES);
+            let boundary = instructions
+                .char_indices()
+                .map(|(index, _)| index)
+                .take_while(|index| *index <= Self::MAX_SKILL_INSTRUCTION_BYTES)
+                .last()
+                .unwrap_or(0);
+            instructions.truncate(boundary);
             instructions.push_str("\n[truncated]");
         }
-        let sandbox = Sandbox::new(root.to_path_buf())?;
         let skill_dir = sandbox
             .resolve_path(&skill.path)?
             .parent()
             .ok_or("Invalid skill path")?
             .to_path_buf();
-        let available_resources = Self::skill_resources(&skill_dir, &sandbox.root);
+        let available_resources = Self::skill_resources(&skill_dir);
         let mut loaded = Vec::new();
         for resource in resources {
             if !Self::safe_skill_resource(resource)
@@ -1276,12 +1532,65 @@ impl ToolDispatcher {
             {
                 return Err(format!("Skill resource is unavailable: {}", resource));
             }
-            let content = sandbox
-                .read_file(
-                    &format!("{}/{}", skill.path.trim_end_matches("SKILL.md"), resource),
-                    None,
-                    None,
-                )
+            let resource_path = format!("{}/{}", skill.path.trim_end_matches("SKILL.md"), resource);
+            let resolved_resource = sandbox.resolve_path(&resource_path)?;
+            let canonical_resource = resolved_resource.canonicalize().map_err(|error| {
+                format!("Could not resolve skill resource {}: {}", resource, error)
+            })?;
+            if !canonical_resource.starts_with(&skill_dir) {
+                return Err(format!(
+                    "Skill resource escapes its skill directory: {}",
+                    resource
+                ));
+            }
+            let resource_metadata = fs::symlink_metadata(&resolved_resource).map_err(|error| {
+                format!("Could not inspect skill resource {}: {}", resource, error)
+            })?;
+            if !resource_metadata.is_file() || resource_metadata.file_type().is_symlink() {
+                return Err(format!(
+                    "Skill resource is not a regular file: {}",
+                    resource
+                ));
+            }
+            let expected_metadata = fs::metadata(&canonical_resource).map_err(|error| {
+                format!("Could not verify skill resource {}: {}", resource, error)
+            })?;
+            log::info!(
+                "event=skill_resource_access name={} origin={:?} resource={}",
+                name,
+                skill.origin,
+                resource
+            );
+            let resource_file = fs::File::open(&canonical_resource).map_err(|error| {
+                log::warn!(
+                    "event=skill_resource_failed name={} origin={:?} resource={} error={}",
+                    name,
+                    skill.origin,
+                    resource,
+                    error
+                );
+                format!("Could not read skill resource {}: {}", resource, error)
+            })?;
+            let opened_resource_path = canonical_resource
+                .canonicalize()
+                .map_err(|error| error.to_string())?;
+            let resource_metadata = resource_file
+                .metadata()
+                .map_err(|error| error.to_string())?;
+            if opened_resource_path != canonical_resource
+                || !resource_metadata.is_file()
+                || resource_metadata.len() != expected_metadata.len()
+                || resource_metadata.modified().ok() != expected_metadata.modified().ok()
+            {
+                return Err(format!(
+                    "Skill resource is not a regular file: {}",
+                    resource
+                ));
+            }
+            let mut content = String::new();
+            resource_file
+                .take((Self::MAX_SKILL_RESOURCE_BYTES + 1) as u64)
+                .read_to_string(&mut content)
                 .map_err(|error| {
                     format!("Could not read skill resource {}: {}", resource, error)
                 })?;
@@ -1292,23 +1601,61 @@ impl ToolDispatcher {
                     .take_while(|index| *index <= Self::MAX_SKILL_RESOURCE_BYTES)
                     .last()
                     .unwrap_or(0);
-                let mut truncated = String::with_capacity(Self::MAX_SKILL_RESOURCE_BYTES + 12);
-                truncated.push_str(&content[..boundary]);
-                truncated.push_str("\n[truncated]");
-                truncated
+                format!("{}\n[truncated]", &content[..boundary])
             } else {
                 content
             };
             loaded.push((resource.clone(), content));
         }
+        log::info!(
+            "event=skill_activated name={} origin={:?} instruction_bytes={} resource_count={}",
+            name,
+            skill.origin,
+            instructions.len(),
+            loaded.len()
+        );
         Ok((instructions, loaded))
+    }
+
+    pub fn activate_skill_from_roots(
+        project_root: Option<&Path>,
+        global_root: Option<&Path>,
+        name: &str,
+        resources: &[String],
+    ) -> Result<(String, Vec<(String, String)>), String> {
+        Self::skill_activation_from_roots(project_root, global_root, name, resources)
+    }
+
+    fn skill_activation(
+        root: &Path,
+        name: &str,
+        resources: &[String],
+    ) -> Result<(String, Vec<(String, String)>), String> {
+        Self::skill_activation_from_roots(Some(root), Some(root), name, resources)
     }
 
     fn safe_skill_resource(path: &str) -> bool {
         !path.is_empty()
             && path.len() <= 4096
             && !path.starts_with(['/', '\\'])
-            && !path.split(['/', '\\']).any(|part| part == "..")
+            && path.split(['/', '\\']).all(|part| {
+                !part.is_empty()
+                    && part != "."
+                    && part != ".."
+                    && !part.contains(':')
+                    && !part.ends_with(['.', ' '])
+                    && ![
+                        "CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6",
+                        "COM7", "COM8", "COM9", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6",
+                        "LPT7", "LPT8", "LPT9",
+                    ]
+                    .iter()
+                    .any(|reserved| {
+                        part.split('.')
+                            .next()
+                            .is_some_and(|base| base.eq_ignore_ascii_case(reserved))
+                    })
+            })
     }
 
     pub fn activate_skill(
@@ -1319,6 +1666,67 @@ impl ToolDispatcher {
         Self::skill_activation(root, name, resources)
     }
 
+    pub fn load_skills_from_roots(
+        project_root: Option<&Path>,
+        global_root: Option<&Path>,
+        selected: &[String],
+    ) -> Result<Vec<(String, String)>, String> {
+        if selected.len() > MAX_SELECTED_SKILLS {
+            return Err(format!(
+                "Select no more than {} skills",
+                MAX_SELECTED_SKILLS
+            ));
+        }
+        let catalog = Self::list_skills_from_roots(project_root, global_root)?;
+        let mut loaded = Vec::new();
+        for name in selected {
+            let Some(skill) = catalog.iter().find(|skill| skill.name == *name) else {
+                continue;
+            };
+            let root = if skill.origin == SkillOrigin::Project {
+                project_root
+            } else {
+                global_root
+            }
+            .ok_or_else(|| format!("Skill root unavailable for {}", name))?;
+            let sandbox = Sandbox::new(root.to_path_buf())?;
+            let path = sandbox.resolve_path(&skill.path)?;
+            let metadata = fs::symlink_metadata(&path)
+                .map_err(|error| format!("Could not inspect skill {}: {}", name, error))?;
+            if !metadata.is_file()
+                || metadata.file_type().is_symlink()
+                || metadata.len() as usize > MAX_SKILL_FILE_BYTES
+            {
+                return Err(format!(
+                    "Skill {} is not a regular file within the {} byte limit",
+                    name, MAX_SKILL_FILE_BYTES
+                ));
+            }
+            let file = fs::File::open(path)
+                .map_err(|error| format!("Could not open skill {}: {}", name, error))?;
+            if !file
+                .metadata()
+                .map_err(|error| error.to_string())?
+                .is_file()
+            {
+                return Err(format!("Skill {} is not a regular file", name));
+            }
+            let mut contents = String::new();
+            file.take((MAX_SKILL_FILE_BYTES + 1) as u64)
+                .read_to_string(&mut contents)
+                .map_err(|error| format!("Could not read skill {}: {}", name, error))?;
+            if contents.len() > MAX_SKILL_FILE_BYTES {
+                return Err(format!(
+                    "Skill {} exceeds {} bytes",
+                    name, MAX_SKILL_FILE_BYTES
+                ));
+            }
+            loaded.push((name.clone(), contents));
+        }
+        Ok(loaded)
+    }
+
+    #[cfg(test)]
     pub fn load_skills(root: &Path, selected: &[String]) -> Result<Vec<(String, String)>, String> {
         if selected.len() > MAX_SELECTED_SKILLS {
             return Err(format!(
@@ -1924,6 +2332,37 @@ impl ToolDispatcher {
     }
 
     pub fn execute_tool(root: &Path, call: &ToolCall, approved: bool) -> ToolResult {
+        let started = std::time::Instant::now();
+        let result = Self::execute_tool_inner(root, call, approved);
+        crate::audit::emit(
+            crate::audit::EventKind::ToolFinished,
+            &call.id,
+            None,
+            Some(&call.id),
+            None,
+            None,
+            Some(if result.success { "success" } else { "failure" }),
+            Some(&call.name),
+        );
+        log::debug!(
+            "event=tool_execution_timing tool={} elapsed_ms={}",
+            call.name,
+            started.elapsed().as_millis()
+        );
+        result
+    }
+
+    fn execute_tool_inner(root: &Path, call: &ToolCall, approved: bool) -> ToolResult {
+        crate::audit::emit(
+            crate::audit::EventKind::ToolStarted,
+            &call.id,
+            None,
+            Some(&call.id),
+            None,
+            None,
+            None,
+            Some(&call.name),
+        );
         if (call.name == "write_file" || call.name == "patch_file" || call.name == "run_command")
             && !approved
         {
@@ -2323,11 +2762,210 @@ mod tests {
     use super::*;
 
     #[test]
+    fn project_instructions_load_root_to_nested_only() {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("target")
+            .join(format!("agents_hierarchy_{}", std::process::id()));
+        let nested = root.join("src/module");
+        let sibling = root.join("tests");
+        fs::create_dir_all(&nested).unwrap();
+        fs::create_dir_all(&sibling).unwrap();
+        fs::write(root.join("AGENTS.md"), "root wins least").unwrap();
+        fs::write(root.join("src/AGENTS.md"), "src overrides root").unwrap();
+        fs::write(nested.join("AGENTS.md"), "nested overrides src").unwrap();
+        fs::write(sibling.join("AGENTS.md"), "sibling is unrelated").unwrap();
+        let sandbox = Sandbox::new(root.clone()).unwrap();
+        let loaded = sandbox.load_project_instructions(&nested).unwrap();
+        assert_eq!(loaded.len(), 3);
+        assert_eq!(loaded[0].content, "root wins least");
+        assert_eq!(loaded[1].content, "src overrides root");
+        assert_eq!(loaded[2].content, "nested overrides src");
+        assert!(loaded.iter().all(|item| !item.content.contains("sibling")));
+        assert!(
+            sandbox
+                .load_project_instructions(Path::new("../../outside"))
+                .is_err()
+        );
+        assert_eq!(
+            sandbox.load_project_instructions(&sibling).unwrap().len(),
+            2
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn project_instruction_symlinks_are_rejected() {
+        use std::os::unix::fs::symlink;
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("target")
+            .join(format!("agents_symlink_{}", std::process::id()));
+        fs::create_dir_all(&root).unwrap();
+        let outside = root.with_extension("outside.md");
+        fs::write(&outside, "outside instructions").unwrap();
+        symlink(&outside, root.join("AGENTS.md")).unwrap();
+        assert!(
+            Sandbox::new(root.clone())
+                .unwrap()
+                .load_project_instructions(&root)
+                .is_err()
+        );
+        let _ = fs::remove_file(&outside);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn system_prompt_does_not_duplicate_request_tool_schemas() {
         let tools = ToolDispatcher::list_tools();
         let schemas = serde_json::to_string_pretty(&tools).unwrap();
 
         assert!(!ToolDispatcher::build_system_prompt().contains(&schemas));
+    }
+
+    #[test]
+    fn resolves_project_and_global_skills_with_project_precedence() {
+        let base = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("target")
+            .join(format!("skill_roots_{}", std::process::id()));
+        let project = base.join("project");
+        let global = base.join("home");
+        for (root, body) in [(&project, "project version"), (&global, "global version")] {
+            let dir = root.join(".agents/skills/shared");
+            fs::create_dir_all(dir.join("references")).unwrap();
+            fs::write(
+                dir.join("SKILL.md"),
+                format!("---\nname: shared\ndescription: Shared skill\n---\n{body}"),
+            )
+            .unwrap();
+            fs::write(dir.join("references/notes.md"), format!("{body} resource")).unwrap();
+        }
+        let global_only = global.join(".claude/skills/global-only");
+        fs::create_dir_all(&global_only).unwrap();
+        fs::write(
+            global_only.join("SKILL.md"),
+            "---\nname: global-only\ndescription: Global only\n---\nGlobal instructions",
+        )
+        .unwrap();
+
+        let catalog =
+            ToolDispatcher::list_skills_from_roots(Some(&project), Some(&global)).unwrap();
+        let shared = catalog.iter().find(|skill| skill.name == "shared").unwrap();
+        assert_eq!(shared.origin, SkillOrigin::Project);
+        assert_eq!(
+            catalog
+                .iter()
+                .filter(|skill| skill.name == "shared")
+                .count(),
+            1
+        );
+        let global_only = catalog
+            .iter()
+            .find(|skill| skill.name == "global-only")
+            .unwrap();
+        assert_eq!(global_only.origin, SkillOrigin::Global);
+        let (instructions, resources) = ToolDispatcher::activate_skill_from_roots(
+            Some(&project),
+            Some(&global),
+            "shared",
+            &["references/notes.md".into()],
+        )
+        .unwrap();
+        assert!(instructions.contains("project version"));
+        assert_eq!(resources[0].1, "project version resource");
+        let (instructions, _) =
+            ToolDispatcher::activate_skill_from_roots(None, Some(&global), "global-only", &[])
+                .unwrap();
+        assert!(instructions.contains("Global instructions"));
+        assert!(
+            ToolDispatcher::load_skills_from_roots(None, Some(&global), &["global-only".into()])
+                .unwrap()[0]
+                .1
+                .contains("Global instructions")
+        );
+        let (instructions, resources) = ToolDispatcher::activate_skill_from_roots(
+            Some(&project),
+            Some(&global),
+            "global-only",
+            &[],
+        )
+        .unwrap();
+        assert!(instructions.contains("Global instructions"));
+        assert!(resources.is_empty());
+        let _ = fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn skill_catalog_rejects_missing_files_invalid_names_and_escaping_resources() {
+        let base = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("target")
+            .join(format!("skill_invalid_{}", std::process::id()));
+        let project = base.join("project");
+        let global = base.join("home");
+        fs::create_dir_all(project.join(".agents/skills/no-file")).unwrap();
+        let invalid = project.join(".agents/skills/Bad_Name");
+        fs::create_dir_all(&invalid).unwrap();
+        fs::write(
+            invalid.join("SKILL.md"),
+            "---\nname: Bad_Name\ndescription: Invalid\n---\nNope",
+        )
+        .unwrap();
+        let skill = global.join(".kilo/skills/safe");
+        fs::create_dir_all(&skill).unwrap();
+        fs::write(
+            skill.join("SKILL.md"),
+            "---\nname: safe\ndescription: Safe\n---\nInstructions",
+        )
+        .unwrap();
+        assert!(
+            ToolDispatcher::list_skills_from_roots(Some(&project), Some(&global))
+                .unwrap()
+                .iter()
+                .all(|skill| skill.name != "invalid")
+        );
+        assert!(
+            ToolDispatcher::activate_skill_from_roots(None, Some(&global), "../safe", &[]).is_err()
+        );
+        assert!(
+            ToolDispatcher::activate_skill_from_roots(
+                None,
+                Some(&global),
+                "safe",
+                &["../../secret".into()]
+            )
+            .is_err()
+        );
+        let _ = fs::remove_dir_all(base);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn skill_resources_reject_symlink_escape() {
+        use std::os::unix::fs::symlink;
+        let base = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("target")
+            .join(format!("skill_symlink_{}", std::process::id()));
+        let global = base.join("home");
+        let outside = base.join("outside");
+        let skill = global.join(".agents/skills/linked");
+        fs::create_dir_all(&skill).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        fs::write(
+            skill.join("SKILL.md"),
+            "---\nname: linked\ndescription: Linked\n---\nInstructions",
+        )
+        .unwrap();
+        fs::write(outside.join("secret.md"), "secret").unwrap();
+        symlink(outside.join("secret.md"), skill.join("secret.md")).unwrap();
+        assert!(
+            ToolDispatcher::activate_skill_from_roots(
+                None,
+                Some(&global),
+                "linked",
+                &["secret.md".into()]
+            )
+            .is_err()
+        );
+        let _ = fs::remove_dir_all(base);
     }
 
     #[test]

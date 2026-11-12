@@ -17,7 +17,7 @@ function SkillsPage({skills, loading, error, selected, search, onSearch, onToggl
   const filtered = skills.filter(skill => `${skill.name} ${skill.description}`.toLowerCase().includes(search.toLowerCase()));
   return <section className="skills-page" aria-labelledby="skills-title">
     <header className="skills-header">
-      <div><span className="skills-eyebrow">GLOBAL AGENT LIBRARY</span><h1 id="skills-title">Skills</h1><p>Choose skills from your user-level agent directory to load into the coding agent’s instructions.</p></div>
+      <div><span className="skills-eyebrow">AGENT SKILL LIBRARY</span><h1 id="skills-title">Skills</h1><p>Choose skills from your project and user-level agent directories to load into the coding agent’s instructions.</p></div>
     </header>
     <label className="skills-search"><MagnifyingGlassIcon width={16} height={16} aria-hidden="true"/><span className="visually-hidden">Search skills</span><input value={search} onChange={event => onSearch(event.target.value)} placeholder="Search skills…" /></label>
     {error && <p className="skills-error" role="alert">{error}</p>}
@@ -26,9 +26,9 @@ function SkillsPage({skills, loading, error, selected, search, onSearch, onToggl
       <label className={`skill-row ${selected.has(skill.name) ? 'selected' : ''}`}>
         <input type="checkbox" checked={selected.has(skill.name)} disabled={!selected.has(skill.name) && selected.size >= 12} onChange={() => onToggle(skill.name)} />
         <span className="skill-row-icon"><SparklesIcon width={15} height={15} aria-hidden="true" /></span>
-        <span className="skill-row-copy"><strong>{skill.name}</strong><span>{skill.description || 'No description provided.'}</span><small>{skill.path}</small></span>
+        <span className="skill-row-copy"><strong>{skill.name}</strong><span>{skill.description || 'No description provided.'}</span><small>{skill.origin ? `${skill.origin} · ` : ''}{skill.path}</small></span>
       </label>
-    </li>)}</ul> : <div className="skills-state">{search ? 'No skills match this search.' : 'No global skills found under your user-level agent directories (.agents/skills, .claude/skills, or .kilo/skills).'}</div>}
+    </li>)}</ul> : <div className="skills-state">{search ? 'No skills match this search.' : 'No skills found under the project or user-level agent directories (.agents/skills, .claude/skills, or .kilo/skills).'}</div>}
   </section>;
 }
 
@@ -45,22 +45,25 @@ export function OpenHarness() {
     } catch { return []; }
   });
   const [skillSearch, setSkillSearch] = useState('');
+  const [activeProjectId, setActiveProjectId] = useState<string | null>(null);
+  const skillRequestId = useRef(0);
   const visibleSelectedSkills = new Set(selectedSkills);
   const selectedSkillsRef = useRef(selectedSkills);
   const [initialSection, setInitialSection] = useState('Providers');
   const [updateAvailable, setUpdateAvailable] = useState(false);
   selectedSkillsRef.current = selectedSkills;
 
-  const refreshSkills = async () => {
+  const refreshSkills = async (projectId = activeProjectId) => {
+    const requestId = ++skillRequestId.current;
     setLoadingSkills(true);
     setSkillsError(null);
     try {
-      const items = await apiListSkills();
-      setSkills(items);
+      const items = await apiListSkills(projectId);
+      if (requestId === skillRequestId.current) setSkills(items);
     } catch (error) {
-      setSkillsError(String(error));
+      if (requestId === skillRequestId.current) setSkillsError(String(error));
     } finally {
-      setLoadingSkills(false);
+      if (requestId === skillRequestId.current) setLoadingSkills(false);
     }
   };
   const toggleSkill = (name: string) => {
@@ -74,6 +77,20 @@ export function OpenHarness() {
   };
 
   useEffect(() => {
+    const syncActiveProject = (event: Event) => {
+      const detail = (event as CustomEvent<{id?: string | null}>).detail;
+      setActiveProjectId(detail?.id ?? null);
+    };
+    window.addEventListener('openharness:active-project', syncActiveProject);
+    return () => window.removeEventListener('openharness:active-project', syncActiveProject);
+  }, []);
+
+  useEffect(() => {
+    const updateActiveProject = (event: Event) => {
+      const id = (event as CustomEvent<{id?: string | null}>).detail?.id ?? null;
+      setActiveProjectId(id);
+      void refreshSkills(id);
+    };
     const updateSkills = (event: Event) => {
       const names = (event as CustomEvent<{names?: string[]}>).detail?.names ?? [];
       selectedSkillsRef.current = names;
@@ -82,8 +99,9 @@ export function OpenHarness() {
     };
     const updateWindowAvailability = (event: Event) => setUpdateAvailable(Boolean((event as CustomEvent<boolean>).detail));
     window.addEventListener('openharness:update-availability', updateWindowAvailability);
+    window.addEventListener('openharness:active-project', updateActiveProject);
     window.addEventListener('openharness:skills-changed', updateSkills);
-    return () => { window.removeEventListener('openharness:update-availability', updateWindowAvailability); window.removeEventListener('openharness:skills-changed', updateSkills); };
+    return () => { window.removeEventListener('openharness:update-availability', updateWindowAvailability); window.removeEventListener('openharness:active-project', updateActiveProject); window.removeEventListener('openharness:skills-changed', updateSkills); };
   }, []);
 
   useEffect(() => {

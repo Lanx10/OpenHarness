@@ -220,7 +220,8 @@ function MessageView({message, onCopy, onDelete, onRegenerate, onSaveEdit}: Mess
   );
 }
 
-type TerminalTab = {id: string; label: string; shell: 'powershell'|'cmd'; output: string; status: 'running'|'exited'};
+type TerminalShell = 'powershell' | 'cmd' | 'zsh' | 'bash' | 'sh' | 'fish';
+type TerminalTab = {id: string; label: string; shell: TerminalShell; output: string; status: 'running'|'exited'};
 
 function LearningProposalCard({candidate, onApprove, onDismiss, saving}: {candidate: NonNullable<ChatThreadLike['learning_candidates']>[number]; onApprove: () => void; onDismiss: () => void; saving: boolean}) {
   return <section className="learning-proposal" aria-label="Project learning proposal">
@@ -243,7 +244,7 @@ export function Canvas() {
     setThreadId(id);
   };
   const [tokenLimits, setTokenLimits] = useState({context: 128_000, output: 4_096});
-  const [cachedInputTokens, setCachedInputTokens] = useState<number | null>(null);
+  const [tokenUsage, setTokenUsage] = useState<{input: number | null; output: number | null; cached: number | null}>({input: null, output: null, cached: null});
   const activeThread = threads.find(thread => thread.id === threadId) ?? null;
   const uncompactedMessages = activeThread?.messages.slice(activeThread.compacted_message_count ?? 0) ?? [];
   const estimatedContextTokens = uncompactedMessages.reduce((total, message) => total + estimateMessageTokens(message.text, message.attachments ?? []), 0)
@@ -392,7 +393,7 @@ export function Canvas() {
 
   const loadThreadMessages = (thread: ChatThreadLike, resetCachedTokens = true) => {
     updateThreadId(thread.id);
-    if (resetCachedTokens) setCachedInputTokens(null);
+    if (resetCachedTokens) setTokenUsage({input: null, output: null, cached: null});
     setLearningCandidates(thread.learning_candidates ?? []);
     setMessages(thread.messages.map((message, index) => ({
       id: message.id || `${thread.id}:${index}`,
@@ -424,6 +425,7 @@ export function Canvas() {
         const id = 'id' in project ? String(project.id) : '';
         if (id) {
           updateProjectId(id);
+          window.dispatchEvent(new CustomEvent('openharness:active-project', {detail: {id}}));
           setProjectName('name' in project && typeof project.name === 'string' ? project.name : '');
           void refreshThreads(id);
         }
@@ -466,7 +468,7 @@ export function Canvas() {
     const runPrompt = async (detail: {text: string; modelId: string; provider: string; projectId?: string | null; threadId?: string | null; attachments?: string[]; supportsVision?: boolean; modelContextTokens?: number; modelOutputTokens?: number; selectedSkills?: string[]; approvalMode?: 'manual' | 'automatic'}) => {
       let persistedUserMessage: ChatMessageLike | null = null;
       if (detail.modelContextTokens) setTokenLimits({context: detail.modelContextTokens, output: detail.modelOutputTokens ?? 4_096});
-      setCachedInputTokens(null);
+      setTokenUsage({input: null, output: null, cached: null});
       const text = String(detail?.text ?? '').trim();
       if (!text && !(detail.attachments?.length)) {
       setRunInProgress(false);
@@ -552,8 +554,12 @@ export function Canvas() {
           }
         }, (approvalRequest) => setApproval(approvalRequest), step => {
           setMessages(prev => prev.map(message => message.id === assistantId ? {...message, steps: upsertStep(message.steps ?? [], step), status: 'thinking'} : message));
-        }, tokens => {
-          if (threadIdRef.current === currentThreadId) setCachedInputTokens(tokens);
+        }, usage => {
+          if (threadIdRef.current === currentThreadId) setTokenUsage(previous => ({
+            input: usage.input_tokens == null ? previous.input : (previous.input ?? 0) + usage.input_tokens,
+            output: usage.output_tokens == null ? previous.output : (previous.output ?? 0) + usage.output_tokens,
+            cached: usage.cached_input_tokens == null ? previous.cached : (previous.cached ?? 0) + usage.cached_input_tokens,
+          }));
         });
       } catch (error) {
         const text = String(error);
@@ -664,7 +670,7 @@ export function Canvas() {
     };
     const startNewThread = () => {
         setMessages([]);
-        setCachedInputTokens(null);
+        setTokenUsage({input: null, output: null, cached: null});
         updateThreadId(null);
         window.dispatchEvent(new CustomEvent('openharness:thread-title-updated', {detail: {title: 'OpenHarness'}}));
     };
@@ -691,7 +697,7 @@ export function Canvas() {
           window.dispatchEvent(new CustomEvent('openharness:active-project', {detail: {id: nextProjectId, name: project?.name ?? project?.title ?? ''}}));
       updateThreadId(null);
         setMessages([]);
-       setCachedInputTokens(null);
+       setTokenUsage({input: null, output: null, cached: null});
        void refreshWorkspaceGit(nextProjectId);
       await refreshThreads(nextProjectId);
     };
@@ -716,7 +722,7 @@ export function Canvas() {
       if (terminalCreationPending.current) return;
       const hasSessions = terminalTabsRef.current.length > 0;
       setActiveTool(current => current === 'terminal' && hasSessions ? null : 'terminal');
-      if (!hasSessions) void createTerminal('powershell');
+      if (!hasSessions) void createTerminal();
     };
     const handleQuickFiles = () => setActiveTool(current => current === 'files' ? null : 'files');
     const handleQuickGit = () => {
@@ -857,8 +863,9 @@ export function Canvas() {
     });
   };
 
-  const createTerminal = async (shell: 'powershell' | 'cmd' = 'powershell') => {
-    if (!isTauri()) {
+  const defaultTerminalShell: TerminalShell = /Win/i.test(navigator.platform) ? 'powershell' : /Mac/i.test(navigator.platform) ? 'zsh' : 'bash';
+  const createTerminal = async (shell: TerminalShell = defaultTerminalShell) => {
+      if (!isTauri()) {
       toast('Terminal requires the desktop app');
       return;
     }
@@ -869,7 +876,7 @@ export function Canvas() {
       const id = await apiTerminalCreate(projectId, shell);
       const nextIndex = nextTerminalNumber.current++;
       const label = nextIndex === 1 ? 'Terminal' : `Terminal ${nextIndex}`;
-      const initialOutput = shell === 'cmd' ? '' : 'PowerShell ready.\r\n';
+      const initialOutput = shell === 'powershell' ? 'PowerShell ready.\r\n' : '';
       setTerminalTabs(previous => [...previous, {id, label, shell, output: initialOutput, status: 'running'}]);
       setActiveTerminalId(id);
       setActiveTool('terminal');
@@ -1037,7 +1044,9 @@ export function Canvas() {
             <div className="session-context-heading"><span className="session-context-eyebrow">TOKEN CONTEXT</span><span className="session-context-model">{(tokenLimits.context / 1000).toFixed(0)}K WINDOW</span></div>
             <div className="session-context-values">
               <div><strong>{estimatedContextTokens.toLocaleString()}</strong><span>estimated in context</span></div>
-              <div><strong>{cachedInputTokens?.toLocaleString() ?? '—'}</strong><span>cached input</span></div>
+              <div><strong>{tokenUsage.input?.toLocaleString() ?? '—'}</strong><span>provider input</span></div>
+              <div><strong>{tokenUsage.output?.toLocaleString() ?? '—'}</strong><span>provider output</span></div>
+              <div><strong>{tokenUsage.cached?.toLocaleString() ?? '—'}</strong><span>cached input</span></div>
             </div>
             <div className={`session-context-meter${nearContextLimit ? ' near-limit' : ''}`} role="progressbar" aria-label="Estimated context usage" aria-valuemin={0} aria-valuemax={100} aria-valuenow={Math.round(contextPercent)}>
               <span style={{width: `${contextPercent}%`}} />
@@ -1110,7 +1119,7 @@ export function Canvas() {
                     {tab.label} {tab.status === 'exited' ? '· exited' : ''}
                   </button>
                 ))}
-                <button type="button" className="terminal-tab terminal-new" onClick={() => void createTerminal('powershell')} disabled={terminalBusy}>+ Terminal</button>
+                <button type="button" className="terminal-tab terminal-new" onClick={() => void createTerminal()} disabled={terminalBusy}>+ Terminal</button>
               </div>
               <button type="button" className="workspace-tool-close" aria-label="Close terminal panel" onClick={() => setActiveTool(null)}>×</button>
             </div>

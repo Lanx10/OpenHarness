@@ -98,14 +98,16 @@ export async function apiSaveProvider(
 ): Promise<ProviderInfo> {
   if (isTauri()) {
     return await invoke<ProviderInfo>('provider_save', {
-      provider,
-      modelId,
-      baseUrl,
-      customEndpoint,
-      apiKey: apiKey || (keepExistingKey ? '__KEEP_EXISTING__' : ''),
-      maxContextTokens,
-      maxOutputTokens,
-      supportsVision,
+      config: {
+        provider,
+        modelId,
+        baseUrl,
+        customEndpoint,
+        apiKey: apiKey || (keepExistingKey ? '__KEEP_EXISTING__' : ''),
+        maxContextTokens,
+        maxOutputTokens,
+        supportsVision,
+      },
     });
   }
   const existing = localProviders.find(item => item.provider === provider);
@@ -207,10 +209,10 @@ export type ApprovalRequestLike = {
 };
 
 import type { StepEventLike } from '../components/StepEvent';
-export type SkillInfoLike = {name: string; description: string; path: string};
+export type SkillInfoLike = {name: string; description: string; path: string; origin?: 'project' | 'global'};
 
-export async function apiListSkills(): Promise<SkillInfoLike[]> {
-  if (isTauri()) return invoke('skills_list');
+export async function apiListSkills(projectId?: string | null): Promise<SkillInfoLike[]> {
+  if (isTauri()) return invoke('skills_list', {projectId});
   return [];
 }
 
@@ -220,7 +222,7 @@ export type StreamChunkLike = {
   error?: string | null;
   approval?: ApprovalRequestLike | null;
   step?: StepEventLike | null;
-  cached_input_tokens?: number | null;
+  token_usage?: { input_tokens?: number | null; output_tokens?: number | null; cached_input_tokens?: number | null } | null;
 };
 
 export async function apiChatStream(
@@ -239,7 +241,7 @@ export async function apiChatStream(
   onError?: (error: string) => void,
   onApproval?: (approval: ApprovalRequestLike) => void,
   onStep?: (step: StepEventLike) => void,
-  onUsage?: (cachedInputTokens: number) => void,
+  onUsage?: (usage: NonNullable<StreamChunkLike['token_usage']>) => void,
 ): Promise<void> {
   if (isTauri()) {
     const channel = new Channel<StreamChunkLike>();
@@ -251,7 +253,7 @@ export async function apiChatStream(
         onStep?.(message.step);
         if (message.step.kind === 'learning' && threadId) void apiGetThread(threadId).then(thread => window.dispatchEvent(new CustomEvent('openharness:learning-ready', {detail: thread})));
       }
-      if (message.cached_input_tokens !== undefined) onUsage?.(message.cached_input_tokens ?? 0);
+      if (message.token_usage) onUsage?.(message.token_usage);
       if (message.done) onDone?.();
     };
     await invoke('chat_send_stream', {
@@ -270,7 +272,7 @@ export async function apiChatStream(
     return;
   }
   const text = `Local OpenHarness Assistant (${modelId}):\n\nProcessing "${prompt.trim()}"${attachments?.length ? ` with ${attachments.length} attachment(s)` : ''}. Configure a provider for live inference.`;
-  onUsage?.(0);
+  onUsage?.({});
   if (threadId) {
     await apiAppendMessage(threadId, 'user', prompt.trim());
     await apiAppendMessage(threadId, 'assistant', text);
@@ -429,7 +431,7 @@ export async function apiGitLog(projectId: string, limit = 10): Promise<string> 
 export type FileEntryLike = {name: string; path: string; is_dir: boolean; size: number};
 export type GrepMatchLike = {file: string; line_number: number; line_text: string};
 
-export async function apiTerminalCreate(projectId: string | null, shell: 'powershell' | 'cmd'): Promise<string> {
+export async function apiTerminalCreate(projectId: string | null, shell?: 'powershell' | 'cmd' | 'zsh' | 'bash' | 'sh' | 'fish'): Promise<string> {
   if (!isTauri()) throw new Error('Terminal requires the desktop app');
   return invoke('terminal_create', { projectId, shell });
 }
