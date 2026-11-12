@@ -24,6 +24,22 @@ export async function windowClose(): Promise<void> {
   throw new Error('Window control unavailable outside the Tauri desktop app');
 }
 
+export type ReadinessComponentLike = {
+  id: string;
+  displayName: string;
+  status: 'ready' | 'degraded' | 'unavailable' | 'disabled' | 'failed';
+  message: string;
+  required: boolean;
+  recoverable: boolean;
+  validatedAtUnixMs: number;
+  diagnosticReference?: string | null;
+};
+
+export async function apiGetStartupReadiness(): Promise<ReadinessComponentLike[]> {
+  if (isTauri()) return invoke('get_startup_readiness');
+  return [];
+}
+
 export type ProviderInfo = {
   provider: string;
   model_id: string;
@@ -198,12 +214,15 @@ export async function apiCreateProject(name: string, path?: string | null): Prom
   persistStoredProjects(localProjects);
   return created;
 }
-export async function apiCancelChatStream(streamId?: string): Promise<void> {
-  if (isTauri()) await invoke('cancel_chat_stream', { streamId: streamId || null });
+export async function apiCancelChatStream(streamId: string): Promise<void> {
+  if (!streamId.trim()) throw new Error('A stream ID is required for cancellation');
+  if (isTauri()) await invoke('cancel_chat_stream', { streamId });
 }
 
 export type ApprovalRequestLike = {
   id: string;
+  run_id: string;
+  tool_call_id: string;
   tool: string;
   arguments: Record<string, unknown>;
 };
@@ -216,13 +235,17 @@ export async function apiListSkills(projectId?: string | null): Promise<SkillInf
   return [];
 }
 
+export type ProviderUsageLike = {input_tokens?: number | null; output_tokens?: number | null; total_tokens?: number | null; cached_input_tokens?: number | null; reasoning_tokens?: number | null};
+export type TokenUsageRecordLike = {requestId: string; source: string; usage: ProviderUsageLike};
+
 export type StreamChunkLike = {
+  usage_request_id?: string | null;
   text: string;
   done: boolean;
   error?: string | null;
   approval?: ApprovalRequestLike | null;
   step?: StepEventLike | null;
-  token_usage?: { input_tokens?: number | null; output_tokens?: number | null; cached_input_tokens?: number | null } | null;
+  token_usage?: ProviderUsageLike | null;
 };
 
 export async function apiChatStream(
@@ -241,7 +264,8 @@ export async function apiChatStream(
   onError?: (error: string) => void,
   onApproval?: (approval: ApprovalRequestLike) => void,
   onStep?: (step: StepEventLike) => void,
-  onUsage?: (usage: NonNullable<StreamChunkLike['token_usage']>) => void,
+  onUsage?: (usage: NonNullable<StreamChunkLike['token_usage']>, requestId?: string) => void,
+  streamId = crypto.randomUUID(),
 ): Promise<void> {
   if (isTauri()) {
     const channel = new Channel<StreamChunkLike>();
@@ -253,7 +277,7 @@ export async function apiChatStream(
         onStep?.(message.step);
         if (message.step.kind === 'learning' && threadId) void apiGetThread(threadId).then(thread => window.dispatchEvent(new CustomEvent('openharness:learning-ready', {detail: thread})));
       }
-      if (message.token_usage) onUsage?.(message.token_usage);
+      if (message.token_usage) onUsage?.(message.token_usage, message.usage_request_id ?? undefined);
       if (message.done) onDone?.();
     };
     await invoke('chat_send_stream', {
@@ -267,6 +291,7 @@ export async function apiChatStream(
       selectedSkills,
       approvalMode,
       userMessageId: userMessageId ?? null,
+      streamId,
       channel,
     });
     return;
@@ -282,8 +307,8 @@ export async function apiChatStream(
 }
 
 export type LearningCandidateLike = {summary:string; memory:string[]; skill_name?:string|null; skill_description?:string|null; skill_content?:string|null; memory_saved?:boolean; skill_saved?:boolean};
-export type ChatMessageLike = { id: string; role: string; text: string; attachments?: string[]; compacted_summary?: string | null };
-export type ChatThreadLike = { id: string; project_id: string; title: string; messages: ChatMessageLike[]; compacted_summary?: string | null; compacted_message_count?: number; learning_candidates?: LearningCandidateLike[] };
+export type ChatMessageLike = { id: string; role: string; text: string; attachments?: string[]; compacted_summary?: string | null; run_id?: string | null; outcome?: 'completed' | 'failed' | 'cancelled' | 'interrupted' | 'request_limit_exhausted' | null };
+export type ChatThreadLike = { id: string; project_id: string; title: string; messages: ChatMessageLike[]; token_usage?: TokenUsageRecordLike[]; compacted_summary?: string | null; compacted_message_count?: number; learning_candidates?: LearningCandidateLike[] };
 
 let localThreads: ChatThreadLike[] = [];
 
@@ -446,9 +471,11 @@ export async function apiTerminalKill(id: string): Promise<void> {
   await invoke('terminal_kill', { id });
 }
 
-export async function apiListenTerminalOutput(handler: (id: string, data: string) => void): Promise<UnlistenFn> {
+export type TerminalOutputStream = 'stdout' | 'stderr';
+
+export async function apiListenTerminalOutput(handler: (id: string, data: string, stream: TerminalOutputStream) => void): Promise<UnlistenFn> {
   if (!isTauri()) return () => {};
-  return listen<{id: string; data: string}>('terminal-output', event => handler(event.payload.id, event.payload.data));
+  return listen<{id: string; data: string; stream: TerminalOutputStream}>('terminal-output', event => handler(event.payload.id, event.payload.data, event.payload.stream));
 }
 
 export async function apiListenTerminalExit(handler: (id: string, code: number | null) => void): Promise<UnlistenFn> {

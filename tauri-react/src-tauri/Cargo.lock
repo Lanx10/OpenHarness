@@ -82,6 +82,7 @@ dependencies = [
  "base64 0.22.1",
  "futures-util",
  "keyring",
+ "libc",
  "log",
  "reqwest 0.12.28",
  "serde",

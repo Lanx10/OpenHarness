@@ -4,11 +4,14 @@ import {
   ArrowPathIcon, ArrowTopRightOnSquareIcon,
   MagnifyingGlassIcon, ServerIcon, XMarkIcon, TrashIcon, PencilSquareIcon, PhotoIcon,
 } from '@heroicons/react/20/solid';
-import {apiDeleteProvider, apiListProviders, apiSaveProvider, type ProviderInfo} from '../../services/tauriBridge';
+import {apiDeleteProvider, apiGetStartupReadiness, apiListProviders, apiSaveProvider, type ProviderInfo, type ReadinessComponentLike} from '../../services/tauriBridge';
+import {classifyProviderEndpoint} from './providerEndpoint';
+import {containTabKey} from '../modalFocus';
+import {createDownloadProgress} from './updateProgress';
 
 type SettingsPageProps = {onClose: () => void; initialSection?: string};
 
-const sections = ['Providers', 'Update'];
+const sections = ['Providers', 'System Status', 'Update'];
 const providerOptions = ['OpenRouter', 'Google AI Studio', 'Ollama', 'OpenAI Compatible'];
 
 const OPENAI_PRESETS = [
@@ -47,15 +50,13 @@ function ProviderForm({onBack, onSaved, editProvider}: {onBack: () => void; onSa
       return;
     }
     if (isOpenAICompatible || customEndpoint) {
-      if (!baseUrl.trim()) {
-        setError('Enter an endpoint URL to connect.');
+      const endpoint = classifyProviderEndpoint(baseUrl);
+      if (endpoint.kind === 'invalid') {
+        setError(endpoint.message);
         return;
       }
-      try {
-        const parsed = new URL(baseUrl);
-        if (!['http:', 'https:'].includes(parsed.protocol) || !parsed.hostname) throw new Error('bad URL');
-      } catch {
-        setError('Endpoint URL must be a valid http(s) URL.');
+      if (endpoint.kind === 'remote_http') {
+        setError('Remote HTTP is unencrypted: credentials and request contents can be read or modified in transit. Use HTTPS or a local loopback endpoint.');
         return;
       }
     }
@@ -112,9 +113,12 @@ function ProviderForm({onBack, onSaved, editProvider}: {onBack: () => void; onSa
         <div className="provider-openai-fields">
           <div className="provider-openai-header-row">
             <label className="field-label" htmlFor="openai-endpoint">Endpoint Base URL</label>
-            <span className="provider-openai-protocol-badge">
-              {baseUrl.startsWith('http://') ? 'HTTP (Local)' : baseUrl.startsWith('https://') ? 'HTTPS (Remote)' : 'Custom'}
-            </span>
+            {(() => {
+              const endpoint = classifyProviderEndpoint(baseUrl);
+              return <span className={`provider-openai-protocol-badge ${endpoint.kind === 'remote_http' ? 'endpoint-insecure' : ''}`}>
+                {endpoint.kind === 'invalid' ? 'Invalid endpoint' : endpoint.label}
+              </span>;
+            })()}
           </div>
           <input
             id="openai-endpoint"
@@ -124,6 +128,7 @@ function ProviderForm({onBack, onSaved, editProvider}: {onBack: () => void; onSa
           />
           <span className="provider-openai-hint">
             Specify the base URL. <code>/chat/completions</code> is automatically appended.
+            {classifyProviderEndpoint(baseUrl).kind === 'remote_http' && ' Remote HTTP does not encrypt API keys or request contents; saving is blocked.'}
           </span>
 
           <div className="provider-openai-presets-wrap">
@@ -248,27 +253,46 @@ export function SettingsPage({onClose, initialSection = 'Providers'}: SettingsPa
   const [search, setSearch] = useState('');
   const [savedProviders, setSavedProviders] = useState<ProviderInfo[]>([]);
   const [providerError, setProviderError] = useState('');
+  const [readiness, setReadiness] = useState<ReadinessComponentLike[]>([]);
+  const [readinessError, setReadinessError] = useState('');
+  const [refreshingReadiness, setRefreshingReadiness] = useState(false);
+  const [readinessRevision, setReadinessRevision] = useState(0);
   const [updateStatus, setUpdateStatus] = useState('');
   const [checkingUpdate, setCheckingUpdate] = useState(false);
+  const updateInFlight = useRef(false);
+  const updateMounted = useRef(true);
   const closeRef = useRef<HTMLButtonElement | null>(null);
-  const openerRef = useRef<Element | null>(null);
+  const dialogRef = useRef<HTMLDivElement | null>(null);
+  const backdropRef = useRef<HTMLDivElement | null>(null);
+  const openerRef = useRef<HTMLElement | null>(null);
 
   useEffect(() => {
-    const closeOnEscape = (event: KeyboardEvent) => {
-      if (event.key === 'Escape') onClose();
-    };
-    document.addEventListener('keydown', closeOnEscape);
-    return () => document.removeEventListener('keydown', closeOnEscape);
-  }, [onClose]);
+    updateMounted.current = true;
+    return () => { updateMounted.current = false; };
+  }, []);
 
   useEffect(() => {
-    openerRef.current = document.activeElement;
+    openerRef.current = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+    const backdrop = backdropRef.current;
+    const background = backdrop?.parentElement ? Array.from(backdrop.parentElement.children).filter((child): child is HTMLElement => child instanceof HTMLElement && child !== backdrop) : [];
+    const previous = background.map(element => element.inert);
+    background.forEach(element => { element.inert = true; });
     const close = closeRef.current;
     if (close) close.focus();
     return () => {
-      if (openerRef.current && 'focus' in openerRef.current) (openerRef.current as HTMLElement).focus();
+      background.forEach((element, index) => { element.inert = previous[index]; });
+      if (openerRef.current?.isConnected) openerRef.current.focus();
+      else document.querySelector<HTMLElement>('[aria-label="Settings"]')?.focus();
     };
   }, []);
+
+  const handleDialogKeyDown = (event: React.KeyboardEvent<HTMLDivElement>) => {
+    containTabKey(event.nativeEvent, event.currentTarget);
+    if (event.key === 'Escape' && !checkingUpdate) {
+      event.preventDefault();
+      onClose();
+    }
+  };
 
   useEffect(() => {
     let cancelled = false;
@@ -276,6 +300,43 @@ export function SettingsPage({onClose, initialSection = 'Providers'}: SettingsPa
     return () => { cancelled = true; };
   }, []);
 
+  useEffect(() => {
+    const loadReadiness = async () => {
+      setRefreshingReadiness(true);
+      setReadinessError('');
+      try {
+        const items = await apiGetStartupReadiness();
+        if (!cancelled) setReadiness(items);
+      } catch {
+        if (!cancelled) setReadinessError('Could not load system readiness.');
+      } finally {
+        if (!cancelled) setRefreshingReadiness(false);
+      }
+    };
+    let cancelled = false;
+    void loadReadiness();
+    return () => { cancelled = true; };
+  }, [readinessRevision]);
+
+  useEffect(() => {
+    const refresh = () => setReadinessRevision(value => value + 1);
+    window.addEventListener('openharness:provider-saved', refresh);
+    return () => window.removeEventListener('openharness:provider-saved', refresh);
+  }, []);
+
+  const refreshReadiness = () => setReadinessRevision(value => value + 1);
+  const statusLabel = (status: ReadinessComponentLike['status']) => status.replaceAll('_', ' ');
+  const actionableMessage = (component: ReadinessComponentLike) => component.message;
+
+  const readinessPanel = (
+    <section className="update-panel" aria-labelledby="readiness-heading">
+      <div className="updates-row"><div className="updates-icon"><ServerIcon width={18}/></div><div className="updates-copy"><h2 id="readiness-heading">System status</h2><p>Component health and actions. Secrets are never shown.</p></div></div>
+      <div className="update-row"><span className="update-status">{readinessError || (refreshingReadiness ? 'Checking components…' : 'Startup diagnostics')}</span><button className="check-updates" onClick={refreshReadiness} disabled={refreshingReadiness}>{refreshingReadiness ? 'Checking…' : 'Refresh status'}</button></div>
+      <div className="readiness-list" role="list">
+        {readiness.map(component => <div className="readiness-item" role="listitem" key={component.id}><div className="readiness-heading-row"><strong>{component.displayName}</strong><span className={`readiness-status readiness-${component.status}`}>{statusLabel(component.status)}</span></div><p>{actionableMessage(component)}</p></div>)}
+      </div>
+    </section>
+  );
   const visibleSections = sections.filter(section => section.toLowerCase().includes(search.toLowerCase()));
   const activeSection = visibleSections.includes(selectedSection) ? selectedSection : (visibleSections[0] ?? '');
   const noResults = search.trim() !== '' && visibleSections.length === 0;
@@ -284,17 +345,21 @@ export function SettingsPage({onClose, initialSection = 'Providers'}: SettingsPa
     try {
       setSavedProviders(await apiListProviders());
       setProviderError('');
+      refreshReadiness();
     } catch (error) {
       setProviderError(String(error));
     }
   };
 
   const checkForUpdates = async () => {
+    if (updateInFlight.current) return;
+    updateInFlight.current = true;
     setCheckingUpdate(true);
     setUpdateStatus('Checking for updates…');
+    const showStatus = (message: string) => { if (updateMounted.current) setUpdateStatus(message); };
     try {
       if (!isTauri()) {
-        setUpdateStatus('Updates are available only in the desktop app.');
+        showStatus('Updates are available only in the desktop app.');
         return;
       }
       const {check} = await import('@tauri-apps/plugin-updater');
@@ -306,27 +371,37 @@ export function SettingsPage({onClose, initialSection = 'Providers'}: SettingsPa
           const {getVersion} = await import('@tauri-apps/api/app');
           currentVer = await getVersion();
         } catch {}
-        setUpdateStatus(currentVer ? `You are on the latest version (v${currentVer}).` : 'You are on the latest version.');
+        showStatus(currentVer ? `You are on the latest version (v${currentVer}).` : 'You are on the latest version.');
         return;
       }
-      setUpdateStatus(`Update available: v${update.version} (current: v${update.currentVersion}). Downloading…`);
-      await update.downloadAndInstall((event) => {
-        if (event.event === 'Progress') {
-          setUpdateStatus(`Downloading v${update.version}… ${Math.round((event.data?.chunkLength ?? 0) / 1024)} KB received`);
+      showStatus(`Update available: v${update.version} (current: v${update.currentVersion}). Starting download…`);
+      const progress = createDownloadProgress();
+      let totalBytes: number | undefined;
+      await update.downloadAndInstall(event => {
+        if (event.event === 'Started') {
+          totalBytes = event.data.contentLength;
+          showStatus(totalBytes && totalBytes > 0 ? `Downloading v${update.version}… 0 KB of ${Math.ceil(totalBytes / 1024).toLocaleString()} KB` : `Downloading v${update.version}…`);
+        } else if (event.event === 'Progress') {
+          const current = progress.add(event.data.chunkLength, totalBytes);
+          const totalText = current.total === null ? '' : ` of ${Math.ceil(current.total / 1024).toLocaleString()} KB`;
+          showStatus(`Downloading v${update.version}… ${Math.ceil(current.downloaded / 1024).toLocaleString()} KB${totalText}`);
+        } else if (event.event === 'Finished') {
+          showStatus(`Download complete. Installing v${update.version}…`);
         }
       });
-      setUpdateStatus(`Update v${update.version} installed. Relaunching…`);
+      showStatus(`Update v${update.version} installed. Relaunching…`);
       await relaunch();
     } catch (error) {
-      setUpdateStatus(`Could not check for updates: ${String(error)}`);
+      showStatus(`Update failed: ${String(error)}`);
     } finally {
-      setCheckingUpdate(false);
+      updateInFlight.current = false;
+      if (updateMounted.current) setCheckingUpdate(false);
     }
   };
 
   return (
-    <div className="settings-modal-backdrop" onClick={onClose}>
-      <div className="settings-page settings-modal" role="dialog" aria-modal="true" aria-label="Settings" onClick={e => e.stopPropagation()}>
+    <div ref={backdropRef} className="settings-modal-backdrop" onMouseDown={event => { if (event.target === event.currentTarget) onClose(); }}>
+          <div ref={dialogRef} className="settings-page settings-modal" role="dialog" aria-modal="true" aria-label="Settings" tabIndex={-1} onKeyDown={handleDialogKeyDown} onClick={e => e.stopPropagation()}>
       <button ref={closeRef} className="settings-close settings-modal-close" type="button" aria-label="Close settings" title="Close settings" onClick={onClose}><XMarkIcon width={16}/></button>
       <aside className="settings-nav">
         <div className="settings-nav-header"><h2>Settings</h2></div>
@@ -342,7 +417,7 @@ export function SettingsPage({onClose, initialSection = 'Providers'}: SettingsPa
         </nav>
       </aside>
       <main className="settings-content">
-        {activeSection === 'Providers' ? <>
+        {activeSection === 'System Status' ? readinessPanel : activeSection === 'Providers' ? <>
           <section className="settings-section-heading"><h1>Providers</h1><p>Connect a service to choose which models power your conversations.</p></section>
           <div className="providers-card">
             <section className="provider-detail">
@@ -361,7 +436,7 @@ export function SettingsPage({onClose, initialSection = 'Providers'}: SettingsPa
             </div>
             <div className="update-row">
               <span className="update-status">{updateStatus || 'Check for the latest version of OpenHarness.'}</span>
-              <button className="check-updates" onClick={checkForUpdates} disabled={checkingUpdate} title="Check for updates">{checkingUpdate ? 'Checking…' : 'Check for updates'}</button>
+              <button className="check-updates" onClick={checkForUpdates} disabled={checkingUpdate} title="Check for updates">{checkingUpdate ? 'Updating…' : 'Check for updates'}</button>
             </div>
           </section>
         </> : (

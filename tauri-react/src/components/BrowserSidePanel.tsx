@@ -45,14 +45,37 @@ export function BrowserSidePanel({width, setWidth, onClose}: BrowserSidePanelPro
   const [historyIndex, setHistoryIndex] = useState(0);
   const [viewportMode, setViewportMode] = useState<ViewportMode>('fill');
   const [loadError, setLoadError] = useState(false);
+  const [addressError, setAddressError] = useState('');
   const iframeRef = useRef<HTMLIFrameElement | null>(null);
+  const loadTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   useEffect(() => {
     try { localStorage.setItem(STORAGE_KEY, currentUrl); } catch {}
   }, [currentUrl]);
 
+  const beginLoad = () => {
+    if (loadTimer.current) clearTimeout(loadTimer.current);
+    loadTimer.current = setTimeout(() => {
+      setIsLoading(false);
+      setLoadError(true);
+    }, 20000);
+  };
+
+  useEffect(() => {
+    beginLoad();
+    return () => { if (loadTimer.current) clearTimeout(loadTimer.current); };
+  }, []);
+
   const navigateTo = (address: string) => {
-    const target = normalizeBrowserAddress(address);
+    let target: string;
+    try { target = normalizeBrowserAddress(address); }
+    catch (error) {
+      setAddressError(error instanceof Error ? error.message : 'Invalid web address.');
+      setIsLoading(false);
+      setLoadError(false);
+      return;
+    }
+    setAddressError('');
     if (target !== currentUrl) {
       setHistory(previous => {
         const next = previous.slice(0, historyIndex + 1);
@@ -65,6 +88,7 @@ export function BrowserSidePanel({width, setWidth, onClose}: BrowserSidePanelPro
     setUrlInput(target);
     setIsLoading(true);
     setLoadError(false);
+    beginLoad();
   };
 
   const handleSubmit = (event: FormEvent) => {
@@ -80,12 +104,15 @@ export function BrowserSidePanel({width, setWidth, onClose}: BrowserSidePanelPro
     setUrlInput(target);
     setIsLoading(true);
     setLoadError(false);
+    setAddressError('');
+    beginLoad();
   };
 
   const handleReload = () => {
     if (!iframeRef.current) return;
     setIsLoading(true);
     setLoadError(false);
+    beginLoad();
     try {
       iframeRef.current.contentWindow?.location.reload();
     } catch {
@@ -150,6 +177,7 @@ export function BrowserSidePanel({width, setWidth, onClose}: BrowserSidePanelPro
           <button type="submit" className="browser-url-submit" aria-label="Navigate">Go</button>
         </form>
       </div>
+      {(addressError || loadError) && <div className="browser-status-warning" role="alert">{addressError || 'Site blocked or unavailable. Try opening it externally.'}</div>}
 
       <div className="browser-presets-bar">
         <span className="browser-presets-label">Quick:</span>
@@ -166,10 +194,10 @@ export function BrowserSidePanel({width, setWidth, onClose}: BrowserSidePanelPro
             src={currentUrl}
             title="Browser preview"
             className="browser-iframe"
-            sandbox="allow-scripts allow-same-origin allow-forms allow-popups allow-modals allow-downloads"
+            sandbox="allow-scripts allow-forms"
             referrerPolicy="strict-origin-when-cross-origin"
-            onLoad={() => { setIsLoading(false); setLoadError(false); }}
-            onError={() => { setIsLoading(false); setLoadError(true); }}
+            onLoad={() => { if (loadTimer.current) clearTimeout(loadTimer.current); setIsLoading(false); setLoadError(false); }}
+            onError={() => { if (loadTimer.current) clearTimeout(loadTimer.current); setIsLoading(false); setLoadError(true); }}
           />
         </div>
       </div>

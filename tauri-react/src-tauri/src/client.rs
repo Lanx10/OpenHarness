@@ -8,6 +8,8 @@ pub struct ModelMessage {
     pub role: String,
     pub content: String,
     pub attachments: Vec<String>,
+    pub tool_call_id: Option<String>,
+    pub tool_name: Option<String>,
 }
 
 pub struct ModelRequest<'a> {
@@ -67,7 +69,17 @@ impl ModelMessage {
             .to_string(),
             content: content.to_string(),
             attachments: Vec::new(),
+            tool_call_id: None,
+            tool_name: None,
         }
+    }
+
+    pub fn tool_result(id: &str, name: &str, content: &str) -> Self {
+        let mut message = Self::new("user", content);
+        message.role = "tool".to_string();
+        message.tool_call_id = Some(id.to_string());
+        message.tool_name = Some(name.to_string());
+        message
     }
 
     pub fn with_attachments(mut self, attachments: &[String]) -> Self {
@@ -233,13 +245,115 @@ async fn read_capped_error(response: reqwest::Response) -> String {
 }
 
 #[cfg(test)]
+mod utf8_stream_tests {
+    use super::{process_sse_line, push_utf8_chunk};
+
+    #[test]
+    fn final_sse_line_processes_content_tools_usage_finish_and_errors() {
+        let mut text = String::new();
+        let mut tools = std::collections::BTreeMap::new();
+        let mut tokens = Vec::new();
+        let mut usages = Vec::new();
+        let mut activities = Vec::new();
+        let mut error = None;
+        let mut token = |value| tokens.push(value);
+        let mut usage = |value| usages.push(value);
+        let mut activity = |value| activities.push(value);
+        let mut process = |line: &str| {
+            process_sse_line(
+                line,
+                "OpenRouter",
+                &mut text,
+                &mut tools,
+                &mut token,
+                &mut usage,
+                &mut activity,
+                &mut error,
+            )
+        };
+        process(r#"data: {"choices":[{"delta":{"content":"final"},"finish_reason":"stop"}]}"#);
+        process(
+            r#"data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","function":{"name":"read","arguments":"{}"}}]}}]}"#,
+        );
+        process(r#"data: {"usage":{"prompt_tokens":3,"completion_tokens":2}}"#);
+        process("data: {malformed}");
+        process("data: [DONE]");
+        process(" ");
+        drop(process);
+        assert_eq!(text, "final");
+        assert_eq!(tokens, ["final"]);
+        assert_eq!(tools[&0].0, "call_1");
+        assert_eq!(tools[&0].1, "read");
+        assert_eq!(usages.len(), 1);
+        assert!(error.is_some());
+    }
+
+    #[test]
+    fn fragmented_utf8_is_preserved_and_invalid_sequences_replaced_at_eof() {
+        let expected = "ASCII é Filipino ñ 中文 日本語 한국어 😀 mixed";
+        let mut pending = Vec::new();
+        let mut output = String::new();
+        for byte in expected.as_bytes() {
+            push_utf8_chunk(&mut pending, &mut output, &[*byte], false).unwrap();
+        }
+        push_utf8_chunk(&mut pending, &mut output, &[], true).unwrap();
+        assert_eq!(output, expected);
+
+        let mut pending = Vec::new();
+        let mut output = String::new();
+        push_utf8_chunk(&mut pending, &mut output, &[0xf0, 0x9f], false).unwrap();
+        push_utf8_chunk(&mut pending, &mut output, &[0x41], false).unwrap();
+        push_utf8_chunk(&mut pending, &mut output, &[], true).unwrap();
+        assert_eq!(output, "�A");
+    }
+}
+
+#[cfg(test)]
 fn messages_json(messages: &[ModelMessage]) -> Vec<Value> {
     messages_json_checked(messages, false).expect("valid test fixture")
 }
 
+pub(crate) fn push_utf8_chunk(
+    pending: &mut Vec<u8>,
+    buffer: &mut String,
+    chunk: &[u8],
+    flush: bool,
+) -> Result<(), String> {
+    use std::str::Utf8Error;
+
+    pending.extend_from_slice(chunk);
+    loop {
+        match std::str::from_utf8(pending) {
+            Ok(text) => {
+                buffer.push_str(text);
+                pending.clear();
+                return Ok(());
+            }
+            Err(error) => {
+                let valid_len = error.valid_up_to();
+                let valid = std::str::from_utf8(&pending[..valid_len])
+                    .map_err(|error: Utf8Error| error.to_string())?;
+                buffer.push_str(valid);
+                pending.drain(..valid_len);
+                if let Some(invalid_len) = error.error_len() {
+                    buffer.push('\u{fffd}');
+                    pending.drain(..invalid_len);
+                } else if flush {
+                    buffer.push('\u{fffd}');
+                    pending.clear();
+                    return Ok(());
+                } else {
+                    return Ok(());
+                }
+            }
+        }
+    }
+}
+
 fn messages_json_checked(messages: &[ModelMessage], ollama: bool) -> Result<Vec<Value>, String> {
     let mut normalized: Vec<Value> = Vec::new();
-    for (i, message) in messages.iter().enumerate() {
+    for message in messages.iter().enumerate() {
+        let (i, message) = message;
         if message.role == "assistant"
             && let Ok(val) = serde_json::from_str::<Value>(&message.content)
             && val.get("tool_calls").is_some()
@@ -248,10 +362,30 @@ fn messages_json_checked(messages: &[ModelMessage], ollama: bool) -> Result<Vec<
             continue;
         }
 
+        if message.role == "tool" {
+            let id = message
+                .tool_call_id
+                .as_deref()
+                .ok_or_else(|| "Tool result is missing its call ID".to_string())?;
+            let name = message
+                .tool_name
+                .as_deref()
+                .ok_or_else(|| "Tool result is missing its tool name".to_string())?;
+            normalized.push(serde_json::json!({
+                "role": "tool",
+                "tool_call_id": id,
+                "name": name,
+                "content": message.content,
+            }));
+            continue;
+        }
+
         let role = if message.role == "system" {
             if i == 0 { "system" } else { "user" }
         } else if message.role == "assistant" {
             "assistant"
+        } else if message.role == "tool" {
+            "tool"
         } else {
             "user"
         };
@@ -333,19 +467,25 @@ fn endpoint_url(provider: &str, custom: Option<&str>) -> Result<String, String> 
     let Some(url) = custom else {
         return Ok(default_url.to_string());
     };
-    let parsed = reqwest::Url::parse(url).map_err(|_| format!("Invalid endpoint URL: {}", url))?;
+    let parsed = reqwest::Url::parse(url).map_err(|_| "Invalid endpoint URL".to_string())?;
+    if !matches!(parsed.scheme(), "http" | "https") {
+        return Err("Endpoint URL must use HTTP or HTTPS".into());
+    }
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        return Err("Endpoint URL must not contain embedded credentials".into());
+    }
     let host = parsed
         .host_str()
         .ok_or_else(|| "Endpoint URL must include a host".to_string())?;
-    let host_ip = host
-        .trim_start_matches('[')
-        .trim_end_matches(']')
-        .parse::<std::net::IpAddr>();
-    let private_or_local = match host_ip {
+    let host_address = host.trim_start_matches('[').trim_end_matches(']');
+    let loopback = match host_address.parse::<std::net::IpAddr>() {
+        Ok(ip) => ip.is_loopback(),
+        Err(_) => host == "localhost" || host.ends_with(".localhost"),
+    };
+    let private_or_local = match host_address.parse::<std::net::IpAddr>() {
         Ok(ip) => private_ip(ip),
         Err(_) => {
-            host == "localhost"
-                || host.ends_with(".localhost")
+            loopback
                 || host.ends_with(".local")
                 || host.ends_with(".internal")
                 || host.ends_with(".test")
@@ -368,7 +508,7 @@ fn endpoint_url(provider: &str, custom: Option<&str>) -> Result<String, String> 
     };
 
     match normalized.scheme() {
-        "http" if private_or_local && (provider == "Ollama" || provider == "OpenAI Compatible") => {
+        "http" if loopback && (provider == "Ollama" || provider == "OpenAI Compatible") => {
             Ok(normalized.to_string())
         }
         "https" if provider == "OpenAI Compatible" => Ok(normalized.to_string()),
@@ -678,6 +818,143 @@ pub async fn query_llm_stream(
     .await
 }
 
+fn process_sse_line<OnToken, OnUsage, OnActivity>(
+    line: &str,
+    provider: &str,
+    accumulated: &mut String,
+    tool_accumulator: &mut std::collections::BTreeMap<usize, (String, String, String)>,
+    on_token: &mut OnToken,
+    on_usage: &mut OnUsage,
+    on_activity: &mut OnActivity,
+    stream_error: &mut Option<String>,
+) where
+    OnToken: FnMut(String),
+    OnUsage: FnMut(ProviderUsage),
+    OnActivity: FnMut(String),
+{
+    let Some(data) = line.strip_prefix("data:") else {
+        return;
+    };
+    let data = data.trim();
+    if data.is_empty() || data == "[DONE]" {
+        return;
+    }
+    process_sse_data(
+        data,
+        provider,
+        accumulated,
+        tool_accumulator,
+        on_token,
+        on_usage,
+        on_activity,
+        stream_error,
+    );
+}
+
+fn process_sse_data<OnToken, OnUsage, OnActivity>(
+    data: &str,
+    provider: &str,
+    accumulated: &mut String,
+    tool_accumulator: &mut std::collections::BTreeMap<usize, (String, String, String)>,
+    on_token: &mut OnToken,
+    on_usage: &mut OnUsage,
+    on_activity: &mut OnActivity,
+    stream_error: &mut Option<String>,
+) where
+    OnToken: FnMut(String),
+    OnUsage: FnMut(ProviderUsage),
+    OnActivity: FnMut(String),
+{
+    if data.trim().is_empty() || data.trim() == "[DONE]" {
+        return;
+    }
+    let json = match serde_json::from_str::<Value>(data) {
+        Ok(json) => json,
+        Err(error) => {
+            *stream_error = Some(format!("Malformed {} stream event: {}", provider, error));
+            return;
+        }
+    };
+    if let Some(raw_usage) = json.get("usage").or_else(|| json.get("usageMetadata"))
+        && let Some(usage) = provider_usage_envelope(provider, raw_usage)
+    {
+        on_usage(usage);
+    } else if matches!(provider, "Google AI Studio" | "Ollama")
+        && let Some(usage) = provider_usage_envelope(provider, &json)
+    {
+        on_usage(usage);
+    }
+    if let Some(error) = json.get("error") {
+        *stream_error = Some(format!(
+            "{} returned error: {}",
+            provider,
+            safe_error_body(&error.to_string())
+        ));
+    }
+    if let Some(reasoning) = json["choices"][0]["delta"]["reasoning"]
+        .as_str()
+        .filter(|s| !s.is_empty())
+    {
+        on_activity(format!("[agent-step]{}", reasoning));
+    }
+    if let Some(content) = json["choices"][0]["delta"]["content"]
+        .as_str()
+        .or_else(|| json["choices"][0]["message"]["content"].as_str())
+        .filter(|s| !s.is_empty())
+    {
+        accumulated.push_str(content);
+        on_token(content.to_string());
+    }
+    if let Some(calls) = json["choices"][0]["delta"]["tool_calls"]
+        .as_array()
+        .or_else(|| json["choices"][0]["message"]["tool_calls"].as_array())
+        .filter(|calls| !calls.is_empty())
+    {
+        for (fallback_idx, tc) in calls.iter().enumerate() {
+            let index = tc
+                .get("index")
+                .and_then(Value::as_u64)
+                .map(|v| v as usize)
+                .unwrap_or(fallback_idx);
+            let entry = tool_accumulator.entry(index).or_default();
+            if let Some(id) = tc
+                .get("id")
+                .and_then(Value::as_str)
+                .filter(|s| !s.is_empty())
+            {
+                entry.0 = id.to_string();
+            }
+            if let Some(name) = tc
+                .pointer("/function/name")
+                .and_then(Value::as_str)
+                .filter(|s| !s.is_empty())
+            {
+                entry.1 = name.to_string();
+            }
+            if let Some(args) = tc.pointer("/function/arguments") {
+                if let Some(args) = args.as_str() {
+                    entry.2.push_str(args);
+                } else if args.is_object() {
+                    entry.2 = args.to_string();
+                }
+            }
+        }
+    }
+    if let Some(reason) = json["choices"][0]["finish_reason"].as_str() {
+        match reason {
+            "length" => *stream_error = Some(
+                "Model response was truncated (finish_reason=length). Retry with a shorter prompt."
+                    .to_string(),
+            ),
+            "content_filter" => {
+                *stream_error =
+                    Some("Model response was blocked by the provider's content filter.".to_string())
+            }
+            _ => {}
+        }
+    }
+}
+
 pub async fn query_llm_stream_with_tools(
     request: StreamingModelRequest<'_>,
     callbacks: ModelCallbacks<
@@ -698,9 +975,9 @@ pub async fn query_llm_stream_with_tools(
         supports_vision,
     } = request;
     let ModelCallbacks {
-        on_token,
-        on_usage,
-        on_activity,
+        mut on_token,
+        mut on_usage,
+        mut on_activity,
     } = callbacks;
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(120))
@@ -755,12 +1032,15 @@ pub async fn query_llm_stream_with_tools(
             let mut stream = res.bytes_stream();
             let mut accumulated = String::new();
             let mut buffer = String::new();
+            let mut utf8_pending = Vec::new();
             let mut native_calls = Vec::new();
             let mut received_bytes = 0;
             while let Some(chunk) = stream.next().await {
                 let chunk = chunk.map_err(|e| e.to_string())?;
                 add_response_bytes(&mut received_bytes, chunk.len())?;
-                buffer.push_str(&String::from_utf8_lossy(&chunk));
+                if let Err(error) = push_utf8_chunk(&mut utf8_pending, &mut buffer, &chunk, false) {
+                    return Err(error);
+                }
                 while let Some(pos) = buffer.find('\n') {
                     let line = buffer[..pos].trim().to_string();
                     buffer.drain(..=pos);
@@ -781,6 +1061,7 @@ pub async fn query_llm_stream_with_tools(
                     }
                 }
             }
+            push_utf8_chunk(&mut utf8_pending, &mut buffer, &[], true)?;
             if !buffer.trim().is_empty()
                 && let Ok(json) = serde_json::from_str::<Value>(buffer.trim())
             {
@@ -861,117 +1142,54 @@ pub async fn query_llm_stream_with_tools(
             let mut stream = res.bytes_stream();
             let mut accumulated = String::new();
             let mut buffer = String::new();
+            let mut utf8_pending = Vec::new();
             let mut stream_error = None;
             let mut tool_accumulator: std::collections::BTreeMap<usize, (String, String, String)> =
                 std::collections::BTreeMap::new();
             let mut received_bytes = 0;
-            while let Some(chunk) = stream.next().await {
-                let chunk = chunk.map_err(|e| e.to_string())?;
-                add_response_bytes(&mut received_bytes, chunk.len())?;
-                buffer.push_str(&String::from_utf8_lossy(&chunk));
+            loop {
+                let at_eof = match stream.next().await {
+                    Some(chunk) => {
+                        let chunk = chunk.map_err(|e| e.to_string())?;
+                        add_response_bytes(&mut received_bytes, chunk.len())?;
+                        push_utf8_chunk(&mut utf8_pending, &mut buffer, &chunk, false)?;
+                        false
+                    }
+                    None => {
+                        push_utf8_chunk(&mut utf8_pending, &mut buffer, &[], true)?;
+                        true
+                    }
+                };
                 while let Some(pos) = buffer.find('\n') {
-                    let line = buffer[..pos].to_string();
+                    let line = buffer[..pos].trim().to_string();
                     buffer.drain(..=pos);
-                    let line = line.trim();
-                    if !line.starts_with("data:") {
-                        continue;
+                    if !line.is_empty() {
+                        process_sse_line(
+                            &line,
+                            provider,
+                            &mut accumulated,
+                            &mut tool_accumulator,
+                            &mut on_token,
+                            &mut on_usage,
+                            &mut on_activity,
+                            &mut stream_error,
+                        );
                     }
-                    let data = line[5..].trim();
-                    if data == "[DONE]" {
-                        continue;
+                }
+                if at_eof {
+                    if !buffer.trim().is_empty() {
+                        process_sse_line(
+                            buffer.trim(),
+                            provider,
+                            &mut accumulated,
+                            &mut tool_accumulator,
+                            &mut on_token,
+                            &mut on_usage,
+                            &mut on_activity,
+                            &mut stream_error,
+                        );
                     }
-                    if let Ok(json) = serde_json::from_str::<Value>(data) {
-                        if let Some(raw_usage) =
-                            json.get("usage").or_else(|| json.get("usageMetadata"))
-                            && let Some(usage) = provider_usage_envelope(provider, raw_usage)
-                        {
-                            on_usage(usage);
-                        } else if provider == "Google AI Studio"
-                            && let Some(usage) = provider_usage_envelope(provider, &json)
-                        {
-                            on_usage(usage);
-                        } else if provider == "Ollama"
-                            && let Some(usage) = provider_usage_envelope(provider, &json)
-                        {
-                            on_usage(usage);
-                        }
-                        if let Some(reasoning) = json["choices"][0]["delta"]["reasoning"]
-                            .as_str()
-                            .filter(|s| !s.is_empty())
-                        {
-                            on_activity(format!("[agent-step]{}", reasoning));
-                        }
-                        if let Some(content) = json["choices"][0]["delta"]["content"]
-                            .as_str()
-                            .filter(|s| !s.is_empty())
-                        {
-                            accumulated.push_str(content);
-                            on_token(content.to_string());
-                            continue;
-                        }
-                        if let Some(content) = json["choices"][0]["message"]["content"]
-                            .as_str()
-                            .filter(|s| !s.is_empty())
-                        {
-                            accumulated.push_str(content);
-                            on_token(content.to_string());
-                            continue;
-                        }
-                        let tool_calls = json["choices"][0]["delta"]["tool_calls"]
-                            .as_array()
-                            .or_else(|| json["choices"][0]["message"]["tool_calls"].as_array());
-                        if let Some(tool_calls) = tool_calls.filter(|calls| !calls.is_empty()) {
-                            for (fallback_idx, tc) in tool_calls.iter().enumerate() {
-                                let index = tc
-                                    .get("index")
-                                    .and_then(|v| v.as_u64())
-                                    .map(|v| v as usize)
-                                    .unwrap_or(fallback_idx);
-                                let entry = tool_accumulator.entry(index).or_insert_with(|| {
-                                    (String::new(), String::new(), String::new())
-                                });
-                                if let Some(id) = tc.get("id").and_then(|v| v.as_str())
-                                    && !id.is_empty()
-                                {
-                                    entry.0 = id.to_string();
-                                }
-                                if let Some(name) =
-                                    tc.pointer("/function/name").and_then(|v| v.as_str())
-                                    && !name.is_empty()
-                                {
-                                    entry.1 = name.to_string();
-                                }
-                                if let Some(args_chunk) =
-                                    tc.pointer("/function/arguments").and_then(|v| v.as_str())
-                                {
-                                    entry.2.push_str(args_chunk);
-                                } else if let Some(args_obj) = tc
-                                    .pointer("/function/arguments")
-                                    .and_then(|v| v.as_object())
-                                {
-                                    entry.2 = serde_json::to_string(args_obj).unwrap_or_default();
-                                }
-                            }
-                            continue;
-                        }
-                        if let Some(reason) = json["choices"][0]["finish_reason"].as_str() {
-                            if reason == "length" {
-                                stream_error = Some("Model response was truncated (finish_reason=length). Retry with a shorter prompt.".to_string());
-                            } else if reason == "content_filter" {
-                                stream_error = Some(
-                                    "Model response was blocked by the provider's content filter."
-                                        .to_string(),
-                                );
-                            }
-                        }
-                        if let Some(error) = json.get("error") {
-                            stream_error = Some(format!(
-                                "{} returned error: {}",
-                                provider,
-                                safe_error_body(&error.to_string())
-                            ));
-                        }
-                    }
+                    break;
                 }
             }
             if !tool_accumulator.is_empty() {
@@ -1000,19 +1218,6 @@ pub async fn query_llm_stream_with_tools(
             if let Some(error) = stream_error {
                 return Err(error);
             }
-            if !buffer.trim().is_empty() {
-                let line = buffer.trim();
-                if let Some(data) = line.strip_prefix("data:")
-                    && data.trim() != "[DONE]"
-                    && let Ok(json) = serde_json::from_str::<Value>(data.trim())
-                    && let Some(content) = json["choices"][0]["delta"]["content"]
-                        .as_str()
-                        .filter(|s| !s.is_empty())
-                {
-                    accumulated.push_str(content);
-                    on_token(content.to_string());
-                }
-            }
             if accumulated.is_empty() {
                 Err("Provider stream completed without text. The model may have returned tool calls or an unsupported response format.".to_string())
             } else {
@@ -1029,6 +1234,45 @@ mod image_payload_tests {
         ModelMessage, attach_images_to_user, image_data_urls, is_image_attachment, messages_json,
         messages_json_checked,
     };
+
+    #[test]
+    fn serializes_tool_results_with_original_call_ids_and_order() {
+        let messages = vec![
+            ModelMessage::new(
+                "assistant",
+                r#"{"role":"assistant","content":null,"tool_calls":[{"id":"call_a","type":"function","function":{"name":"read_file","arguments":"{}"}},{"id":"call_b","type":"function","function":{"name":"git_status","arguments":"{}"}}]}"#,
+            ),
+            ModelMessage::tool_result("call_a", "read_file", "{\"success\":true}"),
+            ModelMessage::tool_result(
+                "call_b",
+                "git_status",
+                "{\"success\":false,\"error\":\"failed\"}",
+            ),
+            ModelMessage::new("assistant", "Recovered."),
+        ];
+        let payload = messages_json_checked(&messages, false).unwrap();
+        assert_eq!(payload[0]["tool_calls"][0]["id"], "call_a");
+        assert_eq!(payload[0]["tool_calls"][1]["id"], "call_b");
+        assert_eq!(payload[1]["role"], "tool");
+        assert_eq!(payload[1]["tool_call_id"], "call_a");
+        assert_eq!(payload[2]["role"], "tool");
+        assert_eq!(payload[2]["tool_call_id"], "call_b");
+        assert_eq!(payload[1]["content"], "{\"success\":true}");
+        assert_eq!(
+            payload[2]["content"],
+            "{\"success\":false,\"error\":\"failed\"}"
+        );
+        assert_eq!(payload[3]["role"], "assistant");
+        assert_eq!(payload[3]["content"], "Recovered.");
+    }
+
+    #[test]
+    fn rejects_tool_result_without_call_identity() {
+        let mut result = ModelMessage::new("user", "{}");
+        result.role = "tool".into();
+        result.tool_call_id = Some("call_1".into());
+        assert!(messages_json_checked(&[result], false).is_err());
+    }
 
     #[test]
     #[ignore = "manual release-mode microbenchmark"]
@@ -1049,6 +1293,35 @@ mod image_payload_tests {
             black_box(messages_json(black_box(&messages)));
         }
         eprintln!("messages_json: 1000 iterations, {:?}", started.elapsed());
+    }
+
+    #[test]
+    fn provider_endpoint_requires_https_for_remote_hosts_and_rejects_credentials() {
+        for endpoint in [
+            "http://api.example.com/v1",
+            "http://192.0.2.10/v1",
+            "http://10.0.0.5/v1",
+            "ftp://localhost/v1",
+            "https://user:pass@example.com/v1",
+            "https://example.com:99999/v1",
+        ] {
+            assert!(
+                super::validated_endpoint_for_test("OpenAI Compatible", Some(endpoint)).is_err(),
+                "accepted unsafe endpoint {endpoint}"
+            );
+        }
+        for endpoint in [
+            "http://localhost/v1",
+            "http://127.0.0.1/v1",
+            "http://[::1]/v1",
+            "https://api.example.com/v1/",
+            "https://api.example.com/custom/api",
+        ] {
+            assert!(
+                super::validated_endpoint_for_test("OpenAI Compatible", Some(endpoint)).is_ok(),
+                "rejected valid endpoint {endpoint}"
+            );
+        }
     }
 
     #[test]

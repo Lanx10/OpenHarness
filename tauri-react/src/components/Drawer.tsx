@@ -6,6 +6,7 @@ const DRAWER_MAX_WIDTH = 260;
 const DRAWER_COLLAPSED_WIDTH = 52;
 import {apiCreateProject, apiGetProjects, apiSelectProject, apiRenameProject, apiDeleteProject, apiRelinkProject, type ProjectInfo} from '../services/tauriBridge';
 import {pickProjectFolder} from '../services/tauriBridge';
+import {containTabKey} from './modalFocus';
 
 export function Drawer() {
   const [projects, setProjects] = useState<ProjectInfo[]>([]);
@@ -29,7 +30,44 @@ export function Drawer() {
   const [projectPath, setProjectPath] = useState<string | null>(null);
   const [notice, setNotice] = useState('');
   const [isSelecting, setIsSelecting] = useState(false);
+  const [isCreatingProject, setIsCreatingProject] = useState(false);
+  const [projectCreationError, setProjectCreationError] = useState('');
+  const creatingProjectRef = useRef(false);
+  const projectCreatedRef = useRef(false);
   const searchInputRef = useRef<HTMLInputElement>(null);
+  const projectDialogRef = useRef<HTMLDivElement>(null);
+  const projectBackdropRef = useRef<HTMLDivElement>(null);
+  const projectDialogOpenerRef = useRef<HTMLElement | null>(null);
+  const projectNameRef = useRef<HTMLInputElement>(null);
+
+  const closeProjectDialog = () => {
+    if (creatingProjectRef.current) return;
+    setProjectModalOpen(false);
+    window.requestAnimationFrame(() => {
+      const opener = projectDialogOpenerRef.current;
+      if (opener?.isConnected) opener.focus();
+      else document.querySelector<HTMLElement>('#new-thread')?.focus();
+    });
+  };
+
+  useEffect(() => {
+    if (!projectModalOpen) return;
+    projectDialogOpenerRef.current = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+    const backdrop = projectBackdropRef.current;
+    const background = backdrop?.parentElement ? Array.from(backdrop.parentElement.children).filter((child): child is HTMLElement => child instanceof HTMLElement && child !== backdrop) : [];
+    const previous = background.map(element => element.inert);
+    background.forEach(element => { element.inert = true; });
+    window.requestAnimationFrame(() => projectNameRef.current?.focus());
+    return () => background.forEach((element, index) => { element.inert = previous[index]; });
+  }, [projectModalOpen]);
+
+  const handleProjectDialogKeyDown = (event: React.KeyboardEvent<HTMLDivElement>) => {
+    containTabKey(event.nativeEvent, event.currentTarget);
+    if (event.key === 'Escape' && !isSelecting) {
+      event.preventDefault();
+      closeProjectDialog();
+    }
+  };
 
   useEffect(() => {
     try {
@@ -124,6 +162,7 @@ export function Drawer() {
   useEffect(() => {
     const handleOpenProject = async () => {
       setProjectModalOpen(true);
+      setProjectCreationError('');
       setProjectName('');
       setProjectPath(null);
     };
@@ -150,22 +189,67 @@ export function Drawer() {
     }
   };
 
+  const refreshCreatedProject = async () => {
+    const updated = await apiGetProjects();
+    setProjects(updated);
+    const active = updated.find(project => project.active) ?? updated[0] ?? null;
+    setActiveProject(active);
+    window.dispatchEvent(new CustomEvent('openharness:select-project', {detail: active}));
+  };
+
+  const retryProjectRefresh = async () => {
+    if (creatingProjectRef.current || !projectCreatedRef.current) return;
+    creatingProjectRef.current = true;
+    setIsCreatingProject(true);
+    setProjectCreationError('');
+    try {
+      await refreshCreatedProject();
+      projectCreatedRef.current = false;
+      creatingProjectRef.current = false;
+      closeProjectDialog();
+      setNotice(`Project "${projectName.trim()}" opened`);
+      window.setTimeout(() => setNotice(''), 2500);
+    } catch (error) {
+      setProjectCreationError(`Project was created, but the project list could not be refreshed: ${String(error)}`);
+    } finally {
+      creatingProjectRef.current = false;
+      setIsCreatingProject(false);
+    }
+  };
+
   const createProject = async () => {
     const name = projectName.trim();
-    if (!name) return;
+    if (creatingProjectRef.current || isSelecting) return;
+    if (!name) {
+      setProjectCreationError('Enter a project name.');
+      return;
+    }
+    if (projectPath && projects.some(project => project.path?.replace(/[\\/]+$/, '').toLowerCase() === projectPath.replace(/[\\/]+$/, '').toLowerCase())) {
+      setProjectCreationError('This folder is already registered as a project.');
+      return;
+    }
+    if (projectCreatedRef.current) {
+      setProjectCreationError('Project was already created. Refresh the project list before trying again.');
+      return;
+    }
+    creatingProjectRef.current = true;
+    setIsCreatingProject(true);
+    setProjectCreationError('');
     try {
       await apiCreateProject(name, projectPath);
-      const updated = await apiGetProjects();
-      setProjects(updated);
-      setProjectModalOpen(false);
-      setNotice(`Project "${name}" opened`);
-      window.setTimeout(() => setNotice(''), 2500);
-       const active = updated.find(project => project.active) ?? updated[0] ?? null;
-       setActiveProject(active);
-       if (active) window.dispatchEvent(new CustomEvent('openharness:select-project', {detail: active}));
-       else { setActiveProject(null); window.dispatchEvent(new CustomEvent('openharness:select-project', {detail: null})); }
-     } catch (error) {
-       setNotice(`Could not create project: ${String(error)}`);
+      projectCreatedRef.current = true;
+      creatingProjectRef.current = false;
+      await retryProjectRefresh();
+    } catch (error) {
+      const message = String(error);
+      setProjectCreationError(message.includes('Project folder does not exist')
+        ? 'The selected folder no longer exists. Choose a valid folder.'
+        : message.includes('Project name cannot be empty')
+          ? 'Enter a project name.'
+          : `Could not create project: ${message}`);
+      creatingProjectRef.current = false;
+      setIsCreatingProject(false);
+      return;
     }
   };
 
@@ -296,11 +380,11 @@ export function Drawer() {
         </>}
       </aside>
 
-      <div className={`modal-backdrop ${projectModalOpen ? 'open' : ''}`} role="presentation" onMouseDown={event => { if (event.target === event.currentTarget) setProjectModalOpen(false); }} onKeyDown={event => { if (event.key === 'Escape') setProjectModalOpen(false); }}>
-        <div className="modal" role="dialog" aria-modal="true" aria-labelledby="modal-title">
+      <div ref={projectBackdropRef} className={`modal-backdrop ${projectModalOpen ? 'open' : ''}`} role="presentation" onMouseDown={event => { if (event.target === event.currentTarget) closeProjectDialog(); }}>
+        {projectModalOpen && <div ref={projectDialogRef} className="modal" role="dialog" aria-modal="true" aria-labelledby="modal-title" tabIndex={-1} onKeyDown={handleProjectDialogKeyDown}>
           <div className="modal-header">
             <h2 id="modal-title">Open Project Folder</h2>
-            <button type="button" className="iconbtn" aria-label="Close modal" title="Close" onClick={() => setProjectModalOpen(false)}>
+            <button type="button" className="iconbtn" aria-label="Close modal" title="Close" onClick={closeProjectDialog}>
               <XMarkIcon width={16} height={16} aria-hidden="true" />
             </button>
           </div>
@@ -309,19 +393,20 @@ export function Drawer() {
           <label htmlFor="project-path-display" className="modal-sub-label">Selected Directory</label>
           <div className="folder-select-row">
             <input id="project-path-display" readOnly value={projectPath || 'No folder selected'} placeholder="Pick a directory" className={projectPath ? 'has-path' : ''} />
-            <button type="button" className="browse-btn" onClick={handleBrowseFolder} disabled={isSelecting}>
+            <button type="button" className="browse-btn" onClick={handleBrowseFolder} disabled={isSelecting || isCreatingProject}>
               <FolderIcon width={14} height={14} aria-hidden="true" /> {isSelecting ? 'Opening...' : 'Browse...'}
             </button>
           </div>
 
           <label htmlFor="project-name-input" className="modal-sub-label" style={{marginTop: '14px'}}>Project Name (Auto-synced)</label>
-          <input id="project-name-input" autoFocus value={projectName} onChange={event => setProjectName(event.target.value)} onKeyDown={event => { if (event.key === 'Enter') void createProject(); }} placeholder="Project name" aria-label="Project name"/>
-          
+          <input ref={projectNameRef} id="project-name-input" value={projectName} onChange={event => { setProjectName(event.target.value); setProjectCreationError(''); }} onKeyDown={event => { if (event.key === 'Enter') { event.preventDefault(); void createProject(); } }} placeholder="Project name" aria-label="Project name" aria-invalid={Boolean(projectCreationError) && !projectName.trim()} aria-describedby={projectCreationError ? 'project-create-error' : undefined} required disabled={isCreatingProject}/>
+          {projectCreationError && <p id="project-create-error" className="provider-error" role="alert">{projectCreationError}</p>}
+          {projectCreatedRef.current && <button type="button" onClick={() => void retryProjectRefresh()} disabled={isCreatingProject} aria-label="Retry project list refresh">{isCreatingProject ? 'Refreshing…' : 'Retry refresh'}</button>}
           <div className="modal-actions">
-            <button type="button" onClick={() => setProjectModalOpen(false)}>Cancel</button>
-            <button type="button" className="confirm" onClick={() => void createProject()} disabled={!projectName.trim()}>Open Project</button>
+            <button type="button" onClick={closeProjectDialog} disabled={isCreatingProject}>Cancel</button>
+            <button type="button" className="confirm" onClick={() => void createProject()} disabled={isCreatingProject || isSelecting || !projectName.trim()}>{isCreatingProject ? (projectCreatedRef.current ? 'Refreshing…' : 'Creating…') : 'Open Project'}</button>
           </div>
-        </div>
+        </div>}
       </div>
       {notice && <div className="drawer-notice" role="status" aria-live="polite">{notice}</div>}
     </>

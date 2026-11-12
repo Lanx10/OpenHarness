@@ -367,7 +367,7 @@ svg { display: block; }
   display: flex;
   height: 100%;
   max-width: calc(100% - 150px);
-  overflow-x: auto;
+  overflow: hidden;
   flex-shrink: 0;
   z-index: 6;
 }
@@ -376,7 +376,58 @@ svg { display: block; }
   position: relative;
   inset: auto;
   height: 100%;
+  min-width: 0;
+  flex: 0 1 auto;
   box-shadow: -18px 0 48px rgba(0, 0, 0, 0.35);
+}
+
+.docked-panels-split > .file-panel {
+  flex: 0 0 auto;
+}
+
+.file-panel-body,
+.file-panel-body > *,
+.workspace-files,
+.workspace-file-content,
+.git-diff-view {
+  min-width: 0;
+  max-width: 100%;
+}
+
+.file-panel-body {
+  overflow: auto;
+}
+
+.file-panel-body pre,
+.terminal-output,
+.conversation pre,
+.conversation table {
+  max-width: 100%;
+  overflow-x: auto;
+  overflow-wrap: anywhere;
+}
+
+.workspace-file-list,
+.file-entry,
+.file-preview-heading {
+  min-width: 0;
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.docked-panels-split .file-panel-resizer {
+  pointer-events: none;
+}
+
+@media (max-width: 760px) {
+  .docked-panels-layer {
+    max-width: 100%;
+  }
+
+  .docked-panels-layer > .file-panel {
+    max-width: 100%;
+  }
 }
 
 .docked-panels-split > .file-panel + .file-panel {
@@ -932,6 +983,20 @@ svg { display: block; }
   font: 12px/1.5 var(--font-mono);
   white-space: pre-wrap;
 }
+
+.terminal-jump-latest {
+  position: absolute;
+  right: 20px;
+  bottom: 56px;
+  z-index: 9;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  padding: 7px 12px;
+  background: var(--surface);
+  color: var(--fg);
+  cursor: pointer;
+}
+.terminal-jump-latest:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
 
 .terminal-input-row {
   display: flex;
@@ -1606,6 +1671,23 @@ svg { display: block; }
 }
 .conversation-entry { display: flow-root; margin: 0 0 20px; }
 .conversation-entry:last-child { margin-bottom: 0; }
+.jump-to-latest {
+  position: absolute;
+  z-index: 5;
+  left: 50%;
+  bottom: 116px;
+  transform: translateX(-50%);
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  padding: 8px 14px;
+  color: var(--foreground);
+  background: var(--card);
+  cursor: pointer;
+}
+.jump-to-latest:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+@media (prefers-reduced-motion: reduce) {
+  .jump-to-latest { scroll-behavior: auto; }
+}
 
 /* Message Layout */
 .chatgpt-user-row {

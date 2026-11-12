@@ -1,8 +1,13 @@
-import {useEffect, useRef, useState} from 'react';
+import {useEffect, useLayoutEffect, useRef, useState} from 'react';
+import {isNearBottom} from './conversationScroll';
+import {createRequestOwner} from './conversationRequests';
+import {CHAT_PANEL_GAP, getSplitLayout} from './splitLayout';
+import {containTabKey} from './modalFocus';
 import { SafeMarkdown } from './SafeMarkdown';
 import { MessageCrumbs } from './MessageCrumbs';
 import { readQueuedPrompts, upsertStep, markPromptActive, estimateMessageTokens, removeQueuedPrompt, nextQueuedPrompt, queuedPromptById, queuedPromptsForThread, persistQueuedPrompts, type QueuedPrompt } from './stepLifecycle';
 import type { Message } from '../types/message';
+import {addUsageOnce, emptyTokenUsage, isCurrentThreadLoad, tokenUsageTotals, type ProviderUsageLike} from './tokenUsage';
 import { cleanMessageText } from '../utils/cleanMessageText';
 import {isTauri} from '@tauri-apps/api/core';
 import {PlusIcon, ComputerDesktopIcon, ClipboardDocumentIcon, ArrowPathIcon, TrashIcon, ChevronLeftIcon, ChevronRightIcon, DocumentTextIcon, SquaresPlusIcon, ChatBubbleLeftIcon} from '@heroicons/react/20/solid';
@@ -244,7 +249,11 @@ export function Canvas() {
     setThreadId(id);
   };
   const [tokenLimits, setTokenLimits] = useState({context: 128_000, output: 4_096});
-  const [tokenUsage, setTokenUsage] = useState<{input: number | null; output: number | null; cached: number | null}>({input: null, output: null, cached: null});
+  const [tokenUsage, setTokenUsage] = useState(emptyTokenUsage);
+  const seenUsageRequestIds = useRef(new Set<string>());
+  const threadLoadRequest = useRef(0);
+  const requestOwner = useRef(createRequestOwner());
+  const [threadLoadError, setThreadLoadError] = useState('');
   const activeThread = threads.find(thread => thread.id === threadId) ?? null;
   const uncompactedMessages = activeThread?.messages.slice(activeThread.compacted_message_count ?? 0) ?? [];
   const estimatedContextTokens = uncompactedMessages.reduce((total, message) => total + estimateMessageTokens(message.text, message.attachments ?? []), 0)
@@ -273,6 +282,7 @@ export function Canvas() {
     } catch { return []; }
   });
   const projectIdRef = useRef<string | null>(null);
+  const projectSelectionMade = useRef(false);
   const updateProjectId = (id: string | null) => {
     projectIdRef.current = id;
     setProjectId(id);
@@ -315,11 +325,52 @@ export function Canvas() {
     });
   };
   const [approval, setApproval] = useState<ApprovalRequestLike | null>(null);
+  const approvalDialogRef = useRef<HTMLDivElement>(null);
+  const canvasLayoutRef = useRef<HTMLDivElement>(null);
+  const approvalOpenerRef = useRef<HTMLElement | null>(null);
+  const previousApprovalRef = useRef(false);
+  const inertBackgroundRef = useRef<Array<[HTMLElement, boolean]>>([]);
+  const [approvalBusy, setApprovalBusy] = useState(false);
+  useEffect(() => {
+    const opening = Boolean(approval);
+    const layout = canvasLayoutRef.current;
+    const backdrop = approvalDialogRef.current?.parentElement;
+    if (opening && !previousApprovalRef.current) {
+      approvalOpenerRef.current = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+      inertBackgroundRef.current = layout
+        ? Array.from(layout.children).filter((child): child is HTMLElement => child instanceof HTMLElement && child !== backdrop).map(element => [element, element.inert])
+        : [];
+      inertBackgroundRef.current.forEach(([element]) => { element.inert = true; });
+    }
+    if (opening) window.requestAnimationFrame(() => approvalDialogRef.current?.querySelector<HTMLButtonElement>('button:not([disabled])')?.focus());
+    else if (previousApprovalRef.current) {
+      inertBackgroundRef.current.forEach(([element, wasInert]) => { element.inert = wasInert; });
+      inertBackgroundRef.current = [];
+      const opener = approvalOpenerRef.current;
+      if (opener?.isConnected) opener.focus();
+      else document.querySelector<HTMLElement>('[aria-label="Approve once"]')?.focus();
+      approvalOpenerRef.current = null;
+    }
+    previousApprovalRef.current = opening;
+  }, [approval]);
+  const handleApprovalKeyDown = (event: React.KeyboardEvent<HTMLDivElement>) => {
+    containTabKey(event.nativeEvent, event.currentTarget);
+    if (event.key === 'Escape') event.preventDefault();
+  };
   const [learningCandidates, setLearningCandidates] = useState<NonNullable<ChatThreadLike['learning_candidates']>>([]);
   const [learningBusy, setLearningBusy] = useState(false);
   const [workspaceStatus, setWorkspaceStatus] = useState('');
   const [gitDiff, setGitDiff] = useState('');
   const [activeTool, setActiveTool] = useState<'terminal'|'browser'|'files'|'git'|null>(null);
+  const layoutElementRef = useRef<HTMLDivElement | null>(null);
+  const [layoutWidth, setLayoutWidth] = useState(0);
+  useEffect(() => {
+    const element = layoutElementRef.current;
+    if (!element) return;
+    const observer = new ResizeObserver(entries => setLayoutWidth(entries[0]?.contentRect.width ?? 0));
+    observer.observe(element);
+    return () => observer.disconnect();
+  }, []);
   const [terminalHeight, setTerminalHeight] = useState(() => {
     try { const saved = Number(localStorage.getItem('openharness:terminal-height')); return Number.isFinite(saved) && saved >= 140 && saved <= 600 ? saved : 240; }
     catch { return 240; }
@@ -346,8 +397,53 @@ export function Canvas() {
   const terminalCreationPending = useRef(false);
   const nextTerminalNumber = useRef(1);
   const terminalOutputRef = useRef<HTMLPreElement | null>(null);
+  const terminalScrollRef = useRef(new Map<string, {scrollTop: number; followLatest: boolean}>());
+  const terminalScrollFrameRef = useRef<number | null>(null);
+  const [terminalHasNewOutput, setTerminalHasNewOutput] = useState(false);
   const terminalInputRef = useRef<HTMLInputElement | null>(null);
+  const scheduleTerminalFollow = () => {
+    if (terminalScrollFrameRef.current !== null) return;
+    terminalScrollFrameRef.current = window.requestAnimationFrame(() => {
+      terminalScrollFrameRef.current = null;
+      const element = terminalOutputRef.current;
+      const id = activeTerminalId;
+      if (!element || !id) return;
+      const state = terminalScrollRef.current.get(id);
+      if (state?.followLatest) element.scrollTop = element.scrollHeight;
+      else setTerminalHasNewOutput(true);
+    });
+  };
+  const onTerminalScroll = (element: HTMLPreElement) => {
+    const id = activeTerminalId;
+    if (!id) return;
+    const followLatest = isNearBottom(element);
+    terminalScrollRef.current.set(id, {scrollTop: element.scrollTop, followLatest});
+    setTerminalHasNewOutput(!followLatest);
+  };
+  const jumpTerminalToLatest = () => {
+    const element = terminalOutputRef.current;
+    if (!element || !activeTerminalId) return;
+    terminalScrollRef.current.set(activeTerminalId, {scrollTop: element.scrollHeight, followLatest: true});
+    element.scrollTo({top: element.scrollHeight, behavior: window.matchMedia('(prefers-reduced-motion: reduce)').matches ? 'instant' : 'smooth'});
+    setTerminalHasNewOutput(false);
+  };
+  useEffect(() => () => {
+    if (terminalScrollFrameRef.current !== null) window.cancelAnimationFrame(terminalScrollFrameRef.current);
+  }, []);
+  useEffect(() => {
+    scheduleTerminalFollow();
+  }, [terminalTabs, activeTerminalId, terminalHeight]);
+  useLayoutEffect(() => {
+    const element = terminalOutputRef.current;
+    if (!element || !activeTerminalId) return;
+    const state = terminalScrollRef.current.get(activeTerminalId) ?? {scrollTop: element.scrollHeight, followLatest: true};
+    terminalScrollRef.current.set(activeTerminalId, state);
+    element.scrollTop = state.followLatest ? element.scrollHeight : Math.min(state.scrollTop, element.scrollHeight);
+    setTerminalHasNewOutput(!state.followLatest && element.scrollHeight > state.scrollTop + element.clientHeight);
+  }, [activeTerminalId]);
   const conversationRef = useRef<HTMLElement | null>(null);
+  const followConversationRef = useRef(true);
+  const [showJumpToLatest, setShowJumpToLatest] = useState(false);
 
   useEffect(() => {
     try { localStorage.setItem('openharness:terminal-height', String(terminalHeight)); } catch {}
@@ -372,7 +468,9 @@ export function Canvas() {
     if (firstQueued) queueRef.current(firstQueued.id);
   }, [threadId, queuedPrompts]);
 
+  const workspaceRequest = useRef(0);
   const refreshWorkspaceGit = async (currentProjectId: string | null) => {
+    const request = ++workspaceRequest.current;
     if (!currentProjectId) {
       setWorkspaceStatus('');
       setGitDiff('');
@@ -380,37 +478,43 @@ export function Canvas() {
     }
     try {
       const status = await apiGitStatus(currentProjectId);
-      setWorkspaceStatus(status.trim());
+      if (request === workspaceRequest.current && projectIdRef.current === currentProjectId) setWorkspaceStatus(status);
     } catch {
-      setWorkspaceStatus('');
+      if (request === workspaceRequest.current && projectIdRef.current === currentProjectId) setWorkspaceStatus('');
     }
     try {
-      setGitDiff((await apiGitDiff(currentProjectId)).trim());
+      const diff = (await apiGitDiff(currentProjectId)).trim();
+      if (request === workspaceRequest.current && projectIdRef.current === currentProjectId) setGitDiff(diff);
     } catch {
-      setGitDiff('');
+      if (request === workspaceRequest.current && projectIdRef.current === currentProjectId) setGitDiff('');
     }
   };
 
-  const loadThreadMessages = (thread: ChatThreadLike, resetCachedTokens = true) => {
+  const loadThreadMessages = (thread: ChatThreadLike) => {
     updateThreadId(thread.id);
-    if (resetCachedTokens) setTokenUsage({input: null, output: null, cached: null});
+    seenUsageRequestIds.current = new Set((thread.token_usage ?? []).map(record => record.requestId));
+    setTokenUsage(tokenUsageTotals(thread.token_usage));
     setLearningCandidates(thread.learning_candidates ?? []);
     setMessages(thread.messages.map((message, index) => ({
       id: message.id || `${thread.id}:${index}`,
       role: message.role === 'assistant' ? 'assistant' : 'user',
       text: message.text,
-      status: 'done',
+      status: message.outcome === 'failed' || message.outcome === 'request_limit_exhausted' ? 'error' : message.outcome === 'cancelled' ? 'cancelled' : message.outcome === 'interrupted' ? 'interrupted' : 'done',
       attachments: message.attachments,
     })));
   };
 
+  const threadListRequest = useRef(0);
   const refreshThreads = async (nextProjectId: string | null) => {
+    const request = ++threadListRequest.current;
     try {
       const items = await apiListThreads(nextProjectId ?? undefined);
+      if (request !== threadListRequest.current || projectIdRef.current !== nextProjectId) return [];
       setThreads(items);
       window.dispatchEvent(new CustomEvent('openharness:threads-updated', {detail: items}));
       return items;
     } catch {
+      if (request !== threadListRequest.current || projectIdRef.current !== nextProjectId) return [];
       setThreads([]);
       window.dispatchEvent(new CustomEvent('openharness:threads-updated', {detail: []}));
       return [];
@@ -420,7 +524,7 @@ export function Canvas() {
   useEffect(() => {
     let active = true;
     void apiGetProjects().then(items => {
-      if (active && !projectId && items.length) {
+      if (active && !projectSelectionMade.current && !projectIdRef.current && items.length) {
         const project = items.find(item => item.active) ?? items[0];
         const id = 'id' in project ? String(project.id) : '';
         if (id) {
@@ -468,7 +572,6 @@ export function Canvas() {
     const runPrompt = async (detail: {text: string; modelId: string; provider: string; projectId?: string | null; threadId?: string | null; attachments?: string[]; supportsVision?: boolean; modelContextTokens?: number; modelOutputTokens?: number; selectedSkills?: string[]; approvalMode?: 'manual' | 'automatic'}) => {
       let persistedUserMessage: ChatMessageLike | null = null;
       if (detail.modelContextTokens) setTokenLimits({context: detail.modelContextTokens, output: detail.modelOutputTokens ?? 4_096});
-      setTokenUsage({input: null, output: null, cached: null});
       const text = String(detail?.text ?? '').trim();
       if (!text && !(detail.attachments?.length)) {
       setRunInProgress(false);
@@ -508,6 +611,7 @@ export function Canvas() {
             return;
           }
           currentThreadId = thread.id;
+          threadListRequest.current++;
           setThreads(prev => [thread, ...prev.filter(item => item.id !== thread.id)]);
           updateThreadId(thread.id);
           } catch (error) {
@@ -520,12 +624,14 @@ export function Canvas() {
       }
       if (currentThreadId) compactedThreadsRef.current.delete(currentThreadId);
       const userMessage: Message = {id: `u-${Date.now()}`, role: 'user', text, status: 'queued', attachments: detail.attachments};
+      followConversationRef.current = true;
       if (!detail.threadId) setMessages(prev => [...prev, userMessage]);
       const assistantId = `a-${Date.now()}`;
       if (detail.threadId) setMessages(previous => [...previous, {id: assistantId, role: 'assistant', text: '', status: 'thinking'}]);
       else setMessages(prev => [...prev, {id: assistantId, role: 'assistant', text: '', status: 'thinking'}]);
+      const streamId = crypto.randomUUID();
       const cancel = () => {
-        void apiCancelChatStream().catch(error => toast(`Could not stop: ${String(error)}`));
+        void apiCancelChatStream(streamId).catch(error => toast(`Could not stop: ${String(error)}`));
       };
       setStopHandle(() => cancel);
       try {
@@ -541,6 +647,7 @@ export function Canvas() {
         await apiChatStream(text, detail.modelId, detail.provider, targetProjectId ?? undefined, currentThreadId ?? undefined, detail.attachments, detail.supportsVision, activeSkills, detail.approvalMode ?? 'manual', persistedUserMessage?.id, (token) => {
           setMessages(prev => prev.map(message => message.id === assistantId ? {...message, text: message.text + token, status: 'thinking'} : message));
         }, () => {
+          setApproval(null);
           setMessages(prev => prev.map(message => message.id === assistantId ? {...message, status: 'done', steps: message.steps} : message.id === userMessage.id || message.id === persistedUserMessage?.id ? {...message, status: 'done' as const} : message));
           void refreshWorkspaceGit(targetProjectId);
         }, (error) => {
@@ -554,15 +661,14 @@ export function Canvas() {
           }
         }, (approvalRequest) => setApproval(approvalRequest), step => {
           setMessages(prev => prev.map(message => message.id === assistantId ? {...message, steps: upsertStep(message.steps ?? [], step), status: 'thinking'} : message));
-        }, usage => {
-          if (threadIdRef.current === currentThreadId) setTokenUsage(previous => ({
-            input: usage.input_tokens == null ? previous.input : (previous.input ?? 0) + usage.input_tokens,
-            output: usage.output_tokens == null ? previous.output : (previous.output ?? 0) + usage.output_tokens,
-            cached: usage.cached_input_tokens == null ? previous.cached : (previous.cached ?? 0) + usage.cached_input_tokens,
-          }));
-        });
+        }, (usage: ProviderUsageLike, requestId) => {
+          if (threadIdRef.current === currentThreadId && requestId) {
+            setTokenUsage(previous => addUsageOnce(previous, seenUsageRequestIds.current, requestId, usage));
+          }
+        }, streamId);
       } catch (error) {
         const text = String(error);
+        setApproval(null);
         if (text.includes('Generation stopped')) {
           setMessages(prev => prev.map(message => message.id === assistantId ? {...message, status: 'done'} : message.id === userMessage.id || message.id === persistedUserMessage?.id ? {...message, status: 'cancelled'} : message));
           toast('Generation stopped');
@@ -576,9 +682,10 @@ export function Canvas() {
         if (currentThreadId) {
           try {
             const thread = await apiGetThread(currentThreadId);
-            if (threadIdRef.current === currentThreadId) loadThreadMessages(thread, false);
+            if (threadIdRef.current === currentThreadId && projectIdRef.current === thread.project_id) loadThreadMessages(thread);
+            if (projectIdRef.current === thread.project_id) setThreads(previous => previous.map(item => item.id === currentThreadId ? thread : item));
             const uncompactedMessages = thread.messages.slice(thread.compacted_message_count ?? 0);
-            const projectedTokens = uncompactedMessages.reduce((total, message) => total + Math.ceil(message.text.length / 4) + (message.attachments ?? []).reduce((sum, attachment) => sum + Math.ceil(attachment.length / 4), 0), 0) + Math.ceil((thread.compacted_summary ?? '').length / 4);
+            const projectedTokens = uncompactedMessages.reduce((total, message) => total + estimateMessageTokens(message.text, message.attachments ?? []), 0) + estimateMessageTokens(thread.compacted_summary ?? '');
             if (projectedTokens / Math.max(1, activeLimits.context) >= 0.7) {
               void compactCurrentThread(currentThreadId, detail.provider, detail.modelId, activeLimits.context);
             }
@@ -669,26 +776,57 @@ export function Canvas() {
       setSelectedSkillNames(Array.isArray(detail?.names) ? detail.names.filter((name): name is string => typeof name === 'string') : []);
     };
     const startNewThread = () => {
+        threadLoadRequest.current += 1;
+        requestOwner.current.invalidate();
+        setThreadLoadError('');
+        seenUsageRequestIds.current.clear();
         setMessages([]);
-        setTokenUsage({input: null, output: null, cached: null});
+        setTokenUsage(emptyTokenUsage());
+        setLearningCandidates([]);
+        setApproval(null);
         updateThreadId(null);
         window.dispatchEvent(new CustomEvent('openharness:thread-title-updated', {detail: {title: 'OpenHarness'}}));
     };
     const onNewChat = startNewThread;
     const onOpenThread = async (selectedThreadId: string) => {
+      const request = ++threadLoadRequest.current;
+      const owner = requestOwner.current.begin(projectIdRef.current, selectedThreadId);
+      updateThreadId(selectedThreadId);
+      setMessages([]);
+      setTokenUsage(emptyTokenUsage());
+      seenUsageRequestIds.current.clear();
+      setLearningCandidates([]);
+      setApproval(null);
+      setThreadLoadError('');
       try {
         const thread = await apiGetThread(selectedThreadId);
-        if (!cancelled) {
-          loadThreadMessages(thread);
-          updateThreadId(thread.id);
-          window.dispatchEvent(new CustomEvent('openharness:select-project', {detail: {name: thread.title || 'OpenHarness'}}));
+        if (!isCurrentThreadLoad(threadLoadRequest.current, request)
+          || !requestOwner.current.isCurrent(owner, projectIdRef.current, selectedThreadId)
+          || thread.id !== selectedThreadId || thread.project_id !== projectIdRef.current) return;
+        loadThreadMessages(thread);
+      } catch (error) {
+        if (!cancelled && isCurrentThreadLoad(threadLoadRequest.current, request)
+          && requestOwner.current.isCurrent(owner, projectIdRef.current, selectedThreadId)) {
+          setThreadLoadError(String(error));
         }
-      } catch (error) { toast(String(error)); }
+      }
     };
     const onSelectProject = async (event: Event) => {
+      threadLoadRequest.current += 1;
+      requestOwner.current.invalidate();
+      threadListRequest.current++;
+      seenUsageRequestIds.current.clear();
+      projectSelectionMade.current = true;
       const project = (event as CustomEvent<{id?: string; name?: string; title?: string}>).detail;
       const nextProjectId = project?.id ?? null;
       updateProjectId(nextProjectId);
+      updateThreadId(null);
+      setThreadLoadError('');
+      setMessages([]);
+      setTokenUsage(emptyTokenUsage());
+      setLearningCandidates([]);
+      setApproval(null);
+      setThreads([]);
       try {
         const names: unknown = JSON.parse(localStorage.getItem('openharness:global-skills') || '[]');
         setSelectedSkillNames(Array.isArray(names) ? names.filter((name): name is string => typeof name === 'string') : []);
@@ -697,23 +835,32 @@ export function Canvas() {
           window.dispatchEvent(new CustomEvent('openharness:active-project', {detail: {id: nextProjectId, name: project?.name ?? project?.title ?? ''}}));
       updateThreadId(null);
         setMessages([]);
-       setTokenUsage({input: null, output: null, cached: null});
+       setTokenUsage(emptyTokenUsage());
        void refreshWorkspaceGit(nextProjectId);
       await refreshThreads(nextProjectId);
     };
     const onDeleteThread = async (selectedThreadId: string) => {
       if (!window.confirm('Delete this chat?')) return;
+      const projectAtStart = projectIdRef.current;
+      const request = ++threadLoadRequest.current;
+      threadListRequest.current++;
       try {
             const remaining = await apiDeleteThread(selectedThreadId);
+            if (request !== threadLoadRequest.current || projectIdRef.current !== projectAtStart) return;
             updateQueuedPrompts(previous => previous.filter(prompt => prompt.threadId !== selectedThreadId));
 
-        const filtered = projectId ? remaining.filter(t => t.project_id === projectId) : remaining;
+        const filtered = projectAtStart ? remaining.filter(t => t.project_id === projectAtStart) : remaining;
         setThreads(filtered);
                 if (threadIdRef.current === selectedThreadId) {
-                  updateThreadId(null);
-                  setMessages([]);
-                  if (filtered.length) loadThreadMessages(filtered[0]);
-                }
+            threadLoadRequest.current += 1;
+            requestOwner.current.invalidate();
+            setThreadLoadError('');
+            updateThreadId(null);
+            seenUsageRequestIds.current.clear();
+            setMessages([]);
+            setTokenUsage(emptyTokenUsage());
+            if (filtered.length) loadThreadMessages(filtered[0]);
+          }
       } catch (error) { toast(String(error)); }
     };
     const handleOpenThread = (event: Event) => void onOpenThread(String((event as CustomEvent<string>).detail));
@@ -746,9 +893,46 @@ export function Canvas() {
   }, [threadId, projectId]);
 
   useEffect(() => {
+    followConversationRef.current = true;
+    setShowJumpToLatest(false);
     const element = conversationRef.current;
     if (element) element.scrollTop = element.scrollHeight;
+  }, [threadId]);
+
+  useLayoutEffect(() => {
+    const element = conversationRef.current;
+    if (!element) return;
+    const updatePosition = () => {
+      const nearBottom = isNearBottom(element);
+      followConversationRef.current = nearBottom;
+      setShowJumpToLatest(!nearBottom);
+    };
+    const followLatest = () => {
+      if (followConversationRef.current) {
+        element.scrollTop = element.scrollHeight;
+        setShowJumpToLatest(false);
+      } else {
+        setShowJumpToLatest(true);
+      }
+    };
+    element.addEventListener('scroll', updatePosition, {passive: true});
+    followLatest();
+    const observer = new ResizeObserver(followLatest);
+    observer.observe(element);
+    for (const child of element.children) observer.observe(child);
+    return () => {
+      element.removeEventListener('scroll', updatePosition);
+      observer.disconnect();
+    };
   }, [messages]);
+
+  const jumpToLatest = () => {
+    const element = conversationRef.current;
+    if (!element) return;
+    followConversationRef.current = true;
+    element.scrollTo({top: element.scrollHeight, behavior: window.matchMedia('(prefers-reduced-motion: reduce)').matches ? 'instant' : 'smooth'});
+    setShowJumpToLatest(false);
+  };
 
   useEffect(() => {
     let unlistenOutput: (() => void) | undefined;
@@ -877,6 +1061,7 @@ export function Canvas() {
       const nextIndex = nextTerminalNumber.current++;
       const label = nextIndex === 1 ? 'Terminal' : `Terminal ${nextIndex}`;
       const initialOutput = shell === 'powershell' ? 'PowerShell ready.\r\n' : '';
+      terminalScrollRef.current.set(id, {scrollTop: 0, followLatest: true});
       setTerminalTabs(previous => [...previous, {id, label, shell, output: initialOutput, status: 'running'}]);
       setActiveTerminalId(id);
       setActiveTool('terminal');
@@ -915,12 +1100,15 @@ export function Canvas() {
   };
 
   const approveToolCall = async (allowed: boolean) => {
-    if (!approval) return;
+    if (!approval || approvalBusy) return;
+    setApprovalBusy(true);
     try {
       await apiRespondToToolApproval(approval.id, allowed);
       setApproval(null);
     } catch (error) {
       toast(`Approval failed: ${String(error)}`);
+    } finally {
+      setApprovalBusy(false);
     }
   };
 
@@ -928,7 +1116,7 @@ export function Canvas() {
     if (!projectId) { setWorkspaceStatus('Select a project to view Git status.'); setGitDiff(''); return; }
     try {
       const [status, diff] = await Promise.all([apiGitStatus(projectId), apiGitDiff(projectId)]);
-      setWorkspaceStatus(status.trim());
+      setWorkspaceStatus(status);
       setGitDiff(diff.trim());
       window.dispatchEvent(new CustomEvent('openharness:workspace-context', {detail: {status, diff}}));
     } catch (error) {
@@ -971,22 +1159,19 @@ export function Canvas() {
   };
 
   const empty = messages.length === 0;
-  const isSideBySide = splitPanels && (activeTool === 'files' || activeTool === 'git') && window.innerWidth >= 768;
-  const availableSplitWidth = Math.max(0, window.innerWidth - 700);
-  const splitScale = isSideBySide
-    ? Math.min(1, availableSplitWidth / (filePanelWidth + gitPanelWidth))
-    : 1;
-  const filesWidth = isSideBySide ? Math.round(filePanelWidth * splitScale) : filePanelWidth;
-  const gitWidth = isSideBySide ? Math.round(gitPanelWidth * splitScale) : gitPanelWidth;
-  const activeFileWidth = isSideBySide ? filesWidth : filePanelWidth;
-  const activeGitWidth = isSideBySide ? gitWidth : gitPanelWidth;
+  const isWorkspacePanel = activeTool === 'files' || activeTool === 'git';
+  const availableCanvasWidth = Math.max(0, layoutWidth - (threadsCollapsed ? 48 : threadsWidth));
+  const splitLayout = getSplitLayout(availableCanvasWidth, splitPanels && isWorkspacePanel, filePanelWidth, gitPanelWidth);
+  const isSideBySide = splitLayout.enabled;
+  const activeFileWidth = isSideBySide ? splitLayout.filesWidth : filePanelWidth;
+  const activeGitWidth = isSideBySide ? splitLayout.gitWidth : gitPanelWidth;
   const sidePanelWidth = isSideBySide
-    ? activeFileWidth + activeGitWidth
+    ? splitLayout.sidePanelWidth
     : activeTool === 'files' ? filePanelWidth : activeTool === 'git' ? gitPanelWidth : activeTool === 'browser' ? browserPanelWidth : 0;
-  const rightOffset = sidePanelWidth > 0 ? sidePanelWidth + 18 : 0;
+  const rightOffset = sidePanelWidth > 0 ? sidePanelWidth + CHAT_PANEL_GAP : 0;
 
   return (
-      <div className="canvas-layout">
+      <div className="canvas-layout" ref={element => { layoutElementRef.current = element; canvasLayoutRef.current = element; }}>
       {threadsCollapsed ? (
         <aside className="thread-sidebar thread-sidebar-collapsed" aria-label="Chat threads collapsed" style={{width: 48, minWidth: 48, flexBasis: 48}}>
           <button type="button" className="collapse-toggle-btn thread-toggle" onClick={toggleThreads} aria-label="Expand threads sidebar" title="Expand threads sidebar">
@@ -1047,6 +1232,8 @@ export function Canvas() {
               <div><strong>{tokenUsage.input?.toLocaleString() ?? '—'}</strong><span>provider input</span></div>
               <div><strong>{tokenUsage.output?.toLocaleString() ?? '—'}</strong><span>provider output</span></div>
               <div><strong>{tokenUsage.cached?.toLocaleString() ?? '—'}</strong><span>cached input</span></div>
+              <div><strong>{tokenUsage.reasoning?.toLocaleString() ?? '—'}</strong><span>reasoning</span></div>
+              <div><strong>{tokenUsage.total?.toLocaleString() ?? '—'}</strong><span>provider total</span></div>
             </div>
             <div className={`session-context-meter${nearContextLimit ? ' near-limit' : ''}`} role="progressbar" aria-label="Estimated context usage" aria-valuemin={0} aria-valuemax={100} aria-valuenow={Math.round(contextPercent)}>
               <span style={{width: `${contextPercent}%`}} />
@@ -1066,13 +1253,14 @@ export function Canvas() {
           } as React.CSSProperties
         }
       >
-        {workspaceStatus && (
+        {workspaceStatus && !workspaceStatus.includes('\0') && (
           <div className="git-status-badge" aria-label="Git repository status" title={workspaceStatus}>
-            <span>{workspaceStatus}</span>
+            <span>{workspaceStatus.split('\n')[0]}</span>
           </div>
         )}
         {/* browser rendered as docked right-side panel below */}
 
+        {threadLoadError && <div className="provider-error" role="alert">Could not load conversation: {threadLoadError}</div>}
         {empty && <Hero className={activeTool === 'terminal' ? 'hero-above-terminal' : undefined} />}
         <section className="conversation" aria-live="polite" ref={conversationRef} hidden={empty}>
           {messages.map(message => (
@@ -1081,6 +1269,7 @@ export function Canvas() {
             </div>
           ))}
         </section>
+        {showJumpToLatest && !empty && <button type="button" className="jump-to-latest" onClick={jumpToLatest}>Newer messages · Jump to latest</button>}
         {learningCandidates.length > 0 && <LearningProposalCard candidate={learningCandidates[0]} saving={learningBusy} onApprove={() => void reviewLearning('approve')} onDismiss={() => void reviewLearning('dismiss')} />}
         {visibleQueuedPrompts.length > 0 && (
           <section className="prompt-queue" aria-label="Queued prompts">
@@ -1097,14 +1286,14 @@ export function Canvas() {
           <Composer running={runInProgress} onStop={stopGenerating} />
         </div>
         {approval && (
-          <div className="approval-backdrop" role="alertdialog" aria-modal="true" aria-labelledby="tool-approval-title">
-            <div className="approval-dialog">
+          <div className="approval-backdrop" role="presentation">
+            <div ref={approvalDialogRef} className="approval-dialog" role="alertdialog" aria-modal="true" aria-labelledby="tool-approval-title" aria-describedby="tool-approval-description" tabIndex={-1} onKeyDown={handleApprovalKeyDown}>
               <h2 id="tool-approval-title">Approve workspace operation</h2>
-              <p><strong>{approval.tool}</strong> requests:</p>
+              <p id="tool-approval-description"><strong>{approval.tool}</strong> requests:</p>
               <pre>{JSON.stringify(approval.arguments, null, 2)}</pre>
               <div className="approval-actions">
-                <button type="button" onClick={() => void approveToolCall(false)}>Reject</button>
-                <button type="button" className="confirm" onClick={() => void approveToolCall(true)}>Approve once</button>
+                <button type="button" onClick={() => void approveToolCall(false)} disabled={approvalBusy}>Reject</button>
+                <button type="button" className="confirm" onClick={() => void approveToolCall(true)} disabled={approvalBusy}>Approve once</button>
               </div>
             </div>
           </div>
@@ -1123,7 +1312,8 @@ export function Canvas() {
               </div>
               <button type="button" className="workspace-tool-close" aria-label="Close terminal panel" onClick={() => setActiveTool(null)}>×</button>
             </div>
-            <pre className="terminal-output" ref={terminalOutputRef} tabIndex={0} aria-label="Terminal output">{terminalTabs.find(tab => tab.id === activeTerminalId)?.output || 'No terminal sessions. Use + Terminal.'}</pre>
+            <pre className="terminal-output" ref={terminalOutputRef} onScroll={event => onTerminalScroll(event.currentTarget)} tabIndex={0} aria-label="Terminal output">{terminalTabs.find(tab => tab.id === activeTerminalId)?.output || 'No terminal sessions. Use + Terminal.'}</pre>
+            {terminalHasNewOutput && <button type="button" className="terminal-jump-latest" onClick={jumpTerminalToLatest}>New terminal output · Jump to latest</button>}
             {(() => {
               const active = terminalTabs.find(tab => tab.id === activeTerminalId);
               if (active?.status === 'running') {
@@ -1146,7 +1336,7 @@ export function Canvas() {
         )}
         </main>
       {(activeTool === 'files' || activeTool === 'git') && (
-        <div className={`docked-panels-layer ${isSideBySide ? 'docked-panels-split' : ''}`}>
+        <div className={`docked-panels-layer ${isSideBySide ? 'docked-panels-split' : ''}`} style={isSideBySide ? {maxWidth: `${splitLayout.sidePanelWidth}px`} : undefined}>
           {(activeTool === 'files' || isSideBySide) && (
             <aside className="file-panel" aria-label="Files panel" style={{width: `${activeFileWidth}px`}}>
                 <div className="file-panel-header">

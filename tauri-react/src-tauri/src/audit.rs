@@ -20,15 +20,23 @@ pub enum EventKind {
     ProviderRequestStarted,
     ProviderRequestFinished,
     ProviderRequestFailed,
+    ProviderUsageReceived,
+    ToolRequested,
     ToolStarted,
+    ToolRejected,
     ToolApproval,
     ToolFinished,
     SkillDiscovered,
+    SkillActivationRequested,
     SkillActivated,
+    SkillActivationFailed,
     SandboxOperation,
     StreamCreated,
+    StreamStarted,
+    StreamFinished,
     StreamCancelled,
     StreamCleaned,
+    AgentFailed,
 }
 
 #[derive(Debug, Clone, Serialize)]

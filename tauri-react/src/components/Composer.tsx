@@ -1,15 +1,22 @@
 import {useEffect, useRef, useState} from 'react';
 import {ChevronDownIcon, ArrowUpIcon, PaperClipIcon, StopIcon, CheckIcon} from '@heroicons/react/20/solid';
 import {apiGetApprovalMode, apiListProviders, apiListSkills, apiUpdateApprovalMode, type ProviderInfo} from '../services/tauriBridge';
+import {parseSavedModel, reconcileModelSelection} from './providerSelection';
+import type {ProviderModel} from './providerSelection';
+import {inspectAttachment, MAX_ATTACHMENTS, MAX_IMAGE_BYTES, MAX_TOTAL_BYTES} from './attachmentPolicy';
 
-type Model = {
-  id: string;
+
+type Model = ProviderModel & {
   name: string;
-  provider: string;
   supportsVision: boolean;
   maxContextTokens: number;
   maxOutputTokens: number;
 };
+
+function readSavedModel(): ProviderModel | null {
+  try { return parseSavedModel(localStorage.getItem('openharness:default-model')); }
+  catch { return null; }
+}
 
 type AttachmentInfo = {
   name: string;
@@ -23,6 +30,11 @@ export function Composer({running = false, onStop}: {running?: boolean; onStop?:
   const [modelPickerOpen, setModelPickerOpen] = useState(false);
   const [models, setModels] = useState<Model[]>([]);
   const [selectedModel, setSelectedModel] = useState<Model | null>(null);
+  const selectedModelRef = useRef<Model | null>(null);
+  const [modelsLoading, setModelsLoading] = useState(true);
+  const [modelsUnavailable, setModelsUnavailable] = useState(false);
+  const [modelsLoadFailed, setModelsLoadFailed] = useState(false);
+  const modelRefreshGeneration = useRef(0);
   const [projectId, setProjectId] = useState<string | null>(null);
   const [attachments, setAttachments] = useState<AttachmentInfo[]>([]);
   const [approvalMode, setApprovalMode] = useState<'manual' | 'automatic'>(() => localStorage.getItem('openharness:approval-mode') === 'automatic' ? 'automatic' : 'manual');
@@ -45,28 +57,44 @@ export function Composer({running = false, onStop}: {running?: boolean; onStop?:
   const selectedSkillsRef = useRef(selectedSkills);
   selectedSkillsRef.current = selectedSkills;
 
-  const loadModels = async () => {
-    try {
-      const providers: ProviderInfo[] = await apiListProviders();
-      const list: Model[] = providers.map((p) => ({id: p.model_id, name: `${p.provider} · ${p.model_id}`, provider: p.provider, supportsVision: p.supports_vision ?? false, maxContextTokens: p.max_context_tokens ?? 128_000, maxOutputTokens: p.max_output_tokens ?? 4_096}));
-      const savedDefault = localStorage.getItem('openharness:default-model');
-      if (savedDefault) {
-        const parsed: Model = JSON.parse(savedDefault);
-        if (!list.some((m) => m.id === parsed.id && m.provider === parsed.provider)) {
-          list.unshift({...parsed, supportsVision: parsed.supportsVision ?? false, maxContextTokens: parsed.maxContextTokens ?? 128_000, maxOutputTokens: parsed.maxOutputTokens ?? 4_096});
-        }
-      }
-      setModels(list);
-      if (list.length && !selectedModel) {
-        const match = savedDefault ? list.find((m) => m.id === JSON.parse(savedDefault).id && m.provider === JSON.parse(savedDefault).provider) : null;
-        setSelectedModel(match || list[0]);
-      }
-    } catch {
-      setModels([]);
+  const chooseModel = (model: Model | null, persist = false) => {
+    selectedModelRef.current = model;
+    setSelectedModel(model);
+    setModelsUnavailable(false);
+    if (persist && model) {
+      try { localStorage.setItem('openharness:default-model', JSON.stringify(model)); } catch { /* Storage may be unavailable. */ }
     }
   };
 
-  useEffect(() => { void loadModels(); }, []);
+  const loadModels = async () => {
+    const generation = ++modelRefreshGeneration.current;
+    setModelsLoading(true);
+    try {
+      const providers: ProviderInfo[] = await apiListProviders();
+      if (generation !== modelRefreshGeneration.current) return;
+      const list: Model[] = providers.map((p) => ({id: p.model_id, name: `${p.provider} · ${p.model_id}`, provider: p.provider, supportsVision: p.supports_vision ?? false, maxContextTokens: p.max_context_tokens ?? 128_000, maxOutputTokens: p.max_output_tokens ?? 4_096}));
+      const reconciled = reconcileModelSelection(selectedModelRef.current, list, readSavedModel());
+      setModels(reconciled.models);
+      chooseModel(reconciled.selected);
+      setModelsUnavailable(reconciled.unavailable);
+      setModelsLoadFailed(false);
+    } catch {
+      if (generation !== modelRefreshGeneration.current) return;
+      setModelsLoadFailed(true);
+    } finally {
+      if (generation === modelRefreshGeneration.current) setModelsLoading(false);
+    }
+  };
+
+  useEffect(() => {
+    void loadModels();
+    const refresh = () => { void loadModels(); };
+    window.addEventListener('openharness:provider-saved', refresh);
+    return () => {
+      modelRefreshGeneration.current++;
+      window.removeEventListener('openharness:provider-saved', refresh);
+    };
+  }, []);
   useEffect(() => {
     let disposed = false;
     void apiListSkills(projectId).then(skills => { if (!disposed) setAvailableSkills(skills); }).catch(() => { if (!disposed) setAvailableSkills([]); });
@@ -185,53 +213,64 @@ export function Composer({running = false, onStop}: {running?: boolean; onStop?:
     return () => window.removeEventListener('openharness:set-prompt', setText);
   }, []);
 
+  useEffect(() => {
+    const reset = () => {
+      attachmentRevision.current++;
+      attachmentsRef.current = [];
+      setAttachments([]);
+    };
+    window.addEventListener('openharness:new-chat', reset);
+    window.addEventListener('openharness:open-thread', reset);
+    window.addEventListener('openharness:select-project', reset);
+    return () => {
+      window.removeEventListener('openharness:new-chat', reset);
+      window.removeEventListener('openharness:open-thread', reset);
+      window.removeEventListener('openharness:select-project', reset);
+    };
+  }, []);
+
+  const attachmentsRef = useRef(attachments);
+  attachmentsRef.current = attachments;
+  const processingFiles = useRef(new Set<string>());
+  const reservedBytes = useRef(0);
+  const attachmentRevision = useRef(0);
   const handleFiles = async (files: FileList | null) => {
     if (!files) return;
+    const revision = attachmentRevision.current;
     const next: AttachmentInfo[] = [];
+    const batchSeen = new Set<string>();
+    let totalBytes = attachmentsRef.current.reduce((sum, item) => sum + item.size, 0) + reservedBytes.current;
+    let count = attachmentsRef.current.length + processingFiles.current.size;
     for (const file of Array.from(files)) {
-      const isImg = file.type.startsWith('image/') || /\.(png|jpe?g|webp|gif|svg)$/i.test(file.name);
-      if (isImg && !['image/png', 'image/jpeg', 'image/webp', 'image/gif'].includes(file.type)) {
-        toastError(`Unsupported image: ${file.name}. Use PNG, JPEG, WebP, or GIF (SVG is not supported).`);
-        continue;
-      }
-      const maxSize = isImg ? 4 * 1024 * 1024 : 256 * 1024;
-      if (file.size > maxSize) {
-        toastError(`Attachment too large: ${file.name} (max ${isImg ? '4MB' : '256KB'})`);
-        continue;
-      }
+      const identity = `${file.name}:${file.size}:${file.lastModified}`;
+      if (batchSeen.has(identity) || processingFiles.current.has(identity) || attachmentsRef.current.some(item => item.name === file.name && item.size === file.size)) continue;
+      batchSeen.add(identity);
+      if (count >= MAX_ATTACHMENTS) { toastError(`Maximum ${MAX_ATTACHMENTS} attachments.`); break; }
+      if (totalBytes + file.size > MAX_TOTAL_BYTES) { toastError('Attachments exceed the 12MB total limit.'); break; }
+      if (file.size > MAX_IMAGE_BYTES) { toastError(`Attachment too large: ${file.name} (max 4MB)`); continue; }
+      processingFiles.current.add(identity);
+      count++;
+      reservedBytes.current += file.size;
       try {
-        if (isImg) {
-          const dataUrl = await new Promise<string>((resolve, reject) => {
-            const reader = new FileReader();
-            reader.onload = () => resolve(String(reader.result || ''));
-            reader.onerror = () => reject(reader.error);
-            reader.readAsDataURL(file);
-          });
-          next.push({
-            name: file.name,
-            size: file.size,
-            isImage: true,
-            content: `![${file.name}](${dataUrl})`,
-          });
-        } else {
-          const content = await new Promise<string>((resolve, reject) => {
-            const reader = new FileReader();
-            reader.onload = () => resolve(String(reader.result || ''));
-            reader.onerror = () => reject(reader.error);
-            reader.readAsText(file);
-          });
-          next.push({
-            name: file.name,
-            size: file.size,
-            isImage: false,
-            content: `[${file.name}]\n${content}`,
-          });
-        }
+        const bytes = new Uint8Array(await file.arrayBuffer());
+        const validation = inspectAttachment(file.name, file.type, bytes);
+        if ('error' in validation) { toastError(validation.error); continue; }
+        const content = validation.kind === 'image'
+          ? `![${file.name}](data:${validation.mime};base64,${btoa(Array.from(bytes, byte => String.fromCharCode(byte)).join(''))})`
+          : `[${file.name}]\n${new TextDecoder('utf-8', {fatal: true}).decode(bytes)}`;
+        next.push({name: file.name, size: file.size, isImage: validation.kind === 'image', content});
+        totalBytes += file.size;
       } catch {
         toastError(`Could not read: ${file.name}`);
+      } finally {
+        processingFiles.current.delete(identity);
+        reservedBytes.current -= file.size;
       }
     }
-    if (next.length) setAttachments(prev => [...prev, ...next]);
+    if (next.length && revision === attachmentRevision.current) {
+      attachmentsRef.current = [...attachmentsRef.current, ...next];
+      setAttachments(attachmentsRef.current);
+    }
   };
 
   const toastError = (message: string) => {
@@ -240,26 +279,31 @@ export function Composer({running = false, onStop}: {running?: boolean; onStop?:
   };
 
   const removeAttachment = (index: number) => {
-    setAttachments(prev => prev.filter((_, i) => i !== index));
+    attachmentRevision.current++;
+    attachmentsRef.current = attachmentsRef.current.filter((_, i) => i !== index);
+    setAttachments(attachmentsRef.current);
   };
 
   const send = () => {
     const text = prompt.trim();
-    if (!text && attachments.length === 0) return;
-    const fileText = attachments.filter(attachment => !attachment.isImage).map(attachment => attachment.content).join('\n\n');
+    const submittingAttachments = attachmentsRef.current;
+    if (!text && submittingAttachments.length === 0) return;
+    const fileText = submittingAttachments.filter(attachment => !attachment.isImage).map(attachment => attachment.content).join('\n\n');
     const combined = [fileText, text].filter(Boolean).join('\n\n');
     const model = selectedModel;
     if (!model) return;
-    const imageAttachments = attachments.filter(item => item.isImage);
+    const imageAttachments = submittingAttachments.filter(item => item.isImage);
     if (imageAttachments.length && !model.supportsVision) {
       toastError('Selected model does not support images. Remove image attachments or choose a vision-capable model.');
       return;
     }
-    const detail = {text: combined, modelId: model.id, provider: model.provider, projectId, attachments: attachments.map(a => a.content), supportsVision: model.supportsVision, modelContextTokens: model.maxContextTokens, modelOutputTokens: model.maxOutputTokens, selectedSkills, approvalMode: approvalModeRef.current};
+    const detail = {text: combined, modelId: model.id, provider: model.provider, projectId, attachments: submittingAttachments.map(a => a.content), supportsVision: model.supportsVision, modelContextTokens: model.maxContextTokens, modelOutputTokens: model.maxOutputTokens, selectedSkills, approvalMode: approvalModeRef.current};
     window.dispatchEvent(new CustomEvent('openharness:send-message', {detail}));
     setPrompt('');
+    attachmentRevision.current++;
+    attachmentsRef.current = [];
     setAttachments([]);
-    localStorage.setItem('openharness:default-model', JSON.stringify(model));
+    try { localStorage.setItem('openharness:default-model', JSON.stringify(model)); } catch { /* Storage may be unavailable. */ }
   };
 
   return (
@@ -334,7 +378,7 @@ export function Composer({running = false, onStop}: {running?: boolean; onStop?:
         </div>
       )}
       <div className="composer-row">
-        <input ref={fileInputRef} type="file" accept="image/*,.txt,.md,.json,.ts,.js,.rs,.py,.css,.html" multiple style={{display:'none'}} onChange={(e) => { void handleFiles(e.target.files); e.target.value = ''; }} />
+        <input ref={fileInputRef} type="file" accept=".png,.jpg,.jpeg,.webp,.gif,.txt,.md,.json,.ts,.tsx,.js,.jsx,.rs,.py,.css,.html,.xml,.yaml,.yml,.toml,.csv,.sh,.sql" multiple style={{display:'none'}} onChange={(e) => { void handleFiles(e.target.files); e.target.value = ''; }} />
         <button className="model-button attach-button" type="button" aria-label="Attach files or images" title="Attach files or images" onClick={() => fileInputRef.current?.click()} disabled={running}>
           <PaperClipIcon width={16} height={16} aria-hidden="true" />
         </button>
@@ -397,12 +441,13 @@ export function Composer({running = false, onStop}: {running?: boolean; onStop?:
             onClick={() => setModelPickerOpen((open) => !open)}
           >
             <span className="model-provider-mark" aria-hidden="true">{selectedModel?.provider.slice(0, 1) ?? 'M'}</span>
-            <span className="model-button-copy"><span className="model-provider-label">{selectedModel?.provider ?? 'Model'}</span><span className="model-label" id="model-label">{selectedModel ? selectedModel.id : 'No models configured'}</span></span>
+            <span className="model-button-copy"><span className="model-provider-label">{selectedModel?.provider ?? 'Model'}</span><span className="model-label" id="model-label">{modelsLoading && !selectedModel ? 'Loading models…' : selectedModel ? selectedModel.id : 'No models configured'}</span></span>
             <ChevronDownIcon className="model-chevron" width={13} height={13} aria-hidden="true" />
           </button>
           <div className={`model-menu ${modelPickerOpen ? 'open' : ''}`} id="model-menu" role="listbox" aria-label="Choose model" aria-hidden={!modelPickerOpen}>
             <div className="model-menu-heading">Choose a model</div>
-            {models.length === 0 ? <div className="model-option-empty">Add a provider in Settings</div> : models.map((m) => {
+            {modelsUnavailable && <div className="model-option-empty" role="status">Previously selected model is unavailable. Choose a configured model.</div>}
+            {modelsLoading ? <div className="model-option-empty" role="status">Loading models…</div> : models.length === 0 ? <div className="model-option-empty">{modelsLoadFailed ? 'Could not load providers. Refresh or check Settings.' : 'Add a provider in Settings'}</div> : models.map((m) => {
               const isChosen = selectedModel?.id === m.id && selectedModel?.provider === m.provider;
               return (
                 <button
@@ -413,9 +458,8 @@ export function Composer({running = false, onStop}: {running?: boolean; onStop?:
                   aria-selected={isChosen}
                   disabled={running}
                   onClick={() => {
-                    setSelectedModel(m);
+                    chooseModel(m, true);
                     setModelPickerOpen(false);
-                    localStorage.setItem('openharness:default-model', JSON.stringify(m));
                   }}
                 >
                   <span className="model-option-mark" aria-hidden="true">{m.provider.slice(0, 1)}</span>

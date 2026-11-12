@@ -2,10 +2,32 @@ use client::{ModelCallbacks, ModelRequest, ProviderConfig, StreamingModelRequest
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::io::{Read, Write};
+#[cfg(unix)]
+use std::os::unix::process::CommandExt as _;
 #[cfg(target_os = "windows")]
 use std::os::windows::process::CommandExt;
 use std::path::PathBuf;
 use std::process::{Child, ChildStdin, Command, Stdio};
+
+#[cfg(unix)]
+fn terminate_terminal_tree(pid: u32) {
+    // Terminal shells own a dedicated process group (PGID == shell PID).
+    unsafe {
+        libc::kill(-(pid as i32), libc::SIGKILL);
+    }
+}
+
+#[cfg(windows)]
+fn terminate_terminal_tree(pid: u32) {
+    // Limit forced termination to this terminal's descendant tree.
+    let _ = Command::new("taskkill.exe")
+        .args(["/PID", &pid.to_string(), "/T", "/F"])
+        .creation_flags(CREATE_NO_WINDOW)
+        .spawn();
+}
+
+#[cfg(not(any(unix, windows)))]
+fn terminate_terminal_tree(_pid: u32) {}
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -87,11 +109,15 @@ fn resolve_terminal_shell(requested: Option<&str>) -> Result<(String, Vec<&'stat
 
 impl Drop for AppState {
     fn drop(&mut self) {
+        if let Ok(mut streams) = self.streams.lock() {
+            for (_, entry) in streams.drain() {
+                let _ = entry.cancel.send(());
+            }
+        }
         if let Ok(terminals) = self.terminals.lock() {
             for session in terminals.values() {
                 if let Ok(mut session) = session.lock() {
-                    let _ = session.child.kill();
-                    let _ = session.child.wait();
+                    session.stop();
                 }
             }
         }
@@ -207,6 +233,10 @@ pub struct ChatMessage {
     pub attachments: Vec<String>,
     #[serde(default)]
     pub compacted_summary: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub outcome: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -369,6 +399,7 @@ pub struct AppState {
     streams: Arc<Mutex<HashMap<String, StreamEntry>>>,
     next_stream_id: AtomicU64,
     pub pending_approvals: Arc<Mutex<PendingApprovals>>,
+    processes: Arc<harness::ProcessRegistry>,
     terminals: Arc<Mutex<HashMap<String, Arc<Mutex<TerminalSession>>>>>,
     approval_mode: Mutex<String>,
 }
@@ -378,8 +409,72 @@ struct TerminalSession {
     stdin: ChildStdin,
 }
 
+impl TerminalSession {
+    fn stop(&mut self) {
+        // Signal only while the owned shell is still alive; never target a stale PID.
+        if matches!(self.child.try_wait(), Ok(None)) {
+            terminate_terminal_tree(self.child.id());
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+        }
+    }
+}
+
+impl Drop for TerminalSession {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
+
+#[cfg(unix)]
+fn terminal_process_group(command: &mut Command) {
+    command.process_group(0);
+}
+
+#[cfg(not(unix))]
+fn terminal_process_group(_command: &mut Command) {}
+
+#[cfg(windows)]
+const CREATE_NEW_PROCESS_GROUP: u32 = 0x00000200;
+
+#[cfg(windows)]
+fn terminal_windows_process_group(command: &mut Command) {
+    command.creation_flags(CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW);
+}
+
+#[cfg(not(windows))]
+fn terminal_windows_process_group(_command: &mut Command) {}
+
+#[cfg(test)]
+mod terminal_lifecycle_tests {
+    use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn terminal_session_kills_background_descendants_idempotently() {
+        let mut command = Command::new("sh");
+        command.args(["-c", "sleep 30 & wait"]);
+        terminal_process_group(&mut command);
+        command
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let mut child = command.spawn().unwrap();
+        let pid = child.id();
+        let stdin = child.stdin.take().unwrap();
+        let mut session = TerminalSession { child, stdin };
+        session.stop();
+        session.stop();
+        let mut probe = Command::new("sh");
+        probe.args(["-c", &format!("kill -0 -- -{pid} 2>/dev/null")]);
+        assert!(!probe.status().unwrap().success());
+    }
+}
+
 struct StreamEntry {
     token: u64,
+    thread_id: Option<String>,
+    run_id: String,
     cancel: oneshot::Sender<()>,
 }
 
@@ -413,10 +508,22 @@ impl Drop for StreamRegistration {
     }
 }
 
+fn cancel_registered_stream(
+    streams: &Arc<Mutex<HashMap<String, StreamEntry>>>,
+    id: &str,
+) -> Result<StreamEntry, String> {
+    streams
+        .lock()
+        .map_err(|error| format!("Lock failure: {error}"))?
+        .remove(id)
+        .ok_or_else(|| "Stream not found or already finished".to_string())
+}
+
 fn register_chat_stream(
     streams: &Arc<Mutex<HashMap<String, StreamEntry>>>,
     id: &str,
     token: u64,
+    thread_id: Option<String>,
 ) -> Result<(StreamRegistration, oneshot::Receiver<()>), String> {
     let (cancel_tx, cancel_rx) = oneshot::channel();
     let mut registry = streams.lock().map_err(|e| format!("Lock failure: {}", e))?;
@@ -427,6 +534,8 @@ fn register_chat_stream(
         id.to_string(),
         StreamEntry {
             token,
+            thread_id,
+            run_id: id.to_string(),
             cancel: cancel_tx,
         },
     );
@@ -449,17 +558,53 @@ mod stream_registry_tests {
     #[test]
     fn registration_removes_only_its_own_id() {
         let streams = Arc::new(Mutex::new(HashMap::new()));
-        let (registration, _receiver) = register_chat_stream(&streams, "one", 1).unwrap();
+        let (registration, _receiver) = register_chat_stream(&streams, "one", 1, None).unwrap();
         assert_eq!(streams.lock().unwrap().len(), 1);
         drop(registration);
         assert!(streams.lock().unwrap().is_empty());
     }
 
     #[test]
+    fn cancellation_only_targets_the_requested_stream() {
+        let streams = Arc::new(Mutex::new(HashMap::new()));
+        let (_one, mut rx_one) =
+            register_chat_stream(&streams, "one", 1, Some("thread-a".into())).unwrap();
+        let (_two, mut rx_two) =
+            register_chat_stream(&streams, "two", 2, Some("thread-b".into())).unwrap();
+        let (_three, mut rx_three) =
+            register_chat_stream(&streams, "three", 3, Some("thread-c".into())).unwrap();
+
+        cancel_registered_stream(&streams, "two")
+            .unwrap()
+            .cancel
+            .send(())
+            .unwrap();
+        assert!(rx_two.try_recv().is_ok());
+        assert!(rx_one.try_recv().is_err());
+        assert!(rx_three.try_recv().is_err());
+        assert_eq!(streams.lock().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn unknown_and_repeated_cancellation_are_rejected() {
+        let streams = Arc::new(Mutex::new(HashMap::new()));
+        let (_registration, mut receiver) =
+            register_chat_stream(&streams, "known", 1, Some("thread".into())).unwrap();
+        assert!(cancel_registered_stream(&streams, "unknown").is_err());
+        cancel_registered_stream(&streams, "known")
+            .unwrap()
+            .cancel
+            .send(())
+            .unwrap();
+        assert!(receiver.try_recv().is_ok());
+        assert!(cancel_registered_stream(&streams, "known").is_err());
+    }
+
+    #[test]
     fn duplicate_id_does_not_replace_active_sender() {
         let streams = Arc::new(Mutex::new(HashMap::new()));
-        let (_registration, receiver) = register_chat_stream(&streams, "one", 1).unwrap();
-        assert!(register_chat_stream(&streams, "one", 2).is_err());
+        let (_registration, receiver) = register_chat_stream(&streams, "one", 1, None).unwrap();
+        assert!(register_chat_stream(&streams, "one", 2, None).is_err());
         assert_eq!(streams.lock().unwrap().len(), 1);
         drop(receiver);
     }
@@ -476,25 +621,36 @@ impl Default for AppState {
             streams: Arc::new(Mutex::new(HashMap::new())),
             next_stream_id: AtomicU64::new(1),
             pending_approvals: Arc::new(Mutex::new(PendingApprovals::default())),
+            processes: Arc::new(harness::ProcessRegistry::default()),
             terminals: Arc::new(Mutex::new(HashMap::new())),
             approval_mode: Mutex::new("manual".into()),
         }
     }
 }
 
+fn resolve_optional_project_root(
+    project_id: Option<&str>,
+    lookup: impl FnOnce(&str) -> Result<PathBuf, String>,
+) -> Result<Option<PathBuf>, String> {
+    project_id.map(lookup).transpose()
+}
+
 impl AppState {
-    pub fn project_root(&self, project_id: &str) -> Result<PathBuf, String> {
-        let projects = self
+    fn authorize_project_context(
+        &self,
+        project_id: &str,
+    ) -> Result<Option<(PathBuf, String)>, String> {
+        let mut projects = self
             .projects
             .lock()
             .map_err(|e| format!("Lock failure: {}", e))?;
         if project_id.trim().is_empty() {
-            return Err("Invalid project ID".into());
+            return Ok(None);
         }
         let mut matches = projects.iter().filter(|project| project.id == project_id);
         let project = matches
             .next()
-            .ok_or_else(|| format!("Project not found: {}", project_id))?;
+            .ok_or_else(|| format!("Project not found: {project_id}"))?;
         if matches.next().is_some() {
             return Err("Project ID is ambiguous; persisted data must be repaired".into());
         }
@@ -508,7 +664,46 @@ impl AppState {
         if !root.is_dir() {
             return Err("Project folder is not a directory".into());
         }
-        Ok(root)
+        Ok(Some((root, project.name.clone())))
+    }
+
+    fn resolve_chat_context(
+        &self,
+        thread_id: Option<&str>,
+        project_id: Option<&str>,
+    ) -> Result<Option<(PathBuf, String)>, String> {
+        let requested_project = project_id.map(str::trim).filter(|id| !id.is_empty());
+        let thread = thread_id
+            .map(|id| self.get_thread(id))
+            .transpose()
+            .map_err(|error| {
+                if error.starts_with("Thread not found:") {
+                    format!("Chat thread not found: {error}")
+                } else {
+                    error
+                }
+            })?;
+
+        match (thread, requested_project) {
+            (Some(thread), Some(requested_project)) => {
+                if thread.project_id != requested_project {
+                    return Err(format!(
+                        "Thread '{}' belongs to project '{}', not '{}'",
+                        thread.id, thread.project_id, requested_project
+                    ));
+                }
+                self.authorize_project_context(requested_project)
+            }
+            (Some(thread), None) => self.authorize_project_context(&thread.project_id),
+            (None, Some(requested_project)) => self.authorize_project_context(requested_project),
+            (None, None) => Ok(None),
+        }
+    }
+
+    pub fn project_root(&self, project_id: &str) -> Result<PathBuf, String> {
+        self.authorize_project_context(project_id)?
+            .map(|(root, _)| root)
+            .ok_or_else(|| "Invalid project ID".into())
     }
 }
 
@@ -771,29 +966,6 @@ impl AppState {
             path: path_value.clone(),
             active: true,
         };
-        let mut guard = self
-            .projects
-            .lock()
-            .map_err(|e| format!("Lock failure: {}", e))?;
-        let next_id = if id.is_empty() {
-            format!("project-{}", guard.len() + 1)
-        } else {
-            id.clone()
-        };
-        let id = if guard.iter().any(|project| project.id == next_id) {
-            format!("{}-{}", next_id, guard.len() + 1)
-        } else {
-            next_id
-        };
-        let mut new_project = new_project;
-        new_project.id = id;
-        // ponytail: supports only path-based dedupe; full rename/delete requires API additions. project name changes and canonical path split should be editable.
-        if guard
-            .iter()
-            .any(|project| project.path.as_deref() == path_value.as_deref() && path_value.is_some())
-        {
-            return Err("A project for this folder is already loaded.".into());
-        }
         for project in guard.iter_mut() {
             project.active = false;
         }
@@ -1000,6 +1172,89 @@ impl AppState {
         self.append_thread_message_with_attachments(thread_id, role, text, &[])
     }
 
+    fn append_run_outcome(
+        &self,
+        thread_id: &str,
+        run_id: &str,
+        outcome: &str,
+        text: &str,
+    ) -> Result<(), String> {
+        let mut guard = self
+            .threads
+            .lock()
+            .map_err(|e| format!("Lock failure: {e}"))?;
+        let thread = guard
+            .iter_mut()
+            .find(|thread| thread.id == thread_id)
+            .ok_or_else(|| format!("Thread not found: {thread_id}"))?;
+        if thread
+            .messages
+            .iter()
+            .any(|message| message.run_id.as_deref() == Some(run_id))
+        {
+            return Ok(());
+        }
+        thread.messages.push(ChatMessage {
+            id: format!("run-{run_id}"),
+            role: "assistant".into(),
+            text: text.into(),
+            attachments: Vec::new(),
+            compacted_summary: None,
+            run_id: Some(run_id.into()),
+            outcome: Some(outcome.into()),
+        });
+        drop(guard);
+        self.persist()
+    }
+
+    fn user_facing_run_error(error: &str) -> &'static str {
+        if error.contains("Generation stopped") || error.contains("cancel") {
+            "Run cancelled."
+        } else if error.contains("AGENT_REQUEST_LIMIT_REACHED") {
+            "Run paused at the model-request limit. Progress and completed tool results were saved; send a follow-up prompt to continue in a new run."
+        } else if error.contains("approval") || error.contains("Approval") {
+            "Run stopped because tool approval was rejected or unavailable."
+        } else if error.contains("Sandbox")
+            || error.contains("sandbox")
+            || error.contains("workspace")
+        {
+            "Run stopped by a workspace or sandbox restriction."
+        } else if error.contains("tool") || error.contains("Tool") {
+            "A tool failed while running. Review the preceding assistant output and retry."
+        } else if error.contains("Stream task failed") || error.contains("interrupted") {
+            "Run interrupted before completion."
+        } else {
+            "Provider request failed. Check the provider connection and settings."
+        }
+    }
+
+    fn safe_run_message(partial: &str, error: &str, secret: Option<&str>) -> String {
+        let mut partial = partial.to_string();
+        let mut error = error.to_string();
+        if let Some(secret) = secret.filter(|secret| !secret.is_empty()) {
+            partial = partial.replace(secret, "[redacted]");
+            error = error.replace(secret, "[redacted]");
+        }
+        let outcome = Self::user_facing_run_error(&error);
+        if partial.trim().is_empty() {
+            outcome.into()
+        } else {
+            format!("{}\n\n{}", partial.trim_end(), outcome)
+        }
+    }
+
+    fn outcome_status(error: &str) -> &'static str {
+        if error.contains("Generation stopped") || error.contains("cancel") {
+            "cancelled"
+        } else if error.contains("AGENT_REQUEST_LIMIT_REACHED") {
+            "request_limit_exhausted"
+        } else if error.contains("Stream task failed") || error.contains("interrupted") {
+            "interrupted"
+        } else {
+            "failed"
+        }
+    }
+
     fn update_thread_learning_candidates(
         &self,
         id: &str,
@@ -1026,6 +1281,21 @@ impl AppState {
         expected_messages: &[ChatMessage],
         summary: &str,
     ) -> Result<ChatThread, String> {
+        self.set_thread_compaction_prefix(
+            thread_id,
+            expected_messages,
+            expected_messages.len(),
+            summary,
+        )
+    }
+
+    fn set_thread_compaction_prefix(
+        &self,
+        thread_id: &str,
+        expected_messages: &[ChatMessage],
+        compacted_message_count: usize,
+        summary: &str,
+    ) -> Result<ChatThread, String> {
         let mut guard = self
             .threads
             .lock()
@@ -1038,7 +1308,7 @@ impl AppState {
             return Err("Thread changed during compaction; retry after refresh".into());
         }
         thread.compacted_summary = Some(summary.to_string());
-        thread.compacted_message_count = thread.messages.len();
+        thread.compacted_message_count = compacted_message_count.min(thread.messages.len());
         let updated = thread.clone();
         drop(guard);
         self.persist()?;
@@ -1064,6 +1334,8 @@ impl AppState {
             text: text.into(),
             attachments: attachments.to_vec(),
             compacted_summary: None,
+            run_id: None,
+            outcome: None,
         };
         let mut guard = self
             .threads
@@ -1319,8 +1591,24 @@ async fn compact_thread(
     }
     let original_messages = thread.messages.clone();
     let compacted_count = thread.compacted_message_count.min(original_messages.len());
+    let active_messages = &original_messages[compacted_count..];
+    let retain_count = active_messages.len().min(6);
+    let mut prefix_count = active_messages.len() - retain_count;
+    // Keep assistant tool-call records with the immediately following tool results.
+    while prefix_count > 0
+        && (active_messages[prefix_count].role == "tool"
+            || (active_messages[prefix_count - 1].role == "assistant"
+                && active_messages[prefix_count - 1]
+                    .text
+                    .contains("\"tool_calls\"")))
+    {
+        prefix_count -= 1;
+    }
+    if prefix_count == 0 {
+        return Err("Not enough complete history to compact while retaining recent context".into());
+    }
     let mut messages =
-        Vec::with_capacity(original_messages.len().saturating_sub(compacted_count) + 1);
+        Vec::with_capacity(prefix_count + usize::from(thread.compacted_summary.is_some()));
     if let Some(existing_summary) = thread.compacted_summary.as_deref() {
         messages.push(client::ModelMessage::new(
             "system",
@@ -1330,12 +1618,16 @@ async fn compact_thread(
             ),
         ));
     }
-    messages.extend(
-        original_messages
-            .iter()
-            .skip(compacted_count)
-            .map(|message| client::ModelMessage::new(&message.role, &message.text)),
-    );
+    messages.extend(active_messages[..prefix_count].iter().map(|message| {
+        client::ModelMessage::new(&message.role, &message.text)
+            .with_attachments(&message.attachments)
+    }));
+    messages.push(client::ModelMessage::new(
+        "user",
+        "Summarize only the provided conversation history. Preserve system instructions, unresolved user requests, decisions, constraints, and unfinished work. Do not invent completed actions.",
+    ));
+    // Store count as a prefix boundary; recent messages stay live in the thread.
+    let compacted_messages = &original_messages[..compacted_count + prefix_count];
     let key = secrets::get_secret(&format!("provider_{}", provider))?;
     let saved = state
         .providers
@@ -1357,7 +1649,13 @@ async fn compact_thread(
         supports_vision: false,
     })
     .await?;
-    state.set_thread_compaction_summary(&thread_id, &original_messages, &summary)?;
+    state.set_thread_compaction_summary(&thread_id, compacted_messages, &summary)?;
+    if let Ok(mut threads) = state.threads.lock() {
+        if let Some(updated) = threads.iter_mut().find(|thread| thread.id == thread_id) {
+            updated.compacted_message_count = compacted_count + prefix_count;
+        }
+    }
+    state.persist()?;
     Ok(summary)
 }
 
@@ -1513,6 +1811,8 @@ struct StreamChunk {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ApprovalRequest {
     pub id: String,
+    pub run_id: String,
+    pub tool_call_id: String,
     pub tool: String,
     pub arguments: serde_json::Value,
 }
@@ -1524,15 +1824,141 @@ struct ApprovalDecision {
 }
 
 const MAX_AGENT_REQUESTS: usize = 64;
+const MAX_PERSISTED_TOOL_PROGRESS_BYTES: usize = 64 * 1024;
+
+fn append_completed_tool_progress(partial: &mut String, call_id: &str, name: &str, result: &str) {
+    let remaining = MAX_PERSISTED_TOOL_PROGRESS_BYTES.saturating_sub(partial.len());
+    if remaining == 0 {
+        return;
+    }
+    let header = format!("\n\n[Completed tool result: {name}, call_id={call_id}]\n");
+    if header.len() > remaining {
+        return;
+    }
+    partial.push_str(&header);
+    let remaining = remaining - header.len();
+    let end = result
+        .char_indices()
+        .map(|(index, character)| index + character.len_utf8())
+        .take_while(|end| *end <= remaining)
+        .last()
+        .unwrap_or(0);
+    partial.push_str(&result[..end]);
+}
 
 fn agent_request_limit_reached(request_count: usize) -> bool {
     request_count >= MAX_AGENT_REQUESTS
 }
 
+struct ApprovalRunRegistration {
+    approvals: Arc<Mutex<PendingApprovals>>,
+    run_id: String,
+}
+
+impl Drop for ApprovalRunRegistration {
+    fn drop(&mut self) {
+        if let Ok(mut approvals) = self.approvals.lock() {
+            approvals.cancel_run(&self.run_id);
+        }
+    }
+}
+
+struct ApprovalRunGuard {
+    cancelled: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl Drop for ApprovalRunGuard {
+    fn drop(&mut self) {
+        self.cancelled
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ApprovalOutcome {
+    Approved,
+    Denied { response: Option<String> },
+    Cancelled,
+    Expired,
+    Failed { error: String },
+}
+
+impl ApprovalOutcome {
+    fn emit(&self, id: &str, kind: &str, label: &str) -> StreamChunk {
+        let status = match self {
+            Self::Approved => "running",
+            Self::Denied { .. } | Self::Cancelled | Self::Expired | Self::Failed { .. } => "failed",
+        };
+        let detail = match self {
+            Self::Approved => None,
+            Self::Denied { response } => Some(
+                response
+                    .as_deref()
+                    .unwrap_or("Approval not granted")
+                    .to_string(),
+            ),
+            Self::Failed { error } => Some(error.clone()),
+            Self::Cancelled => Some("Agent run cancelled".to_string()),
+            Self::Expired => Some("Approval expired".to_string()),
+        };
+        StreamChunk {
+            text: String::new(),
+            done: false,
+            error: None,
+            approval: None,
+            step: Some(StepEvent {
+                id: id.to_string(),
+                kind: kind.to_string(),
+                label: label.to_string(),
+                status: status.into(),
+                detail,
+            }),
+            token_usage: None,
+        }
+    }
+
+    fn decision(self) -> Result<ApprovalDecision, String> {
+        match self {
+            Self::Approved => Ok(ApprovalDecision {
+                allowed: true,
+                response: None,
+            }),
+            Self::Denied { response } => Ok(ApprovalDecision {
+                allowed: false,
+                response,
+            }),
+            Self::Cancelled | Self::Expired | Self::Failed { .. } => {
+                Err("Approval request was cancelled".to_string())
+            }
+        }
+    }
+}
+
+struct PendingApproval {
+    run_id: String,
+    tool_call_id: String,
+    sender: tokio::sync::oneshot::Sender<ApprovalOutcome>,
+}
+
 #[derive(Default)]
 pub struct PendingApprovals {
     next_id: u64,
-    waiting: HashMap<String, tokio::sync::oneshot::Sender<ApprovalDecision>>,
+    waiting: HashMap<String, PendingApproval>,
+}
+
+impl PendingApprovals {
+    fn cancel_run(&mut self, run_id: &str) {
+        let cancelled: Vec<_> = self
+            .waiting
+            .iter()
+            .filter_map(|(id, approval)| (approval.run_id == run_id).then_some(id.clone()))
+            .collect();
+        for id in cancelled {
+            if let Some(approval) = self.waiting.remove(&id) {
+                let _ = approval.sender.send(ApprovalOutcome::Cancelled);
+            }
+        }
+    }
 }
 
 const MAX_AGENT_RESPONSE_BYTES: usize = 1_000_000;
@@ -1622,6 +2048,13 @@ fn tool_label(tool: &str, arguments: &serde_json::Value) -> String {
 }
 
 fn validate_tool_call(call: &harness::ToolCall) -> Result<(), String> {
+    if let Some(error) = call
+        .arguments
+        .get("__native_argument_parse_error")
+        .and_then(|value| value.as_str())
+    {
+        return Err(error.to_string());
+    }
     match call.name.as_str() {
         "read_file" => {
             let path = call.arguments["path"]
@@ -1736,7 +2169,18 @@ async fn run_agent_loop(
     usage_records: Arc<Mutex<Vec<TokenUsageRecord>>>,
     request_prefix: String,
     conversation_id: Option<String>,
+    run_id: String,
+    partial_output: Arc<Mutex<String>>,
+    cancelled: Arc<std::sync::atomic::AtomicBool>,
+    processes: Arc<harness::ProcessRegistry>,
 ) -> Result<String, String> {
+    let _approval_registration = ApprovalRunRegistration {
+        approvals: approvals.clone(),
+        run_id: run_id.clone(),
+    };
+    let _run_guard = ApprovalRunGuard {
+        cancelled: cancelled.clone(),
+    };
     audit::emit(
         audit::EventKind::AgentStarted,
         &request_prefix,
@@ -1888,7 +2332,7 @@ async fn run_agent_loop(
                 MAX_AGENT_REQUESTS
             );
             return Err(format!(
-                "Agent reached the {} model-request limit for this run. Split the task into a smaller follow-up prompt.",
+                "AGENT_REQUEST_LIMIT_REACHED: Agent reached the {} model-request limit for this run. Start a follow-up run with the saved conversation context.",
                 MAX_AGENT_REQUESTS
             ));
         }
@@ -1924,15 +2368,21 @@ async fn run_agent_loop(
                 tools: &tools,
             },
             ModelCallbacks {
-                on_token: move |text| {
-                    let _ = token_emitter.send(StreamChunk {
-                        text,
-                        done: false,
-                        error: None,
-                        approval: None,
-                        step: None,
-                        token_usage: None,
-                    });
+                on_token: {
+                    let partial_output = partial_output.clone();
+                    move |text: String| {
+                        if let Ok(mut partial) = partial_output.lock() {
+                            partial.push_str(&text);
+                        }
+                        let _ = token_emitter.send(StreamChunk {
+                            text,
+                            done: false,
+                            error: None,
+                            approval: None,
+                            step: None,
+                            token_usage: None,
+                        });
+                    }
                 },
                 on_usage: {
                     let usage_emitter = emitter.clone();
@@ -2269,27 +2719,55 @@ async fn run_agent_loop(
                 continue;
             }
             if let Err(error) = validate_tool_call(&call) {
-                messages.push(client::ModelMessage::new(
-                    "system",
-                    &format!("Tool {} rejected: {}", call.name, error),
+                messages.push(client::ModelMessage::tool_result(
+                    &call.id,
+                    &call.name,
+                    &serde_json::json!({"success": false, "error": error}).to_string(),
                 ));
                 continue;
             }
 
             if requires_approval(&call.name) && !auto_approve_tools {
-                let approval_id = {
+                let (approval_id, receiver) = {
                     let mut pending = approvals.lock().map_err(|e| e.to_string())?;
                     pending.next_id += 1;
-                    format!("approval-{}", pending.next_id)
+                    let approval_id = format!("approval-{}", pending.next_id);
+                    let (sender, receiver) = tokio::sync::oneshot::channel::<ApprovalOutcome>();
+                    pending.waiting.insert(
+                        approval_id.clone(),
+                        PendingApproval {
+                            run_id: run_id.to_string(),
+                            tool_call_id: call.id.clone(),
+                            sender,
+                        },
+                    );
+                    audit::emit(
+                        audit::EventKind::ToolApproval,
+                        &request_prefix,
+                        conversation_id.as_deref(),
+                        Some(&call.id),
+                        Some(&provider),
+                        Some(&model_id),
+                        Some(&call.name),
+                        Some("requested"),
+                    );
+                    let timeout_approval_id = approval_id.clone();
+                    let timeout_approvals = approvals.clone();
+                    tokio::spawn(async move {
+                        tokio::time::sleep(Duration::from_secs(300)).await;
+                        if let Ok(mut pending) = timeout_approvals.lock() {
+                            if let Some(expired) = pending.waiting.remove(&timeout_approval_id) {
+                                let _ = expired.sender.send(ApprovalOutcome::Expired);
+                            }
+                        }
+                    });
+
+                    (approval_id, receiver)
                 };
-                let (sender, receiver) = tokio::sync::oneshot::channel::<ApprovalDecision>();
-                approvals
-                    .lock()
-                    .map_err(|e| e.to_string())?
-                    .waiting
-                    .insert(approval_id.clone(), sender);
                 let request = ApprovalRequest {
                     id: approval_id.clone(),
+                    run_id: run_id.clone(),
+                    tool_call_id: call.id.clone(),
                     tool: call.name.clone(),
                     arguments: call.arguments.clone(),
                 };
@@ -2317,35 +2795,27 @@ async fn run_agent_loop(
                     }),
                     token_usage: None,
                 });
-                let decision = receiver
-                    .await
-                    .map_err(|_| "Approval request was cancelled".to_string())?;
-                let _ = emitter.send(StreamChunk {
-                    text: String::new(),
-                    done: false,
-                    error: None,
-                    approval: None,
-                    step: Some(StepEvent {
-                        id: step_id,
-                        kind: tool_kind(&call.name).into(),
-                        label,
-                        status: if decision.allowed {
-                            "running"
-                        } else {
-                            "failed"
-                        }
-                        .into(),
-                        detail: None,
-                    }),
-                    token_usage: None,
-                });
+                let outcome = receiver.await.unwrap_or(ApprovalOutcome::Cancelled);
+                if cancelled.load(std::sync::atomic::Ordering::SeqCst) {
+                    return Err("Generation stopped".into());
+                }
+                let _ = emitter.send(outcome.emit(&step_id, tool_kind(&call.name), &label));
+                let decision = outcome.decision().map_err(|error| {
+                    messages.push(client::ModelMessage::tool_result(
+                        &call.id,
+                        &call.name,
+                        &serde_json::json!({"success": false, "error": error}).to_string(),
+                    ));
+                    error
+                })?;
                 if !decision.allowed {
                     let observation = decision
                         .response
                         .unwrap_or_else(|| "User declined this operation".to_string());
-                    messages.push(client::ModelMessage::new(
-                        "system",
-                        &format!("Tool {} not run: {}", call.name, observation),
+                    messages.push(client::ModelMessage::tool_result(
+                        &call.id,
+                        &call.name,
+                        &serde_json::json!({"success": false, "error": format!("Tool not run: {}", observation)}).to_string(),
                     ));
                     continue;
                 }
@@ -2367,9 +2837,22 @@ async fn run_agent_loop(
             }
 
             let root = project_root.clone();
+            if cancelled.load(std::sync::atomic::Ordering::SeqCst)
+                || processes.is_cancelled(&run_id)
+            {
+                return Err("Generation stopped".into());
+            }
             let call_clone = call.clone();
+            let process_registry = processes.clone();
+            let run_for_tool = run_id.clone();
             let tool_result = tokio::task::spawn_blocking(move || {
-                harness::ToolDispatcher::execute_tool(&root, &call_clone, true)
+                harness::ToolDispatcher::execute_tool_tracked(
+                    &root,
+                    &call_clone,
+                    true,
+                    &process_registry,
+                    &run_for_tool,
+                )
             })
             .await
             .map_err(|e| format!("Tool task failed: {}", e))?;
@@ -2404,7 +2887,19 @@ async fn run_agent_loop(
             });
             let mut observation = harness::ToolDispatcher::format_observation(&tool_result);
             observation = clamp_string(observation, MAX_TOOL_OUTPUT_BYTES);
-            messages.push(client::ModelMessage::new("system", &observation));
+            append_completed_tool_progress(
+                &mut *partial_output
+                    .lock()
+                    .map_err(|_| "Partial output lock failure".to_string())?,
+                &tool_result.tool_call_id,
+                &tool_result.name,
+                &observation,
+            );
+            messages.push(client::ModelMessage::tool_result(
+                &tool_result.tool_call_id,
+                &tool_result.name,
+                &observation,
+            ));
         }
     }
 }
@@ -2417,19 +2912,23 @@ struct ApprovalReply {
 }
 
 #[tauri::command]
-fn respond_to_tool_approval(
-    reply: ApprovalReply,
+async fn respond_to_tool_approval(
     state: tauri::State<'_, AppState>,
+    reply: ApprovalReply,
 ) -> Result<(), String> {
     let mut pending = state.pending_approvals.lock().map_err(|e| e.to_string())?;
-    let sender = pending
+    let approval = pending
         .waiting
         .remove(&reply.id)
         .ok_or_else(|| format!("Approval not found: {}", reply.id))?;
-    sender
-        .send(ApprovalDecision {
-            allowed: reply.allowed,
-            response: reply.response,
+    approval
+        .sender
+        .send(if reply.allowed {
+            ApprovalOutcome::Approved
+        } else {
+            ApprovalOutcome::Denied {
+                response: reply.response,
+            }
         })
         .map_err(|_| "Agent no longer waiting for approval".to_string())
 }
@@ -2565,8 +3064,20 @@ async fn chat_send(
         .await
 }
 
+struct ProcessRunCleanup {
+    registry: Arc<harness::ProcessRegistry>,
+    run_id: String,
+}
+
+impl Drop for ProcessRunCleanup {
+    fn drop(&mut self) {
+        if !self.registry.is_cancelled(&self.run_id) {
+            self.registry.complete(&self.run_id);
+        }
+    }
+}
+
 #[tauri::command]
-#[allow(clippy::too_many_arguments)]
 async fn chat_send_stream(
     prompt: String,
     model_id: String,
@@ -2578,13 +3089,15 @@ async fn chat_send_stream(
     selected_skills: Option<Vec<String>>,
     user_message_id: Option<String>,
     approval_mode: Option<String>,
+    stream_id: String,
     channel: Channel<StreamChunk>,
     state: State<'_, AppState>,
 ) -> Result<String, String> {
-    let stream_id = state
-        .next_stream_id
-        .fetch_add(1, Ordering::Relaxed)
-        .to_string();
+    let stream_id = stream_id.trim();
+    if stream_id.is_empty() {
+        return Err("stream_id is required".to_string());
+    }
+    let stream_id = stream_id.to_string();
     let trimmed = prompt.trim();
     if trimmed.is_empty() {
         return Err("Prompt cannot be empty".into());
@@ -2597,13 +3110,12 @@ async fn chat_send_stream(
         .get(&provider)
         .cloned();
     let config_url = saved.as_ref().and_then(|item| item.base_url.clone());
-    let project_root_for_skills = match project_id.as_deref() {
-        Some(id) => Some(state.project_root(id)?),
-        None => None,
-    };
+    let project_root_opt = state
+        .resolve_chat_context(thread_id.as_deref(), project_id.as_deref())?
+        .map(|(root, _)| root);
     let home_for_skills = user_home_dir().ok();
     let skills = harness::ToolDispatcher::list_skills_from_roots(
-        project_root_for_skills.as_deref(),
+        project_root_opt.as_deref(),
         home_for_skills.as_deref(),
     )?;
     let skill_context = format!(
@@ -2700,9 +3212,6 @@ async fn chat_send_stream(
     let url_owned = config_url.clone();
     let max_output_tokens_owned = max_output_tokens;
     let attachments_owned = attachments_from_request;
-    let project_root_opt = project_id
-        .as_deref()
-        .and_then(|id| state.project_root(id).ok());
     let approval_mode = approval_mode.unwrap_or(
         state
             .approval_mode
@@ -2721,17 +3230,32 @@ async fn chat_send_stream(
     let candidates_for_review_task = candidates_for_review.clone();
     let usage_records = Arc::new(Mutex::new(Vec::<TokenUsageRecord>::new()));
     let usage_records_for_task = usage_records.clone();
-    let stream_id_for_task = uuid::Uuid::new_v4().to_string();
+    let stream_id_for_task = stream_id.clone();
+    let run_id = stream_id.clone();
     let approvals = state.pending_approvals.clone();
+    let approvals_for_cancel = approvals.clone();
+    let processes = state.processes.clone();
+    let processes_for_cancel = processes.clone();
+    let processes_for_task = processes.clone();
+    let processes_for_agent = processes.clone();
+    let cancelled_for_task = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let cancelled_for_agent = cancelled_for_task.clone();
+    let partial_output = Arc::new(Mutex::new(String::new()));
+    let partial_output_for_task = partial_output.clone();
     let task_state = state.inner();
     let learning_project_root = project_root_opt.clone();
     let (_stream_registration, mut cancel_rx) = register_chat_stream(
         &state.streams,
         &stream_id,
-        state.next_stream_id.load(Ordering::Relaxed),
+        state.next_stream_id.fetch_add(1, Ordering::Relaxed),
+        thread_id.clone(),
     )?;
     log::info!("event=chat_stream_started stream_id={}", stream_id);
     let task = tokio::spawn(async move {
+        let _process_run_cleanup = ProcessRunCleanup {
+            registry: processes_for_task,
+            run_id: stream_id_for_task.clone(),
+        };
         if let Some(root) = project_root_opt {
             if key_owned.is_some() || saved.is_some() || provider_owned == "Ollama" {
                 if !attachments_owned.is_empty() && !supports_vision {
@@ -2759,6 +3283,10 @@ async fn chat_send_stream(
                     usage_records_for_task.clone(),
                     stream_id_for_task.clone(),
                     learning_thread_id_for_agent.clone(),
+                    stream_id_for_task.clone(),
+                    partial_output_for_task.clone(),
+                    cancelled_for_agent.clone(),
+                    processes_for_agent.clone(),
                 )
                 .await?;
                 Ok(result)
@@ -2785,6 +3313,7 @@ async fn chat_send_stream(
             let direct_model_for_usage = model_owned.clone();
             let direct_usage_records = usage_records_for_task.clone();
             let direct_stream_id = stream_id_for_task.clone();
+            let direct_partial_output = partial_output_for_task.clone();
             client::query_llm_stream(
                 ModelRequest {
                     provider: &provider_owned,
@@ -2797,7 +3326,10 @@ async fn chat_send_stream(
                     supports_vision,
                 },
                 ModelCallbacks {
-                    on_token: move |text| {
+                    on_token: move |text: String| {
+                        if let Ok(mut partial) = direct_partial_output.lock() {
+                            partial.push_str(&text);
+                        }
                         let _ = emitter.send(StreamChunk {
                             text,
                             done: false,
@@ -2866,7 +3398,13 @@ async fn chat_send_stream(
     });
     let abort_handle = task.abort_handle();
     let result = tokio::select! {
-        _ = &mut cancel_rx => { abort_handle.abort(); Err("Generation stopped".to_string()) }
+        _ = &mut cancel_rx => {
+            cancelled_for_task.store(true, std::sync::atomic::Ordering::SeqCst);
+            approvals_for_cancel.lock().map_err(|e| e.to_string())?.cancel_run(&run_id);
+            processes_for_cancel.cancel_run(&run_id);
+            abort_handle.abort();
+            Err("Generation stopped".to_string())
+        }
         joined = task => joined.map_err(|error| format!("Stream task failed: {}", error))?,
     };
     if let (Some(thread_id), Ok(records)) = (thread_id.as_deref(), usage_records.lock()) {
@@ -2880,10 +3418,23 @@ async fn chat_send_stream(
             let _ = learning_state.update_thread_learning_candidates(thread_id, candidates);
         }
     }
+    processes.complete(&run_id);
     if let Ok(text) = &result
         && let Some(thread_id) = thread_id.as_deref()
     {
-        task_state.append_thread_message(thread_id, "assistant", text)?;
+        task_state.append_run_outcome(thread_id, &stream_id, "completed", text)?;
+    } else if let (Err(error), Some(thread_id)) = (&result, thread_id.as_deref()) {
+        let partial = partial_output
+            .lock()
+            .map(|text| text.clone())
+            .unwrap_or_default();
+        let text = AppState::safe_run_message(&partial, error, key.as_deref());
+        task_state.append_run_outcome(
+            thread_id,
+            &stream_id,
+            AppState::outcome_status(error),
+            &text,
+        )?;
     }
     if let (Some(thread_id), Some(_project_root)) = (
         learning_thread_id.as_deref(),
@@ -2964,30 +3515,39 @@ async fn chat_send_stream(
 }
 
 #[tauri::command]
-fn cancel_chat_stream(stream_id: Option<String>, state: State<'_, AppState>) -> Result<(), String> {
-    let mut streams = state
+fn cancel_chat_stream(stream_id: String, state: State<'_, AppState>) -> Result<(), String> {
+    if stream_id.trim().is_empty() {
+        return Err("A stream ID is required for cancellation".to_string());
+    }
+    let entry = cancel_registered_stream(&state.streams, &stream_id)?;
+    let _ = entry.cancel.send(());
+    log::info!(
+        "event=chat_stream_cancel_requested stream_id={} thread_id={} run_id={}",
+        stream_id,
+        entry.thread_id.as_deref().unwrap_or("<none>"),
+        entry.run_id
+    );
+    Ok(())
+}
+
+#[tauri::command]
+fn cancel_all_chat_streams(state: State<'_, AppState>) -> Result<usize, String> {
+    let entries: Vec<_> = state
         .streams
         .lock()
-        .map_err(|e| format!("Lock failure: {}", e))?;
-    if let Some(id) = stream_id.filter(|s| !s.is_empty()) {
-        if let Some(entry) = streams.remove(&id) {
-            let _ = entry.cancel.send(());
-            log::info!("event=chat_stream_cancel_requested stream_id={}", id);
-            return Ok(());
-        }
-        return Err("Stream not found or already finished".to_string());
-    }
-    if streams.is_empty() {
-        return Err("Stream not found or already finished".to_string());
-    }
-    for (id, entry) in streams.drain() {
+        .map_err(|error| format!("Lock failure: {error}"))?
+        .drain()
+        .collect();
+    let count = entries.len();
+    for (id, entry) in entries {
         let _ = entry.cancel.send(());
         log::info!(
-            "event=chat_stream_cancel_requested stream_id={} scope=all_active",
-            id
+            "event=chat_stream_admin_cancelled stream_id={} thread_id={}",
+            id,
+            entry.thread_id.as_deref().unwrap_or("<none>")
         );
     }
-    Ok(())
+    Ok(count)
 }
 
 #[tauri::command]
@@ -3012,38 +3572,135 @@ async fn test_provider_connection(
     Ok("Connection successful".into())
 }
 
-fn read_terminal_output(stdout: std::process::ChildStdout, app: tauri::AppHandle, id: String) {
+#[derive(Clone, Copy, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
+enum TerminalStream {
+    Stdout,
+    Stderr,
+}
+
+#[derive(Clone, serde::Serialize)]
+struct TerminalOutputEvent<'a> {
+    id: &'a str,
+    stream: TerminalStream,
+    data: &'a str,
+}
+
+enum TerminalMessage {
+    Data(TerminalStream, String),
+    Eof,
+    Exited(Option<i32>),
+}
+
+fn read_terminal_output<R: Read + Send + 'static>(
+    mut reader: R,
+    sender: std::sync::mpsc::SyncSender<TerminalMessage>,
+    stream: TerminalStream,
+) {
     std::thread::spawn(move || {
-        let mut reader = std::io::BufReader::new(stdout);
         let mut buffer = [0u8; 4096];
-        let mut accum = String::new();
         loop {
             match reader.read(&mut buffer) {
-                Ok(0) => break,
+                Ok(0) | Err(_) => break,
                 Ok(n) => {
-                    let raw = String::from_utf8_lossy(&buffer[..n]);
-                    accum.push_str(&raw);
-                    let screens = [
-                        "Warning: PowerShell detected that you might be using a screen reader and has disabled PSReadLine for compatibility purposes. If you want to re-enable it, run 'Import-Module PSReadLine'.\r\n\r\n",
-                        "Warning: PowerShell detected that you might be using a screen reader and has disabled PSReadLine for compatibility purposes. If you want to re-enable it, run 'Import-Module PSReadLine'.\n\n",
-                        "Warning: PowerShell detected that you might be using a screen reader and has disabled PSReadLine for compatibility purposes. If you want to re-enable it, run 'Import-Module PSReadLine'.",
-                    ];
-                    let mut output = accum.clone();
-                    for screen in screens {
-                        output = output.replace(screen, "");
-                    }
-                    accum.clear();
-                    if !output.is_empty() {
-                        let _ = app.emit(
-                            "terminal-output",
-                            serde_json::json!({
-                                "id": id,
-                                "data": output,
-                            }),
-                        );
+                    let data = String::from_utf8_lossy(&buffer[..n]).into_owned();
+                    if sender.send(TerminalMessage::Data(stream, data)).is_err() {
+                        return;
                     }
                 }
-                Err(_) => break,
+            }
+        }
+        let _ = sender.send(TerminalMessage::Eof);
+    });
+}
+
+#[cfg(test)]
+mod terminal_output_tests {
+    use super::*;
+
+    #[test]
+    fn subprocess_streams_stdout_and_stderr_with_bounded_queue() {
+        let mut command = if cfg!(windows) {
+            let mut command = Command::new("cmd.exe");
+            command.args(["/C", "echo out & echo err 1>&2"]);
+            command
+        } else {
+            let mut command = Command::new("sh");
+            command.args(["-c", "printf out; printf err >&2"]);
+            command
+        };
+        command.stdout(Stdio::piped()).stderr(Stdio::piped());
+        let mut child = command.spawn().expect("spawn test subprocess");
+        let (sender, receiver) = std::sync::mpsc::sync_channel(4);
+        read_terminal_output(
+            child.stdout.take().unwrap(),
+            sender.clone(),
+            TerminalStream::Stdout,
+        );
+        read_terminal_output(
+            child.stderr.take().unwrap(),
+            sender.clone(),
+            TerminalStream::Stderr,
+        );
+        let collector = std::thread::spawn(move || {
+            let mut stdout = String::new();
+            let mut stderr = String::new();
+            let mut eof_count = 0;
+            let mut exit_code = None;
+            for message in receiver {
+                match message {
+                    TerminalMessage::Data(TerminalStream::Stdout, data) => stdout.push_str(&data),
+                    TerminalMessage::Data(TerminalStream::Stderr, data) => stderr.push_str(&data),
+                    TerminalMessage::Eof => eof_count += 1,
+                    TerminalMessage::Exited(code) => exit_code = code,
+                }
+            }
+            (stdout, stderr, eof_count, exit_code)
+        });
+        let status = child.wait().expect("wait for test subprocess");
+        sender.send(TerminalMessage::Exited(status.code())).unwrap();
+        drop(sender);
+        let (stdout, stderr, eof_count, exit_code) = collector.join().unwrap();
+        assert_eq!(stdout.trim(), "out");
+        assert_eq!(stderr.trim(), "err");
+        assert_eq!(eof_count, 2);
+        assert_eq!(exit_code, Some(0));
+    }
+}
+
+fn spawn_terminal_dispatcher(
+    app: tauri::AppHandle,
+    id: String,
+    receiver: std::sync::mpsc::Receiver<TerminalMessage>,
+) {
+    std::thread::spawn(move || {
+        let mut eof_count = 0;
+        let mut exit_code = None;
+        let mut exited = false;
+        while let Ok(message) = receiver.recv() {
+            match message {
+                TerminalMessage::Data(stream, data) => {
+                    let _ = app.emit(
+                        "terminal-output",
+                        TerminalOutputEvent {
+                            id: &id,
+                            stream,
+                            data: &data,
+                        },
+                    );
+                }
+                TerminalMessage::Eof => eof_count += 1,
+                TerminalMessage::Exited(code) => {
+                    exit_code = code;
+                    exited = true;
+                }
+            }
+            if eof_count == 2 && exited {
+                let _ = app.emit(
+                    "terminal-exit",
+                    serde_json::json!({"id": id, "code": exit_code}),
+                );
+                break;
             }
         }
     });
@@ -3064,8 +3721,8 @@ fn terminal_create(
     let (program, args) = resolved_shell(shell.as_deref())?;
     let mut command = Command::new(program);
     command.args(args);
-    #[cfg(target_os = "windows")]
-    command.creation_flags(CREATE_NO_WINDOW);
+    terminal_windows_process_group(&mut command);
+    terminal_process_group(&mut command);
     command
         .current_dir(&working_dir)
         .stdin(Stdio::piped())
@@ -3088,30 +3745,11 @@ fn terminal_create(
         "terminal-{}",
         state.next_stream_id.fetch_add(1, Ordering::Relaxed)
     );
-    let app_stdout = app.clone();
-    let app_stderr = app.clone();
-    let id_stdout = id.clone();
-    let id_stderr = id.clone();
-    read_terminal_output(stdout, app_stdout, id_stdout);
-    std::thread::spawn(move || {
-        let mut reader = std::io::BufReader::new(stderr);
-        let mut buffer = [0u8; 4096];
-        loop {
-            match reader.read(&mut buffer) {
-                Ok(0) => break,
-                Ok(n) => {
-                    let _ = app_stderr.emit(
-                        "terminal-output",
-                        serde_json::json!({
-                            "id": id_stderr,
-                            "data": String::from_utf8_lossy(&buffer[..n]),
-                        }),
-                    );
-                }
-                Err(_) => break,
-            }
-        }
-    });
+    let terminal_pid = child.id();
+    let (output_tx, output_rx) = std::sync::mpsc::sync_channel(64);
+    read_terminal_output(stdout, output_tx.clone(), TerminalStream::Stdout);
+    read_terminal_output(stderr, output_tx.clone(), TerminalStream::Stderr);
+    spawn_terminal_dispatcher(app.clone(), id.clone(), output_rx);
     state
         .terminals
         .lock()
@@ -3120,14 +3758,15 @@ fn terminal_create(
             id.clone(),
             Arc::new(Mutex::new(TerminalSession { child, stdin })),
         );
-    spawn_terminal_monitor(app, id.clone(), state.terminals.clone());
+    spawn_terminal_monitor(id.clone(), terminal_pid, state.terminals.clone(), output_tx);
     Ok(id)
 }
 
 fn spawn_terminal_monitor(
-    app: tauri::AppHandle,
     id: String,
+    terminal_pid: u32,
     terminals: Arc<Mutex<HashMap<String, Arc<Mutex<TerminalSession>>>>>,
+    output_tx: std::sync::mpsc::SyncSender<TerminalMessage>,
 ) {
     std::thread::spawn(move || {
         loop {
@@ -3143,10 +3782,10 @@ fn spawn_terminal_monitor(
             };
             match status {
                 Ok(Some(status)) => {
-                    let _ = app.emit(
-                        "terminal-exit",
-                        serde_json::json!({ "id": id.clone(), "code": status.code() }),
-                    );
+                    // A descendant may outlive the shell while retaining inherited pipes.
+                    terminate_terminal_tree(terminal_pid);
+                    let _ = output_tx.send(TerminalMessage::Exited(status.code()));
+                    drop(session);
                     if let Ok(mut map) = terminals.lock() {
                         map.remove(&id);
                     }
@@ -3190,11 +3829,7 @@ fn terminal_kill(id: String, state: State<'_, AppState>) -> Result<(), String> {
             .ok_or_else(|| "terminal not found".to_string())?
     };
     let mut session = session.lock().map_err(|e| format!("Lock failure: {}", e))?;
-    let _ = session.stdin.flush();
-    let _ = session.stdin.write_all(b"\r\nexit\r\n");
-    let _ = session.stdin.flush();
-    let _ = session.child.kill();
-    let _ = session.child.wait();
+    session.stop();
     Ok(())
 }
 
@@ -3265,6 +3900,7 @@ pub fn run() {
             chat_send,
             chat_send_stream,
             cancel_chat_stream,
+            cancel_all_chat_streams,
             test_provider_connection,
             tool_list,
             skills_list,
@@ -3337,6 +3973,97 @@ mod tests {
     use super::*;
 
     #[test]
+    fn failed_run_outcome_is_structured_idempotent_and_secret_safe() {
+        let state = AppState::default();
+        let project = state.create_project("Run outcomes".into(), None).unwrap();
+        let thread = state.create_thread(&project.id).unwrap();
+        let text = AppState::safe_run_message(
+            "partial answer",
+            "provider returned secret",
+            Some("secret"),
+        );
+        state
+            .append_run_outcome(&thread.id, "run-1", "failed", &text)
+            .unwrap();
+        state
+            .append_run_outcome(&thread.id, "run-1", "failed", &text)
+            .unwrap();
+
+        let stored = state.get_thread(&thread.id).unwrap();
+        assert_eq!(stored.messages.len(), 1);
+        assert_eq!(stored.messages[0].run_id.as_deref(), Some("run-1"));
+        assert_eq!(stored.messages[0].outcome.as_deref(), Some("failed"));
+        assert!(stored.messages[0].text.contains("partial answer"));
+        assert!(!stored.messages[0].text.contains("secret"));
+        assert!(stored.messages[0].text.contains("Provider request failed"));
+    }
+
+    #[test]
+    fn optional_project_lookup_fails_for_invalid_supplied_ids() {
+        let state = AppState::default();
+        assert!(
+            resolve_optional_project_root(None, |_| Ok(PathBuf::from("unused")))
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            resolve_optional_project_root(Some("valid"), |_| Ok(PathBuf::from("workspace")))
+                .unwrap(),
+            Some(PathBuf::from("workspace"))
+        );
+        assert_eq!(state.project_root("   ").unwrap_err(), "Invalid project ID");
+        assert_eq!(
+            resolve_optional_project_root(Some("missing"), |_| {
+                Err("Project not found: missing".into())
+            })
+            .unwrap_err(),
+            "Project not found: missing"
+        );
+        assert_eq!(state.project_root("").unwrap_err(), "Invalid project ID");
+        assert_eq!(
+            state.project_root("malformed").unwrap_err(),
+            "Project not found: malformed"
+        );
+        assert!(state.projects.lock().unwrap().is_empty());
+        assert!(
+            resolve_optional_project_root(Some("stale-frontend-id"), |id| state.project_root(id))
+                .is_err()
+        );
+        assert!(
+            resolve_optional_project_root(
+                Some("missing"),
+                |_| Err("Lock failure: poisoned".into())
+            )
+            .is_err()
+        );
+        assert!(
+            resolve_optional_project_root(Some("missing"), |_| Err(
+                "Project folder is unavailable: deleted".into()
+            ))
+            .is_err()
+        );
+        assert!(
+            resolve_optional_project_root(Some("missing"), |id| state.project_root(id)).is_err()
+        );
+        assert!(
+            resolve_optional_project_root(None, |_| Err("must not run".into()))
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn deleted_project_id_is_not_fallback_path() {
+        let state = AppState::default();
+        let project = state.create_project("Delete".into(), None).unwrap();
+        let deleted = state.delete_project(&project.id).unwrap();
+        assert!(deleted.is_empty());
+        assert!(
+            resolve_optional_project_root(Some(&project.id), |id| state.project_root(id)).is_err()
+        );
+    }
+
+    #[test]
     fn skill_activation_requires_valid_name_and_reason() {
         let mut call = harness::ToolCall {
             id: "skill-test".into(),
@@ -3349,6 +4076,27 @@ mod tests {
         call.arguments["name"] = serde_json::json!("security");
         call.arguments["reason"] = serde_json::json!("   ");
         assert!(validate_tool_call(&call).is_err());
+    }
+
+    #[test]
+    fn request_limit_is_a_distinct_persisted_outcome_with_followup_guidance() {
+        let reason = "AGENT_REQUEST_LIMIT_REACHED: run reached request cap";
+        assert_eq!(AppState::outcome_status(reason), "request_limit_exhausted");
+        assert!(AppState::user_facing_run_error(reason).contains("follow-up prompt"));
+        assert_eq!(AppState::outcome_status("Generation stopped"), "cancelled");
+    }
+
+    #[test]
+    fn completed_tool_result_is_bounded_and_persisted_with_protocol_id() {
+        let mut partial = String::new();
+        append_completed_tool_progress(&mut partial, "call-7", "read_file", "useful output");
+        assert!(partial.contains("call_id=call-7"));
+        assert!(partial.contains("useful output"));
+        append_completed_tool_progress(&mut partial, "call-8", "read_file", &"x".repeat(80_000));
+        assert!(partial.contains("call_id=call-7"));
+        assert!(partial.contains("useful output"));
+        assert!(partial.len() <= MAX_PERSISTED_TOOL_PROGRESS_BYTES);
+        assert!(partial.is_char_boundary(partial.len()));
     }
 
     #[test]
@@ -3391,6 +4139,178 @@ mod tests {
         assert!(del_res.is_ok());
         let list_after = state.list_providers().unwrap();
         assert_eq!(list_after.len(), 0);
+    }
+
+    #[test]
+    fn approval_lifecycle_cleanup_and_stale_responses() {
+        let approvals = Arc::new(Mutex::new(PendingApprovals::default()));
+        let (sender1, mut receiver1) = oneshot::channel::<ApprovalOutcome>();
+        let (sender2, mut receiver2) = oneshot::channel::<ApprovalOutcome>();
+        {
+            let mut pending = approvals.lock().unwrap();
+            pending.waiting.insert(
+                "approval-1".into(),
+                PendingApproval {
+                    run_id: "run-1".into(),
+                    tool_call_id: "call-1".into(),
+                    sender: sender1,
+                },
+            );
+            pending.waiting.insert(
+                "approval-2".into(),
+                PendingApproval {
+                    run_id: "run-2".into(),
+                    tool_call_id: "call-2".into(),
+                    sender: sender2,
+                },
+            );
+            pending.cancel_run("run-1");
+            assert!(pending.waiting.contains_key("approval-2"));
+            assert!(!pending.waiting.contains_key("approval-1"));
+        }
+        assert_eq!(receiver1.try_recv().unwrap(), ApprovalOutcome::Cancelled);
+        {
+            let approval = approvals
+                .lock()
+                .unwrap()
+                .waiting
+                .remove("approval-2")
+                .unwrap();
+            let _ = approval
+                .sender
+                .send(ApprovalOutcome::Denied { response: None });
+        }
+        assert_eq!(
+            receiver2.try_recv().unwrap(),
+            ApprovalOutcome::Denied { response: None }
+        );
+        assert!(approvals.lock().unwrap().waiting.is_empty());
+
+        let (sender, mut receiver) = oneshot::channel::<ApprovalOutcome>();
+        let _ = sender.send(ApprovalOutcome::Expired);
+        assert_eq!(receiver.try_recv().unwrap(), ApprovalOutcome::Expired);
+    }
+
+    #[test]
+    fn chat_context_requires_thread_project_ownership_and_handles_projectless_threads() {
+        let state = AppState::default();
+        let base = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("target")
+            .join(format!("thread-owner-{}", uuid::Uuid::new_v4()));
+        let root = base.join("owned");
+        let other_root = base.join("other");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&other_root).unwrap();
+        let project = ProjectInfo {
+            id: "owned-project".into(),
+            name: "Owned".into(),
+            subtitle: String::new(),
+            path: Some(root.to_string_lossy().into_owned()),
+            active: true,
+        };
+        let other = ProjectInfo {
+            id: "other-project".into(),
+            name: "Other".into(),
+            subtitle: String::new(),
+            path: Some(other_root.to_string_lossy().into_owned()),
+            active: false,
+        };
+        state
+            .projects
+            .lock()
+            .unwrap()
+            .extend([project.clone(), other.clone()]);
+        let thread = ChatThread {
+            id: "owned-thread".into(),
+            project_id: project.id.clone(),
+            title: "Owned".into(),
+            messages: Vec::new(),
+            token_usage: Vec::new(),
+            compacted_summary: None,
+            compacted_message_count: 0,
+            learning_candidates: Vec::new(),
+        };
+        state.threads.lock().unwrap().push(thread.clone());
+
+        assert_eq!(
+            state
+                .resolve_chat_context(Some(&thread.id), Some(&project.id))
+                .unwrap()
+                .unwrap()
+                .0,
+            root.canonicalize().unwrap()
+        );
+        assert_eq!(
+            state
+                .resolve_chat_context(Some(&thread.id), None)
+                .unwrap()
+                .unwrap()
+                .0,
+            root.canonicalize().unwrap()
+        );
+        assert!(
+            state
+                .resolve_chat_context(Some(&thread.id), Some(&other.id))
+                .unwrap_err()
+                .contains("belongs to project")
+        );
+        assert!(
+            state
+                .resolve_chat_context(Some("missing-thread"), Some(&project.id))
+                .unwrap_err()
+                .contains("Thread not found")
+        );
+        assert!(
+            state
+                .resolve_chat_context(None, Some("missing-project"))
+                .unwrap_err()
+                .contains("Project not found")
+        );
+        state.projects.lock().unwrap().clear();
+        assert!(
+            state
+                .resolve_chat_context(Some(&thread.id), None)
+                .unwrap_err()
+                .contains("Project not found")
+        );
+        state
+            .projects
+            .lock()
+            .unwrap()
+            .extend([project.clone(), other.clone()]);
+
+        let projectless = ChatThread {
+            id: "projectless-thread".into(),
+            project_id: String::new(),
+            title: "Independent".into(),
+            messages: Vec::new(),
+            token_usage: Vec::new(),
+            compacted_summary: None,
+            compacted_message_count: 0,
+            learning_candidates: Vec::new(),
+        };
+        state.threads.lock().unwrap().push(projectless);
+        assert!(
+            state
+                .resolve_chat_context(Some("projectless-thread"), None)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            state
+                .resolve_chat_context(Some("projectless-thread"), Some(&project.id))
+                .unwrap_err()
+                .contains("belongs to project")
+        );
+        assert!(state.resolve_chat_context(None, None).unwrap().is_none());
+        state.projects.lock().unwrap().clear();
+        assert!(
+            state
+                .project_root(&project.id)
+                .unwrap_err()
+                .contains("Project not found")
+        );
+        let _ = std::fs::remove_dir_all(base);
     }
 
     #[test]

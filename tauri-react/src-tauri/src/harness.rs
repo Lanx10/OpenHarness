@@ -3,12 +3,88 @@ use std::fs;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
-#[cfg(target_os = "windows")]
+#[cfg(windows)]
 use std::os::windows::process::CommandExt;
-#[cfg(target_os = "windows")]
+#[cfg(windows)]
+const CREATE_NEW_PROCESS_GROUP: u32 = 0x00000200;
+#[cfg(windows)]
 const CREATE_NO_WINDOW: u32 = 0x08000000;
+#[cfg(unix)]
+use std::os::unix::process::CommandExt as _;
+
+#[cfg(unix)]
+fn terminate_process_tree(pid: u32) {
+    terminate_process_tree_inner(pid);
+}
+
+#[cfg(windows)]
+fn terminate_process_tree(pid: u32) {
+    // taskkill traverses descendants; spawn without waiting so cancellation stays bounded.
+    let _ = Command::new("taskkill.exe")
+        .args(["/PID", &pid.to_string(), "/T", "/F"])
+        .creation_flags(CREATE_NO_WINDOW)
+        .spawn();
+}
+
+#[derive(Default)]
+pub(crate) struct ProcessRegistry {
+    state: Mutex<ProcessState>,
+}
+
+#[derive(Default)]
+struct ProcessState {
+    entries: Vec<(String, u32)>,
+    cancelled_runs: std::collections::HashSet<String>,
+}
+
+impl ProcessRegistry {
+    fn register(&self, run_id: &str, pid: u32) -> bool {
+        let mut state = self.state.lock().unwrap();
+        if state.cancelled_runs.contains(run_id) {
+            return false;
+        }
+        state.entries.push((run_id.to_string(), pid));
+        true
+    }
+
+    pub(crate) fn cancel_run(&self, run_id: &str) {
+        let pids = {
+            let mut state = self.state.lock().unwrap();
+            state.cancelled_runs.insert(run_id.to_string());
+            state
+                .entries
+                .iter()
+                .filter_map(|(id, pid)| (id == run_id).then_some(*pid))
+                .collect::<Vec<_>>()
+        };
+        for pid in pids {
+            terminate_process_tree(pid);
+        }
+    }
+
+    fn unregister(&self, run_id: &str, pid: u32) {
+        self.state
+            .lock()
+            .unwrap()
+            .entries
+            .retain(|(id, child)| id != run_id || *child != pid);
+    }
+
+    pub(crate) fn is_cancelled(&self, run_id: &str) -> bool {
+        self.state.lock().unwrap().cancelled_runs.contains(run_id)
+    }
+
+    pub(crate) fn complete(&self, run_id: &str) {
+        self.state
+            .lock()
+            .unwrap()
+            .entries
+            .retain(|(id, _)| id != run_id);
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FileEntry {
@@ -362,22 +438,13 @@ impl Sandbox {
         offset: Option<usize>,
         limit: Option<usize>,
     ) -> Result<String, String> {
-        let trimmed = rel_path.trim();
-        if trimmed.is_empty() {
-            return Err("File path cannot be empty".to_string());
-        }
-        let full_path = self.resolve_path(trimmed)?;
-        if !full_path.is_file() {
-            return Err(format!("'{}' is not a file", rel_path));
-        }
-        let sym_meta = fs::symlink_metadata(&full_path)
+        Self::validate_regular_file(rel_path.trim(), "Reading")?;
+        let full_path = self.resolve_path(rel_path.trim())?;
+        let metadata = fs::symlink_metadata(&full_path)
             .map_err(|e| format!("Failed to read metadata for '{}': {}", rel_path, e))?;
-        if sym_meta.file_type().is_symlink() {
-            return Err("Security error: Reading symlinks is forbidden".to_string());
+        if metadata.file_type().is_symlink() || !metadata.is_file() {
+            return Err("Security error: Reading requires a regular, non-symlink file".into());
         }
-
-        let metadata = fs::metadata(&full_path)
-            .map_err(|e| format!("Failed to read file metadata for '{}': {}", rel_path, e))?;
         if metadata.len() as usize > MAX_READ_BYTES {
             return Err(format!(
                 "File '{}' exceeds maximum allowed size ({} bytes > {} max)",
@@ -386,8 +453,7 @@ impl Sandbox {
                 MAX_READ_BYTES
             ));
         }
-        let content = fs::read_to_string(&full_path)
-            .map_err(|e| format!("Failed to read '{}': {}", rel_path, e))?;
+        let content = Self::read_regular_file(&full_path, rel_path)?;
 
         if offset.is_none() && limit.is_none() {
             return Ok(content);
@@ -402,6 +468,63 @@ impl Sandbox {
             .collect();
 
         Ok(selected_lines.join("\n"))
+    }
+
+    fn validate_regular_file(path: &str, operation: &str) -> Result<(), String> {
+        for component in Path::new(path).components() {
+            match component {
+                std::path::Component::Prefix(_) | std::path::Component::RootDir => {
+                    return Err("Security error: Absolute paths are forbidden".into());
+                }
+                std::path::Component::ParentDir => {
+                    return Err("Security error: Parent traversal is forbidden".into());
+                }
+                std::path::Component::CurDir | std::path::Component::Normal(_) => {}
+            }
+        }
+        if path.is_empty() {
+            return Err(format!("{} requires a file path", operation));
+        }
+        Ok(())
+    }
+
+    fn read_regular_file(full_path: &Path, display_path: &str) -> Result<String, String> {
+        let metadata = fs::symlink_metadata(full_path)
+            .map_err(|error| format!("Could not inspect '{}': {}", display_path, error))?;
+        if metadata.file_type().is_symlink() || !metadata.is_file() {
+            return Err(
+                "Security error: File operations require a regular, non-symlink file".into(),
+            );
+        }
+        if metadata.len() as usize > MAX_READ_BYTES {
+            return Err(format!(
+                "File '{}' exceeds maximum allowed size ({} bytes > {} max)",
+                display_path,
+                metadata.len(),
+                MAX_READ_BYTES
+            ));
+        }
+        let bytes = fs::read(full_path)
+            .map_err(|error| format!("Could not read '{}': {}", display_path, error))?;
+        let rechecked = fs::symlink_metadata(full_path)
+            .map_err(|error| format!("Could not recheck '{}': {}", display_path, error))?;
+        if rechecked.file_type().is_symlink()
+            || !rechecked.is_file()
+            || rechecked.len() != metadata.len()
+            || rechecked.modified().ok() != metadata.modified().ok()
+            || bytes.len() as u64 != rechecked.len()
+        {
+            return Err(format!(
+                "File '{}' changed while reading; read it again and retry",
+                display_path
+            ));
+        }
+        String::from_utf8(bytes).map_err(|_| {
+            format!(
+                "File '{}' is not UTF-8 text; binary or non-UTF-8 files are unsupported",
+                display_path
+            )
+        })
     }
 
     pub fn patch_file(
@@ -441,14 +564,12 @@ impl Sandbox {
                 MAX_READ_BYTES
             ));
         }
-        let content = fs::read_to_string(&full_path)
-            .map_err(|error| format!("Could not read '{}': {}", rel_path, error))?;
+        let content = Self::read_regular_file(&full_path, rel_path)?;
         let read_metadata = fs::symlink_metadata(&full_path)
             .map_err(|error| format!("Could not recheck '{}': {}", rel_path, error))?;
         if read_metadata.file_type().is_symlink()
             || read_metadata.len() != metadata.len()
             || read_metadata.modified().ok() != metadata.modified().ok()
-            || content.len() as u64 != read_metadata.len()
         {
             return Err("File changed while preparing patch; read it again and retry".to_string());
         }
@@ -815,6 +936,22 @@ impl ExecutionEngine {
         command_str: &str,
         timeout_secs: Option<u64>,
     ) -> Result<CommandResult, String> {
+        Self::run_command_tracked(
+            root,
+            command_str,
+            timeout_secs,
+            &ProcessRegistry::default(),
+            "standalone",
+        )
+    }
+
+    fn run_command_tracked(
+        root: &Path,
+        command_str: &str,
+        timeout_secs: Option<u64>,
+        registry: &ProcessRegistry,
+        run_id: &str,
+    ) -> Result<CommandResult, String> {
         let trimmed = command_str.trim();
         if trimmed.is_empty() {
             return Err("Command cannot be empty".to_string());
@@ -842,9 +979,11 @@ impl ExecutionEngine {
             c.arg("-c").arg(trimmed);
             c
         };
+        #[cfg(unix)]
+        cmd.process_group(0);
 
-        #[cfg(target_os = "windows")]
-        cmd.creation_flags(CREATE_NO_WINDOW);
+        #[cfg(windows)]
+        cmd.creation_flags(CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW);
 
         cmd.current_dir(root)
             .stdout(Stdio::piped())
@@ -853,6 +992,13 @@ impl ExecutionEngine {
         let mut child = cmd
             .spawn()
             .map_err(|e| format!("Failed to execute command: {}", e))?;
+        let pid = child.id();
+        if !registry.register(run_id, pid) {
+            terminate_process_tree(pid);
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err("Agent run cancelled before command started".into());
+        }
         let stdout = child.stdout.take().ok_or("Command stdout unavailable")?;
         let stderr = child.stderr.take().ok_or("Command stderr unavailable")?;
         let output_limit = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -865,6 +1011,11 @@ impl ExecutionEngine {
         loop {
             match child.try_wait() {
                 Ok(Some(status)) => {
+                    let was_cancelled = registry.is_cancelled(run_id);
+                    registry.unregister(run_id, pid);
+                    if was_cancelled {
+                        return Err("Agent run cancelled".into());
+                    }
                     let duration_ms = start.elapsed().as_millis();
                     if output_limit.load(std::sync::atomic::Ordering::Relaxed) {
                         child.kill().map_err(|error| {
@@ -953,7 +1104,8 @@ impl GitContext {
         output_cmd.creation_flags(CREATE_NO_WINDOW);
         let output = output_cmd
             .arg("status")
-            .arg("--short")
+            .arg("--porcelain=v1")
+            .arg("-z")
             .arg("--branch")
             .current_dir(root)
             .output()
@@ -1801,9 +1953,20 @@ impl ToolDispatcher {
         {
             match args_val {
                 serde_json::Value::String(raw) => {
-                    serde_json::from_str(raw).unwrap_or_else(|_| serde_json::json!({}))
+                    match serde_json::from_str::<serde_json::Value>(raw) {
+                        Ok(value) if value.is_object() => value,
+                        Ok(_) => {
+                            serde_json::json!({"__native_argument_parse_error": "arguments must be a JSON object"})
+                        }
+                        Err(error) => {
+                            serde_json::json!({"__native_argument_parse_error": format!("invalid JSON arguments: {}", error)})
+                        }
+                    }
                 }
-                other => other.clone(),
+                other if other.is_object() => other.clone(),
+                _ => {
+                    serde_json::json!({"__native_argument_parse_error": "arguments must be a JSON object"})
+                }
             }
         } else {
             let mut top = serde_json::Map::new();
@@ -2332,8 +2495,37 @@ impl ToolDispatcher {
     }
 
     pub fn execute_tool(root: &Path, call: &ToolCall, approved: bool) -> ToolResult {
+        Self::execute_tool_tracked(
+            root,
+            call,
+            approved,
+            &ProcessRegistry::default(),
+            "standalone",
+        )
+    }
+
+    pub(crate) fn execute_tool_tracked(
+        root: &Path,
+        call: &ToolCall,
+        approved: bool,
+        registry: &ProcessRegistry,
+        run_id: &str,
+    ) -> ToolResult {
+        if let Some(error) = call
+            .arguments
+            .get("__native_argument_parse_error")
+            .and_then(|value| value.as_str())
+        {
+            return ToolResult {
+                tool_call_id: call.id.clone(),
+                name: call.name.clone(),
+                success: false,
+                output: String::new(),
+                error: Some(error.to_string()),
+            };
+        }
         let started = std::time::Instant::now();
-        let result = Self::execute_tool_inner(root, call, approved);
+        let result = Self::execute_tool_inner(root, call, approved, registry, run_id);
         crate::audit::emit(
             crate::audit::EventKind::ToolFinished,
             &call.id,
@@ -2352,7 +2544,13 @@ impl ToolDispatcher {
         result
     }
 
-    fn execute_tool_inner(root: &Path, call: &ToolCall, approved: bool) -> ToolResult {
+    fn execute_tool_inner(
+        root: &Path,
+        call: &ToolCall,
+        approved: bool,
+        registry: &ProcessRegistry,
+        run_id: &str,
+    ) -> ToolResult {
         crate::audit::emit(
             crate::audit::EventKind::ToolStarted,
             &call.id,
@@ -2500,7 +2698,8 @@ impl ToolDispatcher {
             "run_command" => {
                 let command = call.arguments["command"].as_str().unwrap_or("");
                 let timeout = call.arguments["timeout_secs"].as_u64();
-                match ExecutionEngine::run_command(root, command, timeout) {
+                match ExecutionEngine::run_command_tracked(root, command, timeout, registry, run_id)
+                {
                     Ok(res) => ToolResult {
                         tool_call_id: call.id.clone(),
                         name: call.name.clone(),
@@ -2761,6 +2960,74 @@ impl ToolDispatcher {
 mod tests {
     use super::*;
 
+    #[cfg(unix)]
+    #[test]
+    fn tracked_command_cancellation_kills_process_group_and_keeps_runs_isolated() {
+        let root = std::env::temp_dir().join(format!("openharness-cancel-{}", std::process::id()));
+        fs::create_dir_all(&root).unwrap();
+        let registry = std::sync::Arc::new(ProcessRegistry::default());
+        let registry_for_command = registry.clone();
+        let root_for_command = root.clone();
+        let command = std::thread::spawn(move || {
+            ExecutionEngine::run_command_tracked(
+                &root_for_command,
+                "sleep 30 & child=$!; echo $child; wait",
+                Some(60),
+                &registry_for_command,
+                "run-a",
+            )
+        });
+        let pid = loop {
+            let state = registry.state.lock().unwrap();
+            if let Some((_, pid)) = state.entries.iter().find(|(run, _)| run == "run-a") {
+                break *pid;
+            }
+            drop(state);
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        registry.cancel_run("unrelated-run");
+        assert!(registry.is_cancelled("unrelated-run"));
+        assert!(!registry.is_cancelled("run-a"));
+        registry.cancel_run("run-a");
+        registry.cancel_run("run-a");
+        assert!(command.join().unwrap().is_err());
+        let mut probe = Command::new("sh");
+        probe.arg("-c").arg(format!("kill -0 {pid} 2>/dev/null"));
+        let probe = probe.status().unwrap();
+        assert!(!probe.success(), "cancelled shell process should be gone");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn invalid_native_tool_arguments_are_rejected_without_execution() {
+        let call = ToolDispatcher::native_tool_call(
+            &serde_json::json!({"id":"call_bad_json","name":"read_file","arguments":"{"}),
+            1,
+        )
+        .unwrap();
+        assert!(
+            call.arguments["__native_argument_parse_error"]
+                .as_str()
+                .unwrap()
+                .contains("invalid JSON")
+        );
+        let result = ToolDispatcher::execute_tool(Path::new("."), &call, true);
+        assert!(!result.success);
+        assert!(result.error.unwrap().contains("invalid JSON"));
+
+        let array = ToolDispatcher::native_tool_call(
+            &serde_json::json!({"id":"call_array","name":"read_file","arguments":"[]"}),
+            2,
+        )
+        .unwrap();
+        assert!(
+            array.arguments["__native_argument_parse_error"]
+                .as_str()
+                .unwrap()
+                .contains("JSON object")
+        );
+    }
+
     #[test]
     fn project_instructions_load_root_to_nested_only() {
         let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -2789,6 +3056,64 @@ mod tests {
         assert_eq!(
             sandbox.load_project_instructions(&sibling).unwrap().len(),
             2
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn read_file_rejects_binary_and_non_utf8_and_preserves_crlf() {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("target")
+            .join(format!(
+                "read_safety_{}_{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_nanos()
+            ));
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("crlf.txt"), b"one\r\ntwo\r\n").unwrap();
+        fs::write(root.join("binary.bin"), [0xff, 0x00, 0x80]).unwrap();
+        let sandbox = Sandbox::new(root.clone()).unwrap();
+        assert_eq!(
+            sandbox.read_file("crlf.txt", None, None).unwrap(),
+            "one\r\ntwo\r\n"
+        );
+        assert_eq!(
+            sandbox.read_file("crlf.txt", Some(2), Some(1)).unwrap(),
+            "two"
+        );
+        assert!(
+            sandbox
+                .read_file("binary.bin", None, None)
+                .unwrap_err()
+                .contains("not UTF-8")
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn read_file_rejects_files_over_size_limit() {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("target")
+            .join(format!(
+                "read_limit_{}_{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_nanos()
+            ));
+        fs::create_dir_all(&root).unwrap();
+        let file = fs::File::create(root.join("large.txt")).unwrap();
+        file.set_len((MAX_READ_BYTES + 1) as u64).unwrap();
+        let sandbox = Sandbox::new(root.clone()).unwrap();
+        assert!(
+            sandbox
+                .read_file("large.txt", None, Some(1))
+                .unwrap_err()
+                .contains("exceeds maximum")
         );
         let _ = fs::remove_dir_all(root);
     }

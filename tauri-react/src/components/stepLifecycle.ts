@@ -80,8 +80,10 @@ export function persistQueuedPrompts(
 
 
 export function estimateMessageTokens(text: string, attachments: string[] = []): number {
-  const content = [text, ...attachments].join('\n');
-  return content.trim() ? Math.ceil(content.length / 4) : 0;
+  const visibleText = [text, ...attachments.filter(item => !item.startsWith('![image](data:image/'))].join('\n');
+  const textTokens = Math.ceil(Array.from(visibleText).reduce((bytes, char) => bytes + (char.codePointAt(0)! > 0x7f ? 3 : 1), 0) / 3);
+  const imageTokens = attachments.filter(item => item.includes('data:image/')).length * 1_024;
+  return textTokens + imageTokens + (visibleText.trim() || imageTokens ? 8 : 0);
 }
 
 export function markPromptActive(prompt: QueuedPrompt): QueuedPrompt {

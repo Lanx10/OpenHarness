@@ -9,6 +9,8 @@ The UI includes a project drawer, composer, conversation view, settings, provide
 
 ## 2. Runtime architecture and current state
 
+> **Accuracy note:** This guide describes source-level behavior. Build/test success does not establish packaged runtime behavior. Startup readiness is currently partial: see §12.
+
 The active desktop application is `tauri-react/`: React 19, TypeScript, Vite, and a Tauri 2 Rust backend. The top-level `app/` directory is a separate egui prototype. Desktop state persists providers, projects, threads/messages, compaction metadata, learning proposals, and approval mode to Tauri app-data `state.json`; this is file-backed JSON, not SQLite. Provider API keys are held in the OS credential store. Browser-only projects/providers use localStorage, threads are in-memory, and test/chat are simulated.
 
 ```text
@@ -20,7 +22,7 @@ React components → services/tauriBridge.ts → Tauri IPC/channels
 Browser-only mode → localStorage/in-memory demo fallbacks (no Rust backend)
 ```
 
-The active composer uses streamed chat with thread history and an agent/tool loop; `chat_send` is a separate one-shot command. Implemented providers are Ollama, OpenRouter, Google AI Studio's OpenAI-compatible endpoint, and generic OpenAI-compatible endpoints. Anthropic Messages, Claude Code/Codex OAuth or CLI, MCP, and model discovery are not implemented. The packaged app has a CSP in `tauri.conf.json`; review the configured Tauri capabilities when changing command/plugin access.
+The active composer uses streamed chat with thread history and an agent/tool loop; `chat_send` is a separate one-shot command. Implemented providers are Ollama, OpenRouter, Google AI Studio's OpenAI-compatible endpoint, and generic OpenAI-compatible endpoints. Anthropic Messages, Claude Code/Codex OAuth or CLI, and model discovery are not implemented. The packaged app has a CSP in `tauri.conf.json`; review the configured Tauri capabilities when changing command/plugin access.
 
 API keys must not be returned to React, logged, or persisted in ordinary files. Tauri commands are the frontend/backend boundary; keep inputs typed/validated and synchronize Rust signatures with `tauriBridge.ts`. Browser demo behavior is not evidence of desktop/provider behavior.
 
@@ -29,11 +31,12 @@ Rust diagnostics use Tauri's platform-specific application log directory (`app_l
 ## 3. Implemented command contract
 
 
-Commands are registered in `src-tauri/src/lib.rs`; TypeScript calls belong in `src/services/tauriBridge.ts`.
+Commands are registered in `src-tauri/src/lib.rs`; TypeScript calls belong in `src/services/tauriBridge.ts`. `get_startup_readiness` returns component records (`id`, `displayName`, `status`, `message`, `required`, `recoverable`, `validatedAtUnixMs`, optional `diagnosticReference`). Status wire values are snake_case: `ready`, `degraded`, `unavailable`, `disabled`, `failed`. See §12 for important current limitations.
 
 | Purpose | Commands |
 |---|---|
 | Providers | `provider_save`, `provider_list`, `provider_delete`, `test_provider_connection` |
+| Readiness | `get_startup_readiness` |
 | Projects | `get_projects`, `select_project`, `create_project`, `rename_project`, `delete_project`, `relink_project` |
 | Threads/messages | `list_threads`, `create_thread`, `get_thread`, `rename_thread`, `delete_thread`, `append_thread_message`, `edit_thread_message`, `delete_thread_message`, `compact_thread` |
 | Chat and approvals | `chat_send`, `chat_send_stream`, `cancel_chat_stream`, `respond_to_tool_approval`, `get_tool_approval_mode`, `set_tool_approval_mode`, `update_thread_learning_candidates`, `dismiss_thread_learning_candidates` |
@@ -58,7 +61,7 @@ Requests disable redirects and apply timeouts and response/error-body size bound
 
 Anthropic's native Messages API, Claude Code/Codex sign-in, and vendor CLI integration are not implemented. Do not infer support from old UI labels or examples. Image attachments supported by the backend are PNG, JPEG, WebP, and GIF, validated for base64, 4 MB maximum size, MIME, and content signature; SVG is rejected. Images require model vision support. Persisted thread messages retain their own image attachments and are reconstructed in message order on later streamed requests; exact duplicate current-message references are merged once. History images are serialized as OpenAI-compatible `image_url` content parts, or Ollama `images` arrays. The implementation supports Ollama and the OpenAI-compatible request shape (including OpenRouter, Google AI Studio's compatible endpoint, and generic OpenAI-compatible providers); provider-specific departures from that shape may reject image requests. Missing/corrupt or unsupported stored image data fails request construction with an error rather than being silently omitted. Historical-image context is not automatically trimmed independently, so long threads with many images can exceed provider context limits. Arbitrary document upload/provider-side parsing is not provided.
 
-## 6. Persistence and conversation history
+## 5. Persistence and conversation history
 
 Desktop startup loads Tauri app-data `state.json`. It persists provider metadata, projects, threads/messages, compaction metadata, learning proposals, and tool-approval mode. Writes serialize to a temporary file and replace the state file. This is JSON persistence, not SQLite. Provider secrets remain in the OS credential store; store failures are surfaced, not intentionally downgraded to plaintext.
 
@@ -70,13 +73,13 @@ At agent startup, project `AGENTS.md` files are discovered only along the canoni
 
 Browser-only mode is intentionally different: project/provider metadata uses localStorage, threads are page-memory only, and chat/provider tests are simulated.
 
-## 7. Streaming, cancellation, and agent loop
+## 6. Streaming, cancellation, and agent loop
 
 The active composer uses `chat_send_stream`. Provider parsers emit text deltas and token usage when supplied. The Rust agent loop can make multiple model requests, dispatch tool calls, add tool results to context, and continue until a final response or request limit/error. Stream chunks can contain step events and approval requests as well as text.
 
 `cancel_chat_stream` accepts an optional stream ID; omitting it cancels all active streams. The bridge supports passing an ID, but callers that omit it use cancel-all semantics. Backend registry entries are cleaned up on task exit. Registry tests do not prove end-to-end cancellation during every provider or tool operation. `chat_send` remains a separate one-shot provider command. Browser demo chat produces a simulated local callback, not provider streaming.
 
-## 8. Tools, approval, and execution limits
+## 7. Tools, approval, and execution limits
 
 The Rust tool registry exposes file read/write/patch, directory listing, text search, shell command, Git status/diff/log/branch, skill activation, and project-learning proposals. Model tool calls are parsed and validated before dispatch; `tool_list` exposes definitions to the frontend.
 
@@ -84,21 +87,39 @@ Approval mode defaults to `manual`. `write_file`, `patch_file`, and `run_command
 
 `run_command` runs a shell command in the project folder, defaults to a 30-second timeout (clamped to 1–120 seconds), and caps output. It is not a command allowlist: shell commands can access paths outside the project and cause other OS-visible effects. Approval is not an OS sandbox. The integrated terminal is a separate user-controlled shell.
 
-## 9. Workspace sandbox and limits
+## 8. Workspace sandbox and limits
 
 Workspace file tools use `harness::Sandbox`, rooted at the selected project's canonical directory. Absolute paths, parent traversal, non-portable path components, and symlink reads/edits are rejected; existing paths and destination parents are checked to remain under the root. Reads/patches and command outputs are size-bounded; directory listing/search skip symlinks and common generated directories. Writes use a temporary file and replacement after path checks. These restrictions apply to file tools, not shell commands or the interactive terminal.
 
 Project-root lookup validates project IDs, rejects missing/ambiguous IDs, canonicalizes the selected folder, and requires a directory. Projects without an available folder cannot provide project context or run project-root tools until relinked. Path checks reduce traversal risk but do not eliminate races from hostile concurrent filesystem changes.
 
-## 10. Skill discovery and activation
+## 9. Skill discovery and activation
 
 Skill discovery scans `.agents/skills`, `.claude/skills`, and `.kilo/skills` under the selected project root and user home. A valid skill directory contains `SKILL.md` whose frontmatter name matches the directory and whose description is non-empty; names use lowercase ASCII letters, digits, and hyphens. Project skills take precedence over same-named global skills. Symlinks, unsafe names, invalid metadata, and oversized files/resources are skipped or rejected; scan and selection counts are bounded.
 
 The agent receives metadata first, not all skill instructions. It can invoke `activate_skill` when relevant to load `SKILL.md` and explicitly requested validated resources. The UI can also pass selected skills. Skill text and project `AGENTS.md` are untrusted guidance; they cannot override system/user instructions, sandbox boundaries, or approval rules. Learning-created skills require user approval.
 
-## 11. Integrated terminal
+## 10. Integrated terminal
 
 The integrated terminal has separate Tauri process commands. Rust validates requested shell names against platform-supported choices, resolves a platform-appropriate configured/default shell, retains process and stdin for writes, and supports listing/killing sessions. Terminal output is streamed to the UI. The agent's `run_command` tool is a bounded, non-interactive subprocess and is not this terminal. Verify runtime behavior on each target OS before claiming cross-platform reliability.
+
+## 11. Startup readiness, diagnostic logging, and audit
+
+### Startup and readiness
+
+In `src-tauri/src/lib.rs`, Tauri setup loads persisted application state before initializing logging and audit. A failed state load returns an error and aborts setup. File logging and audit initialization failures are printed to stderr; setup continues. State/logging/audit initialization outcomes feed the initial readiness calculation. `get_startup_readiness` recalculates and returns the component array; frontend types are in `src/services/tauriBridge.ts`, rendered in Settings → System Status.
+
+Current statuses are preliminary, not comprehensive probes. The report currently treats application configuration and the built-in tool registry as ready statically. Persistent/conversation/token usage states share the same state-load flag; it does not separately test writes or storage health. Provider status reflects configured metadata and `has_key`, not successful authentication or connectivity. Provider connectivity is intentionally `disabled` at startup. Global skill readiness reflects the discovery call's result, but skill scanning can log errors and still return partial/empty results; project skills are not separately scanned in readiness. Workspace/sandbox readiness uses the active project's sandbox constructor; it does not prove every file operation. Terminal readiness resolves a shell, not a launched interactive session. Required data-directory write access is not separately tested.
+
+Manual refresh reruns the report; provider save/delete also prompts a refresh. It does not reinitialize/recover components or subscribe to project/skill-directory changes. Do not interpret `ready` as an end-to-end guarantee. Messages are fixed and do not include key values or environment variables.
+
+### Diagnostic logs
+
+Tauri `app_log_dir` is the destination for `openharness.log`, not the process working directory. Release level is Info; debug level is Debug with stdout. Rotation is 5 MiB with four retained files. Setup failure is non-fatal and announced on stderr. The startup-reported path is authoritative; platform defaults and packaging identifiers can affect exact location. Never log credentials or private conversation/file content.
+
+### Durable audit
+
+`audit.rs` stores `audit.jsonl` separately in app-data, JSONL format, with schema version, IDs, timestamp, event kind/outcome, and chained SHA-256 hash. It rotates at 5 MiB, retains five rotated files plus current, and sets restrictive Unix permissions. `emit` filters identifier/outcome characters and is a no-op before logger initialization; append errors become diagnostic warnings and are not returned to the caller. Event kinds are a schema vocabulary, not evidence that every lifecycle is emitted. Current integrations are selected coverage, not a complete tool/sandbox audit trail. Do not pass prompts, arguments, file contents, credentials, or arbitrary error text to audit fields.
 
 ## 12. Security and reliability checklist
 
@@ -114,31 +135,33 @@ The integrated terminal has separate Tauri process commands. Rust validates requ
 
 Do not present these as implemented: native Anthropic Messages support, vendor OAuth/CLI integrations, model discovery, SQLite migrations, arbitrary file/document upload, command allowlisting or OS-level shell containment, complete end-to-end cancellation coverage, and cross-platform terminal runtime verification. The top-level `app/` prototype is not evidence of Tauri desktop behavior.
 
-## 14. Verification commands
+## 14. Testing and debugging
 
-Run from `tauri-react/`:
+From `tauri-react/`:
 
 ```sh
+npm test
 npm run build
-npx tauri dev
 ```
 
-Run from `tauri-react/src-tauri/`:
+From `tauri-react/src-tauri/`:
 
 ```sh
 cargo fmt --check
-cargo check
-cargo test
+cargo check --lib
+cargo test --lib
 ```
 
-`cargo clippy -- -D warnings` is useful when the repository warning baseline permits it. Run relevant Rust tests and the frontend build after changing IPC contracts, persistence, provider parsing, tools, or UI bridge behavior. The top-level `app/` checks apply only to the separate egui prototype.
+There are no `lint` or `typecheck` npm scripts in the current `package.json`; `npm run build` runs `tsc` then Vite. `cargo clippy` is optional and has existing warnings. These commands do not verify packaged startup, OS credential-store behavior, runtime terminal operation on each OS, live providers, or complete audit/readiness coverage. Use isolated fixtures/mocks for tests; do not claim runtime behavior from compilation alone.
 
 ## 15. Implementation source map
 
-- Tauri commands, state, persistence, stream/approval coordination, chat orchestration, terminal commands: `tauri-react/src-tauri/src/lib.rs`.
-- Provider configuration, endpoint validation, image validation, HTTP requests and streaming parsers: `tauri-react/src-tauri/src/client.rs`.
-- Workspace sandbox, execution engine, Git helpers, tool registry/dispatch, skill discovery/activation: `tauri-react/src-tauri/src/harness.rs`.
+- Tauri commands, state, persistence, readiness, stream/approval coordination, chat orchestration, terminal: `tauri-react/src-tauri/src/lib.rs`.
+- Provider configuration, endpoint validation, image validation, HTTP and stream parsers: `tauri-react/src-tauri/src/client.rs`.
+- Workspace sandbox, execution engine, Git helpers, tools, skill discovery/activation: `tauri-react/src-tauri/src/harness.rs`.
+- Audit JSONL and hash chaining: `tauri-react/src-tauri/src/audit.rs`.
 - OS credential storage: `tauri-react/src-tauri/src/secrets.rs`.
 - Frontend IPC wrappers and browser fallbacks: `tauri-react/src/services/tauriBridge.ts`.
-- Composer/streaming/terminal UI and project integration: `tauri-react/src/components/Composer.tsx`, `Canvas.tsx`, `Drawer.tsx`.
-- Tauri security policy and plugins: `tauri-react/src-tauri/tauri.conf.json`, `tauri-react/src-tauri/capabilities/`.
+- Composer/streaming and project UI: `tauri-react/src/components/Composer.tsx`, `Canvas.tsx`, `Drawer.tsx`.
+- Token usage aggregation: `tauri-react/src/components/tokenUsage.ts`.
+- Tauri security policy/plugins: `tauri-react/src-tauri/tauri.conf.json`, `tauri-react/src-tauri/capabilities/`.

@@ -1,58 +1,37 @@
 import {useMemo, useState} from 'react';
+import {parseGitStatus, parseFileDiffs} from './gitDiff';
 
-type GitFileStatus = {
-  path: string;
-  code: string;
-  type: 'modified' | 'added' | 'deleted' | 'untracked' | 'renamed' | 'other';
-};
+type GitFileStatus = import('./gitDiff').GitFileStatus;
 
-function parseGitStatus(statusText: string): GitFileStatus[] {
-  return statusText.split('\n').flatMap((rawLine) => {
-    const line = rawLine.trimEnd();
-    if (!line || line.startsWith('##')) return [];
-    const code = line.slice(0, 2).trim();
-    let path = line.slice(2).trim();
-    if (path.startsWith('"') && path.endsWith('"')) {
-      path = path.slice(1, -1);
-    }
-    if (!path) return [];
+const MAX_RENDERED_DIFF_LINES = 20_000;
 
-    let type: GitFileStatus['type'] = 'other';
-    if (code === '??') type = 'untracked';
-    else if (code.includes('M')) type = 'modified';
-    else if (code.includes('A')) type = 'added';
-    else if (code.includes('D')) type = 'deleted';
-    else if (code.includes('R')) {
-      type = 'renamed';
-      const target = (path.split(' -> ').at(-1) || path).trim();
-      path = target.startsWith('"') && target.endsWith('"') ? target.slice(1, -1) : target;
-    }
-
-    return [{path, code: code || 'M', type}];
-  });
+function diffLines(text: string): string[] {
+  return text.split('\n', MAX_RENDERED_DIFF_LINES + 1).slice(0, MAX_RENDERED_DIFF_LINES);
 }
 
-function parseFileDiffs(diffText: string): Record<string, string> {
-  const result: Record<string, string> = {};
-  if (!diffText || !diffText.trim()) return result;
-
-  const chunks = diffText.split(/^diff --git /m);
-  for (const chunk of chunks) {
-    if (!chunk.trim()) continue;
-    const fullChunk = 'diff --git ' + chunk;
-    const firstLine = chunk.split('\n')[0] || '';
-    const match = firstLine.match(/a\/(.+?)\s+b\/(.+)/);
-    if (match && match[2]) {
-      result[match[2].trim()] = fullChunk;
-    } else {
-      const bMatch = firstLine.match(/b\/(.+)/);
-      if (bMatch) {
-        result[bMatch[1].trim()] = fullChunk;
-      }
-    }
-  }
-  return result;
+function classifyDiffLine(line: string): string {
+  if (line.startsWith('+++ ') || line.startsWith('--- ')) return 'diff-line diff-file-target';
+  if (line.startsWith('+')) return 'diff-line diff-added';
+  if (line.startsWith('-')) return 'diff-line diff-removed';
+  if (line.startsWith('@@')) return 'diff-line diff-hunk';
+  if (line.startsWith('diff --git')) return 'diff-line diff-header';
+  return 'diff-line';
 }
+
+function isBinaryDiff(text: string): boolean {
+  return text.includes('GIT binary patch') || text.includes('Binary files ') || text.includes('\ufffd');
+}
+
+function isGitStatusError(text: string): boolean {
+  return text.startsWith('Error:') || text.startsWith('Git error:');
+}
+
+function isGitDiffError(text: string): boolean {
+  return text.startsWith('Error:') || text.startsWith('Git error:');
+}
+
+export {parseGitStatus, parseFileDiffs};
+export type {GitFileStatus};
 
 export function GitDiffIcon({width = 16, height = 16}: {width?: number; height?: number}) {
   return (
@@ -78,8 +57,12 @@ export function WorkspaceGitDiff({
 }) {
   const [selectedFile, setSelectedFile] = useState<string | null>(null);
 
-  const changedFiles = useMemo(() => parseGitStatus(workspaceStatus), [workspaceStatus]);
-  const fileDiffs = useMemo(() => parseFileDiffs(gitDiff), [gitDiff]);
+  const statusError = isGitStatusError(workspaceStatus);
+  const diffError = isGitDiffError(gitDiff);
+  const changedFiles = useMemo(() => statusError ? [] : parseGitStatus(workspaceStatus), [workspaceStatus, statusError]);
+  const fileDiffs = useMemo(() => parseFileDiffs(gitDiff, changedFiles.map(file => file.path)), [gitDiff, changedFiles]);
+  const renderedLines = useMemo(() => diffLines(gitDiff), [gitDiff]);
+  const truncated = gitDiff.split('\n').length > renderedLines.length;
 
   if (!projectId) {
     return (
@@ -93,6 +76,10 @@ export function WorkspaceGitDiff({
   const selectedInfo = changedFiles.find((f) => f.path === selectedFile);
   const activeDiffContent = selectedFile ? fileDiffs[selectedFile] : gitDiff;
   const isClean = !gitDiff.trim() && changedFiles.length === 0;
+
+  if (statusError || diffError) {
+    return <div className="file-preview-state" role="alert"><p>Git could not load this repository.</p><pre>{statusError ? workspaceStatus : gitDiff}</pre><button type="button" onClick={onRefresh}>Retry</button></div>;
+  }
 
   if (isClean) {
     return (
@@ -144,28 +131,12 @@ export function WorkspaceGitDiff({
           {selectedFile ? selectedFile : 'All changes in working tree'}
         </div>
         {activeDiffContent ? (
-          <pre className="git-diff-pre">
-            {activeDiffContent.split('\n').map((line, idx) => {
-              let lineClass = 'diff-line';
-              if (line.startsWith('+++ ') || line.startsWith('--- ')) {
-                lineClass = 'diff-line diff-file-target';
-              } else if (line.startsWith('+')) {
-                lineClass = 'diff-line diff-added';
-              } else if (line.startsWith('-')) {
-                lineClass = 'diff-line diff-removed';
-              } else if (line.startsWith('@@')) {
-                lineClass = 'diff-line diff-hunk';
-              } else if (line.startsWith('diff --git')) {
-                lineClass = 'diff-line diff-header';
-              }
-              return (
-                <span key={idx} className={lineClass}>
-                  {line}
-                  {'\n'}
-                </span>
-              );
-            })}
-          </pre>
+          isBinaryDiff(activeDiffContent) ? <div className="file-preview-state"><p>Binary file; text diff is unavailable.</p></div> : <>
+            <pre className="git-diff-pre">
+              {(selectedFile ? diffLines(activeDiffContent) : renderedLines).map((line, idx) => <span key={idx} className={classifyDiffLine(line)}>{line}{'\n'}</span>)}
+            </pre>
+            {!selectedFile && truncated && <div className="file-preview-state" role="status">Diff output truncated for display. Refresh or inspect individual files for complete changes.</div>}
+          </>
         ) : (
           <div className="file-preview-state">
             {selectedInfo?.type === 'untracked' ? (

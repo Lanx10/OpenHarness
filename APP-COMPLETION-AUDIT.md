@@ -1,161 +1,130 @@
-# OpenHarness App Completion Guide
+# OpenHarness — Completion and Accuracy Audit
 
-## Summary
+**Status:** Current source review; not a release certification. This document describes the active Tauri application, not the separate `app/` egui prototype. Feature labels distinguish source inspection from checks actually run during this review.
 
-OpenHarness has a functional shell, projects, provider storage, and a tauri updater. The chat core remains stateless, non-streaming, and disconnected from configured models. The list below prioritizes required capabilities to reach parity with mature desktop AI harnesses.
+## 1. Executive summary
 
----
+OpenHarness is a Tauri 2 desktop app with a React 19/TypeScript/Vite frontend and Rust backend. Desktop functionality includes provider-backed agent chat, streaming, persisted conversations, tools, skill activation, approval for selected write/command tools, workspace file sandboxing, an integrated terminal, diagnostic logging, and a JSONL audit trail.
 
-## P0 — Chat Core
+Implementation is substantial but not fully verified end-to-end. Startup readiness includes inferred/static statuses rather than checks for every component; audit event declarations exceed emitted coverage; shell commands and the integrated terminal are not OS-sandboxed; packaged cross-platform behavior is not established by the current checks.
 
-1. **Persist chat history per project** (`Canvas.tsx`, `tauriBridge.ts`, `lib.rs`)
-   - Messages live in volatile React `useState`. Implement per-project conversation storage in `state.json` or SQLite.
-   - Add session list, thread switching, rename, and search. Keep project folders as containers, not substitutes for chat history.
+## 2. Current implementation overview
 
-2. **Add token streaming** (`client.rs`, `Canvas.tsx`)
-   - Current calls use blocking HTTP. Stream via Tauri channel events or server-sent events from Rust into incremental text state.
-   - Include a stop/cancel control bound to a Rust `tokio::task::AbortHandle`.
+- **Frontend:** `tauri-react/src`; React and TypeScript. `services/tauriBridge.ts` wraps Tauri IPC and has a browser-only demo fallback.
+- **Backend:** `tauri-react/src-tauri/src`; Rust crate `app` / library `app_lib` (edition 2024, minimum Rust 1.90).
+- **Boundary:** frontend bridge → Tauri commands/channels in `src-tauri/src/lib.rs` → provider client (`client.rs`), credential storage (`secrets.rs`), and harness (`harness.rs`).
+- **Persistence:** Tauri app-data `state.json`; credentials in OS credential storage. No SQLite. Browser fallback is not equivalent to desktop persistence.
+- Top-level `app/` is a separate egui prototype, not the active Tauri UI.
 
-3. **Send context to the model** (`client.rs`)
-   - Request body has single user message only. Include the current thread’s recent messages so multi-turn context is real.
-   - Expose system prompt, temperature, max tokens, and top-p controls.
+## 3. Verified architecture
 
-4. **Wire Composer models to real providers** (`Composer.tsx`, `SettingsPage.tsx`)
-   - Remove hardcoded `MODELS` array. Load from `apiListProviders()` and local Ollama tags.
-   - Add a persisted default model and per-project model override. Disable reflection of a saved model as a new fake fallback.
+### Initialization and readiness
 
----
+Tauri setup resolves app-data, loads `AppState`, initializes the `tauri-plugin-log` file target in Tauri's app log directory, initializes separate audit logging, records startup outcomes, and calculates readiness. A persisted-state load failure aborts setup; logging or audit initialization failures are reported to stderr and do not themselves abort startup. `get_startup_readiness` exposes the report.
 
-## P1 — Workspace & Project Management
+**Readiness is partial:** `readiness_report()` returns a fixed component list. Some statuses derive from startup flags, provider metadata, active project, shell resolution, and a skill-discovery call. Directory writability, independent persistence components, project skill discovery, and provider connectivity are not comprehensively validated. Application configuration and tool registry are reported ready statically. No network probe runs. Messages do not include provider secrets. Treat this as preliminary diagnostics, not a complete health guarantee.
 
-1. **Add project editing** (`Drawer.tsx`, `lib.rs`)
-   - Implement rename, delete, and folder-relink commands. Validate project path existence on load and open.
+### Providers and agent execution
 
-2. **Add attachments pipeline** (`Composer.tsx`, `client.rs`)
-   - Use Tauri file dialog to read selected files and transmit their contents or path metadata.
-   - Support drag-and-drop and pasted images/code. Do not display filenames without sending content.
+`client.rs` implements Ollama and OpenAI-compatible request/stream formats used for OpenRouter, Google AI Studio's compatible endpoint, and generic OpenAI-compatible endpoints. Provider metadata is persisted; API keys use the OS credential store and the UI receives availability metadata, not key values. Model discovery and native Anthropic Messages support are absent.
 
-3. **Add message actions** (`Canvas.tsx`)
-   - Implement copy, regenerate, edit, delete, and message retry.
+The active chat path is `chat_send_stream`: it uses thread context and loops through provider responses and tool calls until a final response or error/limit. `chat_send` is a separate one-shot path, not the agent loop. Stream chunks carry text and lifecycle/approval/usage information. Cancellation accepts an optional stream ID; omitting it cancels all active streams. Seam-level tests do not establish exhaustive provider/tool end-to-end cancellation behavior.
 
-4. **Add Markdown and code rendering** (`Canvas.tsx`)
-   - Use a Markdown + syntax-highlighting renderer. Include a copy button for code blocks and fenced language detection.
+### Persistence, memory, token accounting
 
----
+`AppState::load` loads `state.json`, defaults missing state to empty, and rejects malformed JSON and empty/duplicate project IDs. Persistence serializes to a temporary file then replaces the state file. Providers, projects, threads/messages, approval mode, and conversation token usage are persisted; credentials are separate. Memory/learning proposals are conversation/project-associated data requiring user review before becoming project guidance or skills; this is not a separate vector-memory database.
 
-## P2 — UI Completeness
+Provider-reported usage is stored per thread/request when available and restored/aggregated by the UI. Missing values remain unknown; estimates are not provider-reported usage. Providers may omit fields.
 
-1. **Choose tabs or remove the tab metaphor** (`Chrome.tsx`)
-   - Replace fake tab/titlebar chrome with a persistent breadcrumb containing project/model/title, or implement true multi-tab state.
+### Skills, tools, approval, sandbox
 
-2. **Fix the Hero "Local" shortcut** (`Canvas.tsx`)
-   - Target an actionable local state or the relevant Ollama provider configuration. Do not open a misleading generic settings page.
+`harness.rs` discovers validated `SKILL.md` catalogs from project/global roots. Metadata is available before full instructions; the agent may request activation and validated resource loading. Skills and project `AGENTS.md` are untrusted task guidance. Discovery errors may be logged while returning an empty or partial catalog, so readiness success does not prove all intended roots were scanned.
 
-3. **Add global notices** (`Canvas.tsx`, `Drawer.tsx`)
-   - Replace the dead `#notice` element with a shared status/toast surface for loading, fetch errors, and updater progress.
+Manual approval is the default. `write_file`, `patch_file`, and `run_command` require approval unless automatic mode is enabled. Read/search/list/Git and skill activation are not in that approval set. Learning proposals are staged for user review.
 
-4. **Add connection testing** (`SettingsPage.tsx`)
-   - Verify API endpoint and credential before persist. Show endpoint errors inline, not raw exceptions.
+Workspace file operations use `harness::Sandbox` rooted at the canonical project directory, with path validation, symlink restrictions, and bounded I/O. Canonicalization does not eliminate hostile concurrent filesystem TOCTOU races. `run_command` executes with user OS privileges, outside the file sandbox. The interactive terminal is separate and has similarly broad OS access.
 
-5. **Add empty states** (`Drawer.tsx`, `Canvas.tsx`, `SettingsPage.tsx`)
-   - Show usable guidance when projects, chats, and providers are absent.
+### Logging and audit
 
----
+Diagnostic logging uses Tauri's `app_log_dir`: release `Info+`; debug `Debug+` plus stdout; 5 MiB rotation; four retained files. Initialization failure is non-fatal and reported to stderr. See `INTEGRATION-GUIDE.md` for paths.
 
-## P3 — Reliability & Cleanup
+`audit.rs` writes JSONL with IDs, timestamps, a SHA-256 hash chain, rotation, and Unix directory/file permissions. Emission before initialization is a no-op; append failures are warnings in diagnostics. Declared event variants do not prove call-site coverage. Selected startup, agent, provider, stream, skill, approval, and shutdown events are emitted, but declared tool/sandbox categories and per-operation outcomes are incomplete. Hash chaining does not provide an external immutable sink or guarantee complete coverage.
 
-1. **Centralize event state** (`OpenHarness.tsx`, components)
-   - Replace `window.dispatchEvent` string events with React context or a small store. Reduce component coupling and unsynchronized state drift.
+## 4. Implemented functionality
 
-2. **Remove dead code and redundant paths** (`Chrome.tsx`, `Icons.tsx`, boilerplate assets)
-   - Remove unused icon exports, legacy root experiments, and duplicate window-control fallbacks.
+Labels rely on source inspection; checks run during this review are shown separately below.
 
-3. **Harden web fallback storage** (`tauriBridge.ts`)
-   - Do not store API keys as plaintext in browser `localStorage` outside the Tauri runtime. Use session-only storage for demos.
+| Capability | Classification | Evidence / boundary |
+|---|---|---|
+| Tauri 2 + React/TypeScript frontend | IMPLEMENTED AND VERIFIED (build) | `tauri-react/package.json`; current build passed. |
+| Desktop JSON state and thread persistence | IMPLEMENTED BUT NOT FULLY VERIFIED | `AppState::load` / `persist`; no packaged restart test in this review. |
+| Provider configuration and credential storage | IMPLEMENTED BUT NOT FULLY VERIFIED | `save_provider`, `client.rs`, `secrets.rs`; no live provider test in this review. |
+| Agent loop, tool dispatch, streaming | IMPLEMENTED BUT NOT FULLY VERIFIED | `run_agent_loop`, `chat_send_stream`; browser fallback is simulated. |
+| File sandbox and approval for writes/commands | IMPLEMENTED BUT NOT FULLY VERIFIED | Constrains file tools, not shell execution. |
+| Skill discovery and activation | IMPLEMENTED BUT NOT FULLY VERIFIED | Discovery/activation exist; scope and error limitations above. |
+| Provider-reported usage persistence/UI aggregation | IMPLEMENTED BUT NOT FULLY VERIFIED | `TokenUsageRecord`, `tokenUsage.ts`; provider fields vary. |
+| Diagnostic logging | IMPLEMENTED BUT NOT FULLY VERIFIED | Setup exists; packaged path/rotation not tested here. |
+| Audit JSONL/hash chaining | IMPLEMENTED BUT NOT FULLY VERIFIED | `audit.rs`; coverage and append-failure visibility incomplete. |
+| Startup readiness endpoint and Settings view | PARTIALLY IMPLEMENTED | Several statuses inferred/static; refresh does not reinitialize components. |
+| Integrated terminal | IMPLEMENTED BUT NOT FULLY VERIFIED | Commands exist; cross-OS runtime not verified here. |
 
-4. **Add root `.gitignore`**
-   - Ignore build logs, transcripts, generated artifacts, and local environment files.
+## 5. Partially implemented functionality
 
-5. **Additional mature-app surfaces** (optional)
-   - Keyboard shortcuts, theme controls, export, search, data/retention preferences, telemetry opt-out, and per-message feedback/reporting.
+- **Readiness:** statuses exist, but component-specific checks, directory/persistence validation, and active project skill roots are incomplete. Refresh rereads the report; it does not initialize/recover components.
+- **Audit:** selected event call sites exist; there is no complete event matrix or coverage guarantee for declared tool/sandbox/provider/stream events. Append failures do not fail operations and are visible only through diagnostics.
+- **Skills/instructions:** discovery/loading exist; nested task scope is not automatically wired into tool execution. Scan errors can yield partial results.
+- **Token usage:** provider-reported fields are authoritative; responses may omit them. No model-matched tokenizer is promised.
+- **Cross-platform:** source has platform-specific behavior, but this audit does not certify packaged runtime on Windows/macOS/Linux.
 
-### Verification Targets
+## 6. Known limitations
 
-- Chat history survives project transitions and app restarts.
-- Selected provider/model in Composer is the model that handles the request.
-- Responses stream token-by-token and can be canceled.
-- Attachments change the request payload.
-- Code blocks, syntax colors, and copy controls render correctly.
-- Project deletion, renaming, search, and provider-connection errors behave without unhandled failures.
+- Browser-only mode is a demo: threads are in memory; chat/provider behavior is simulated.
+- Shell commands and integrated terminal run with current-user privileges; file sandboxing does not restrict their filesystem, network, or process access.
+- Path checks leave a TOCTOU window.
+- No native Anthropic Messages API, vendor OAuth/CLI integrations, model discovery, SQLite, arbitrary document upload, command allowlist, or OS-level shell containment.
+- No startup provider connectivity checks; this avoids network delays.
+- Audit declarations exceed verified emission coverage; no external immutable audit sink.
+- Project `AGENTS.md` scope is root-only in current chat flow; nested scope requires callers to supply a nested task directory.
 
----
+## 7. Outstanding issues
 
-## Agent Runtime Audit Update — 2026-11-11
+1. Make readiness component-specific and test success/failure cases, including config corruption, directory access, and persistence failures.
+2. Complete the audit coverage matrix; test JSONL lifecycle, write failures, tool/sandbox outcomes, and cancellations.
+3. Verify packaged app-data/log/audit paths, rotation, credentials, terminal, and sandbox per supported OS.
+4. Add provider-mocked tests for streaming failures, cancellation, retries, request context, and usage parsing.
+5. Decide whether nested project instruction/skill scope is required; wire and document accordingly.
 
-### Confirmed runtime findings
+## 8. Security and sandbox assessment
 
-- **Duplicate current user message (fixed):** `chat_send_stream` loaded persisted history and appended the active prompt again. Frontend now sends the persisted user message ID; Rust validates it belongs to the selected thread and excludes that entry from history.
-- **Attachment persistence (partially fixed):** user images now persist with the message and are reattached to the corresponding current turn. File contents are already included in the composed prompt; only image attachments are stored to avoid duplicate file text. Prior-turn images can be re-used, but binary attachment lifecycle and files referenced by path are not retained.
-- **Unbounded tool loop (fixed):** the agent loop now caps model requests at 12 per run and returns an explicit error after the cap. The request ceiling should be revisited if legitimate workflows need more iterations.
-- **Release logging (fixed):** Tauri logging now initializes in release builds at INFO level; debug builds use DEBUG. Startup/runtime log persistence destination and retention still need verification on packaged builds.
-- **Project instruction loading (improved):** `AGENTS.md` is loaded into system context when present. Its contents are explicitly labelled project-controlled, untrusted guidance; sandbox and approval requirements remain authoritative. Load failures other than absent/non-file are surfaced as errors.
-- **Token accounting remains cache-only:** current provider parsing and UI expose cached input tokens, not a per-request full input/output breakdown. There is no configured model-matched tokenizer. Do not interpret the displayed value as total tokens or compare it directly with another framework's total context usage. OpenAI-compatible cache details are parsed; Ollama usage is not currently propagated.
-- **Audit trail remains incomplete:** lifecycle logs cover run start, context component counts, tool registration, and request-cap events. There is no durable per-request audit record for every loaded component, tool outcome, memory reference, usage discrepancy, or final provider response.
-- **Startup validation remains partial:** app state loads at startup and runtime-selected skills are loaded before a run; required component readiness is not represented in a comprehensive startup validation report. Selected-skill names that are unavailable are silently omitted by the loader.
-- **Other context gaps:** historical image attachments were not included in reconstructed conversation context; now included for the active persisted message. Project-wide AGENTS.md discovery is root-only (no ancestor instruction merge). Context budgeting is compaction-based and does not use exact model tokenization.
+Credentials are intended to remain in OS credential storage and readiness messages do not return them. Audit fields filter identifiers/outcomes; emitter contract prohibits prompts, file contents, credentials, and arbitrary provider errors. Review every new diagnostic/audit call site for sensitive-data leakage.
 
-### Changes made
+The file sandbox constrains workspace file tools only. Approved shell commands retain user privileges, environment, and network access. Approval is user consent, not OS isolation. Path canonicalization leaves a TOCTOU window; no adversarial process containment is claimed.
 
-- `tauri-react/src-tauri/src/lib.rs`: request cap and regression test; duplicate-message exclusion with message-ID validation; current-message image restoration; root AGENTS.md loading with untrusted-content framing; startup/run/context/tool lifecycle logs; release log plugin enabled.
-- `tauri-react/src/components/Canvas.tsx`: persist the active message for all selected-thread turns and retain image data attachments.
-- `tauri-react/src/services/tauriBridge.ts`: persist message attachment values in Tauri and web fallback.
+## 9. Testing and verification results
 
-### Verification evidence
+### Run during this documentation review
 
-- `cargo test --lib -- --test-threads=1`: **50 passed, 0 failed**.
-- `cargo check --lib`: passed.
-- `npx tsc --noEmit`: passed.
-- `npm run build`: passed (TypeScript compile and Vite production build).
-- `git diff --check`: passed; Git reported only LF-to-CRLF working-copy warnings.
-- `cargo fmt --check`: fails because Rust formatting differences exist throughout pre-existing `lib.rs` and `harness.rs`; formatting the entire file would create unrelated churn. Changed Rust expressions were reviewed; rerun after a scoped formatting policy is chosen.
-- `cargo clippy --lib -- -D warnings`: fails on existing warnings in `client.rs`, `harness.rs`, and `lib.rs` (including too-many-arguments and collapsible-if findings); no broad cleanup attempted.
-- `npm run lint` and `npm run typecheck`: unavailable scripts in `tauri-react/package.json`.
-- Existing GitHub issue update could not be posted: GitHub CLI is unauthenticated in this environment. This section is the prepared update for review; no issue status was changed.
+- `npm test`: **31 passed, 0 failed**.
+- `npm run build`: **passed** (TypeScript compilation and Vite production build).
+- `cargo check --lib`: **passed**, with existing warnings (unused `mut`; audit variants not constructed).
+- `cargo fmt --check`: **passed**.
+- `cargo test --lib readiness_component_serializes_safe_status_contract`: **1 passed**.
+- `git diff --check`: **passed**; Git emitted LF-to-CRLF working-copy warnings.
 
-### Remaining limitations / next steps
+These checks verify compilation and selected tests only. No release build, packaged launch, log rotation inspection, or cross-platform runtime test was done in this review.
 
-1. Add typed provider usage fields and aggregate per-request/run totals; keep estimated counts explicitly separate from provider-reported usage.
-2. Add model-appropriate tokenizers only for supported configured model families; otherwise report counts as unavailable rather than inventing estimates.
-3. Persist structured per-run audit records with redacted safe identifiers, component states, request outcomes, cache fields, and tool statuses.
-4. Validate critical configuration and component readiness at startup; report unavailable and disabled components distinctly.
-5. Test release log output destination and rotation on a packaged Windows build.
-6. Add mock/provider tests for prompt completeness, duplicate exclusion, prior-turn image reconstruction, cancellation, and request-cap termination.
-7. Reconcile the older completion-guide summary above with current implementation: chat persistence, streaming, multi-turn context, attachments, and project editing now exist; this audit update records the remaining runtime accounting and observability gaps.
+### Historical verification records
 
-## Sandbox Hardening Audit — 2026-11-12
+The previous version recorded dated results for earlier work, including Rust suites of 50 and 58 tests, a 26-test frontend run, and a release build. These were not rerun and are not current verification. Older P0–P3 task lists and contradictory completion claims are removed from current-status sections.
 
-### Findings and changes
+## 10. Release readiness assessment
 
-- **Absolute path interpretation (fixed):** `Sandbox::resolve_path` previously stripped leading separators, so an absolute-looking path could be reinterpreted as workspace-relative. It now rejects slash-rooted, backslash-rooted, drive-prefixed paths, traversal components, ADS colons, trailing dots/spaces, and Windows device names (device names on Windows). Backslashes normalize as separators. Tests cover representative drive, UNC, POSIX, ADS, reserved-name, and valid-relative paths.
-- **Symlink escape coverage (improved):** Unix tests verify reads/writes through an out-of-root symlink are rejected and the outside file remains unchanged. Directory discovery rejects symlinks and canonicalized paths outside root.
-- **Unbounded subprocess output (fixed at app-level):** stdout/stderr retain at most 500 KB each; crossing either cap terminates and reaps the command instead of continuing to drain an unbounded stream. Timeout paths kill, wait, and join readers. Infinite-output regression test passes. Command execution still runs shell commands with the current user’s OS privileges and is not OS-sandboxed.
-- **Error privacy:** subprocess spawn errors no longer echo the command string.
+**Not release-certified by this audit.** Current frontend build, Rust library check, formatting, and focused tests pass. No `cargo build --release`, packaged install/launch, upgrade validation, audit/log rotation inspection, or per-OS test was performed here. Close or explicitly accept readiness/audit coverage gaps before making stronger release claims.
 
-### Verification evidence
+## 11. Remaining work
 
-- `cargo fmt --check`: passed from `tauri-react/src-tauri`.
-- `cargo check --locked`: passed.
-- `cargo test --locked --lib`: 58 passed, 0 failed, 1 ignored (manual benchmark).
-- Targeted absolute-path, symlink, output-cap, and infinite-output tests passed. Unix symlink behavior exercised; Windows reparse-point behavior not exercised.
-- `cargo build --release --locked`: passed.
-- `cargo clippy --all-targets --all-features --locked -- -D warnings`: still fails on 5 `clippy::too_many_arguments` findings in `client.rs` and `lib.rs`. Four safe `collapsible_if` findings were simplified; remaining API argument-count warnings need a scoped API redesign to avoid changing frontend contracts.
-- `cargo audit`: unavailable; cargo-audit is not installed.
-- `npm test -- --run`: 26 passed; `npx tsc --noEmit` and `npm run build`: passed.
-- `git diff --check`: passed. Changes were made alongside existing uncommitted work; no pre-existing edits were reverted.
+Prioritize truthful readiness checks and failure tests, close or scope audit coverage gaps, and add packaged OS-specific verification. Update this assessment with dated results only after executing those checks.
 
-### Residual security limitations
+## Historical notes
 
-- Sandbox checks use path canonicalization before later filesystem operations; this leaves a symlink/rename TOCTOU window. Secure handle-relative operations are still required for adversarial concurrent writers.
-- Shell subprocesses have full OS-user access, network access, and inherited environment; workspace current-directory does not isolate them. Approval prompts are not OS sandboxing.
-- Windows junction/reparse-point behavior and release-package runtime behavior were not exercised in this environment.
-- Full end-to-end provider/model behavior, tokenizer accuracy, comprehensive durable audit trail, and startup readiness validation remain unverified/incomplete.
+The former P0–P3 completion checklist and dated runtime/sandbox audit entries have been consolidated into the current architecture, limitations, and security sections. Historical test counts are retained only as records, not current results.
