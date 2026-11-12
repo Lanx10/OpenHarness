@@ -1,11 +1,11 @@
 import {useState} from 'react';
-import {CheckIcon, ChevronDownIcon, CommandLineIcon, DocumentTextIcon, ExclamationCircleIcon, MagnifyingGlassIcon, PencilSquareIcon, ShieldExclamationIcon} from '@heroicons/react/20/solid';
+import {CheckIcon, ChevronDownIcon, CommandLineIcon, DocumentTextIcon, ExclamationCircleIcon, MagnifyingGlassIcon, PencilSquareIcon, ShieldExclamationIcon, SparklesIcon} from '@heroicons/react/20/solid';
 import type {StepEventLike} from './StepEvent';
 
 export function MessageCrumbs({steps, thinking}: {steps?: StepEventLike[]; thinking?: boolean}) {
   const [expanded, setExpanded] = useState<string | null>(null);
   const items = steps ?? [];
-  const icon = (kind: string) => kind === 'read' ? DocumentTextIcon : kind === 'grep' ? MagnifyingGlassIcon : kind === 'edit' ? PencilSquareIcon : kind === 'command' ? CommandLineIcon : CommandLineIcon;
+  const icon = (kind: string) => kind === 'read' ? DocumentTextIcon : kind === 'grep' ? MagnifyingGlassIcon : kind === 'edit' ? PencilSquareIcon : kind === 'skill' ? SparklesIcon : CommandLineIcon;
   if (!items.length && !thinking) return null;
   return <section className="message-crumbs" aria-label="Assistant activity">
     {thinking && <div className="message-crumb thinking"><span className="crumb-spinner" aria-hidden="true"/>Working</div>}
