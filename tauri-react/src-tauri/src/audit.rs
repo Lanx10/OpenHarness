@@ -94,27 +94,23 @@ pub fn emit(
     outcome: Option<&str>,
     entity: Option<&str>,
 ) {
-    let Some(log) = AUDIT.get() else { return };
+    let Some(log) = AUDIT.get() else {
+        log::warn!("event=audit_write_failed reason=audit log is not initialized");
+        return;
+    };
     // Schema fields are identifiers and fixed event values only; never pass prompts, arguments,
     // file contents, credentials, or arbitrary error strings here.
-    let event = AuditEvent {
-        schema_version: 1,
-        timestamp_unix_ms: SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_millis() as u64)
-            .unwrap_or_default(),
-        event_id: uuid::Uuid::new_v4().to_string(),
-        correlation_id: safe_id(correlation_id),
-        conversation_id: conversation_id.map(safe_id),
-        request_id: request_id.map(safe_id),
-        provider: provider.map(safe_id),
-        model: model.map(safe_id),
-        entity: entity.map(safe_id),
+    if let Err(_error) = log.emit(
         kind,
-        outcome: outcome.map(safe_outcome),
-    };
-    if let Err(error) = log.append(&event) {
-        log::warn!("event=audit_write_failed reason={error}");
+        correlation_id,
+        conversation_id,
+        request_id,
+        provider,
+        model,
+        outcome,
+        entity,
+    ) {
+        log::warn!("event=audit_write_failed reason=append_failed");
     }
 }
 
@@ -146,6 +142,37 @@ struct HashInput<'a> {
 }
 
 impl AuditLog {
+    #[allow(clippy::too_many_arguments)]
+    fn emit(
+        &self,
+        kind: EventKind,
+        correlation_id: &str,
+        conversation_id: Option<&str>,
+        request_id: Option<&str>,
+        provider: Option<&str>,
+        model: Option<&str>,
+        outcome: Option<&str>,
+        entity: Option<&str>,
+    ) -> Result<(), String> {
+        let event = AuditEvent {
+            schema_version: 1,
+            timestamp_unix_ms: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or_default(),
+            event_id: uuid::Uuid::new_v4().to_string(),
+            correlation_id: safe_id(correlation_id),
+            conversation_id: conversation_id.map(safe_id),
+            request_id: request_id.map(safe_id),
+            provider: provider.map(safe_id),
+            model: model.map(safe_id),
+            entity: entity.map(safe_id),
+            kind,
+            outcome: outcome.map(safe_outcome),
+        };
+        self.append(&event)
+    }
+
     fn append(&self, event: &AuditEvent) -> Result<(), String> {
         let _guard = self
             .lock
@@ -235,6 +262,71 @@ fn read_last_hash(path: &Path) -> Result<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn isolated_emit_writes_sanitized_event_record() {
+        let dir = std::env::current_dir()
+            .unwrap()
+            .join("target")
+            .join(format!("openharness-audit-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&dir).unwrap();
+        let log = AuditLog {
+            directory: dir.clone(),
+            lock: Mutex::new(()),
+        };
+
+        log.emit(
+            EventKind::AgentFinished,
+            "run secret!",
+            Some("conversation/id"),
+            Some("request-1"),
+            Some("provider"),
+            Some("model"),
+            Some("success!"),
+            Some("entity/value"),
+        )
+        .unwrap();
+
+        let line = fs::read_to_string(dir.join("audit.jsonl")).unwrap();
+        let record: serde_json::Value = serde_json::from_str(line.trim()).unwrap();
+        let event = &record["event"];
+        assert_eq!(event["schema_version"], 1);
+        assert_eq!(event["kind"], "agent_finished");
+        assert_eq!(event["correlation_id"], "runsecret");
+        assert_eq!(event["conversation_id"], "conversationid");
+        assert_eq!(event["request_id"], "request-1");
+        assert_eq!(event["outcome"], "success");
+        assert!(!line.contains("secret!"));
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn isolated_emit_returns_storage_failures() {
+        let directory = std::env::current_dir()
+            .unwrap()
+            .join("target")
+            .join(format!("openharness-audit-file-{}", uuid::Uuid::new_v4()));
+        fs::write(&directory, "not a directory").unwrap();
+        let log = AuditLog {
+            directory: directory.clone(),
+            lock: Mutex::new(()),
+        };
+
+        let error = log
+            .emit(
+                EventKind::AgentFailed,
+                "run",
+                None,
+                None,
+                None,
+                None,
+                Some("failed"),
+                None,
+            )
+            .unwrap_err();
+        assert!(!error.is_empty());
+        fs::remove_file(directory).unwrap();
+    }
+
     #[test]
     fn appends_structured_chained_events_and_recovers_after_restart() {
         let dir = std::env::current_dir()

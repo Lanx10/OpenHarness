@@ -17,11 +17,18 @@ use std::os::unix::process::CommandExt as _;
 
 #[cfg(unix)]
 fn terminate_process_tree(pid: u32) {
+    // PID 0 is never a tracked child and must not be passed to platform terminators.
+    if pid == 0 {
+        return;
+    }
     terminate_process_tree_inner(pid);
 }
 
 #[cfg(windows)]
 fn terminate_process_tree(pid: u32) {
+    if pid == 0 {
+        return;
+    }
     // taskkill traverses descendants; spawn without waiting so cancellation stays bounded.
     let _ = Command::new("taskkill.exe")
         .args(["/PID", &pid.to_string(), "/T", "/F"])
@@ -34,16 +41,59 @@ pub(crate) struct ProcessRegistry {
     state: Mutex<ProcessState>,
 }
 
+struct ProcessRegistration<'a> {
+    registry: &'a ProcessRegistry,
+    run_id: &'a str,
+    pid: u32,
+}
+
+impl Drop for ProcessRegistration<'_> {
+    fn drop(&mut self) {
+        self.registry.unregister(self.run_id, self.pid);
+    }
+}
+
 #[derive(Default)]
 struct ProcessState {
     entries: Vec<(String, u32)>,
     cancelled_runs: std::collections::HashSet<String>,
+    active_runs: std::collections::HashSet<String>,
 }
 
 impl ProcessRegistry {
+    pub(crate) fn begin_run(&self, run_id: &str) {
+        let mut state = self.state.lock().unwrap();
+        state.cancelled_runs.remove(run_id);
+        state.entries.retain(|(id, _)| id != run_id);
+        state.active_runs.insert(run_id.to_string());
+    }
+
+    fn end_run(&self, run_id: &str, terminate: bool) {
+        let pids = {
+            let mut state = self.state.lock().unwrap();
+            if terminate && state.active_runs.contains(run_id) {
+                state.cancelled_runs.insert(run_id.to_string());
+            }
+            let pids = state
+                .entries
+                .iter()
+                .filter_map(|(id, pid)| (id == run_id).then_some(*pid))
+                .collect::<Vec<_>>();
+            state.entries.retain(|(id, _)| id != run_id);
+            state.active_runs.remove(run_id);
+            state.cancelled_runs.remove(run_id);
+            pids
+        };
+        if terminate {
+            for pid in pids {
+                terminate_process_tree(pid);
+            }
+        }
+    }
+
     fn register(&self, run_id: &str, pid: u32) -> bool {
         let mut state = self.state.lock().unwrap();
-        if state.cancelled_runs.contains(run_id) {
+        if !state.active_runs.contains(run_id) || state.cancelled_runs.contains(run_id) {
             return false;
         }
         state.entries.push((run_id.to_string(), pid));
@@ -53,6 +103,9 @@ impl ProcessRegistry {
     pub(crate) fn cancel_run(&self, run_id: &str) {
         let pids = {
             let mut state = self.state.lock().unwrap();
+            if !state.active_runs.contains(run_id) {
+                return;
+            }
             state.cancelled_runs.insert(run_id.to_string());
             state
                 .entries
@@ -73,16 +126,41 @@ impl ProcessRegistry {
             .retain(|(id, child)| id != run_id || *child != pid);
     }
 
+    fn registration<'a>(&'a self, run_id: &'a str, pid: u32) -> Option<ProcessRegistration<'a>> {
+        let mut state = self.state.lock().unwrap();
+        if !state.active_runs.contains(run_id) || state.cancelled_runs.contains(run_id) {
+            return None;
+        }
+        state.entries.push((run_id.to_string(), pid));
+        Some(ProcessRegistration {
+            registry: self,
+            run_id,
+            pid,
+        })
+    }
+
     pub(crate) fn is_cancelled(&self, run_id: &str) -> bool {
         self.state.lock().unwrap().cancelled_runs.contains(run_id)
     }
 
     pub(crate) fn complete(&self, run_id: &str) {
-        self.state
-            .lock()
-            .unwrap()
-            .entries
-            .retain(|(id, _)| id != run_id);
+        self.end_run(run_id, false);
+    }
+
+    pub(crate) fn shutdown(&self) {
+        let pids = {
+            let mut state = self.state.lock().unwrap();
+            state.cancelled_runs.clear();
+            state.active_runs.clear();
+            state
+                .entries
+                .drain(..)
+                .map(|(_, pid)| pid)
+                .collect::<Vec<_>>()
+        };
+        for pid in pids {
+            terminate_process_tree(pid);
+        }
     }
 }
 
@@ -936,13 +1014,12 @@ impl ExecutionEngine {
         command_str: &str,
         timeout_secs: Option<u64>,
     ) -> Result<CommandResult, String> {
-        Self::run_command_tracked(
-            root,
-            command_str,
-            timeout_secs,
-            &ProcessRegistry::default(),
-            "standalone",
-        )
+        let registry = ProcessRegistry::default();
+        registry.begin_run("standalone");
+        let result =
+            Self::run_command_tracked(root, command_str, timeout_secs, &registry, "standalone");
+        registry.complete("standalone");
+        result
     }
 
     fn run_command_tracked(
@@ -993,12 +1070,15 @@ impl ExecutionEngine {
             .spawn()
             .map_err(|e| format!("Failed to execute command: {}", e))?;
         let pid = child.id();
-        if !registry.register(run_id, pid) {
-            terminate_process_tree(pid);
-            let _ = child.kill();
-            let _ = child.wait();
-            return Err("Agent run cancelled before command started".into());
-        }
+        let _registration = match registry.registration(run_id, pid) {
+            Some(registration) => registration,
+            None => {
+                terminate_process_tree(pid);
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err("Agent run cancelled before command started".into());
+            }
+        };
         let stdout = child.stdout.take().ok_or("Command stdout unavailable")?;
         let stderr = child.stderr.take().ok_or("Command stderr unavailable")?;
         let output_limit = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -2496,7 +2576,7 @@ impl ToolDispatcher {
 
     pub fn execute_tool(root: &Path, call: &ToolCall, approved: bool) -> ToolResult {
         Self::execute_tool_tracked(
-            root,
+            Some(root),
             call,
             approved,
             &ProcessRegistry::default(),
@@ -2505,7 +2585,7 @@ impl ToolDispatcher {
     }
 
     pub(crate) fn execute_tool_tracked(
-        root: &Path,
+        root: Option<&Path>,
         call: &ToolCall,
         approved: bool,
         registry: &ProcessRegistry,
@@ -2545,7 +2625,7 @@ impl ToolDispatcher {
     }
 
     fn execute_tool_inner(
-        root: &Path,
+        root: Option<&Path>,
         call: &ToolCall,
         approved: bool,
         registry: &ProcessRegistry,
@@ -2573,6 +2653,15 @@ impl ToolDispatcher {
             };
         }
 
+        let Some(root) = root else {
+            return ToolResult {
+                tool_call_id: call.id.clone(),
+                name: call.name.clone(),
+                success: false,
+                output: String::new(),
+                error: Some("Tool requires an active project workspace".to_string()),
+            };
+        };
         let sandbox = match Sandbox::new(root.to_path_buf()) {
             Ok(s) => s,
             Err(e) => {
@@ -2848,6 +2937,10 @@ impl ToolDispatcher {
         }
     }
 
+    pub(crate) fn tool_available_in_context(name: &str, project_root: Option<&Path>) -> bool {
+        project_root.is_some() || name == "activate_skill"
+    }
+
     pub fn format_observation(result: &ToolResult) -> String {
         if result.success {
             format!("[Tool Observation - {}]:\n{}", result.name, result.output)
@@ -2959,6 +3052,107 @@ impl ToolDispatcher {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn shutdown_cleans_registered_processes() {
+        let registry = ProcessRegistry::default();
+        registry.begin_run("shutdown-run");
+        assert!(registry.register("shutdown-run", u32::MAX));
+        registry.shutdown();
+        let state = registry.state.lock().unwrap();
+        assert!(state.entries.is_empty());
+        assert!(state.cancelled_runs.is_empty());
+        assert!(state.active_runs.is_empty());
+    }
+
+    #[test]
+    fn completed_run_removes_cancellation_marker_and_blocks_stale_operations() {
+        let registry = ProcessRegistry::default();
+        registry.begin_run("run-1");
+        registry.cancel_run("run-1");
+        registry.complete("run-1");
+        assert!(!registry.is_cancelled("run-1"));
+        assert!(!registry.register("run-1", 42));
+        registry.cancel_run("run-1");
+        let state = registry.state.lock().unwrap();
+        assert!(state.entries.is_empty());
+        assert!(state.cancelled_runs.is_empty());
+        assert!(state.active_runs.is_empty());
+    }
+
+    #[test]
+    fn cancellation_before_process_registration_prevents_escape() {
+        let registry = ProcessRegistry::default();
+        registry.begin_run("run-2");
+        registry.cancel_run("run-2");
+        assert!(!registry.register("run-2", 42));
+        registry.complete("run-2");
+        registry.complete("run-2");
+        let state = registry.state.lock().unwrap();
+        assert!(state.entries.is_empty());
+        assert!(state.cancelled_runs.is_empty());
+        assert!(state.active_runs.is_empty());
+    }
+
+    #[test]
+    fn cancellation_and_registration_are_serialized_without_escaping() {
+        use std::sync::Barrier;
+
+        for index in 0..1_000 {
+            let registry = std::sync::Arc::new(ProcessRegistry::default());
+            let run_id = format!("race-{index}");
+            registry.begin_run(&run_id);
+            let barrier = std::sync::Arc::new(Barrier::new(3));
+
+            let registration_registry = registry.clone();
+            let registration_run_id = run_id.clone();
+            let registration_barrier = barrier.clone();
+            let registration = std::thread::spawn(move || {
+                registration_barrier.wait();
+                registration_registry
+                    .registration(&registration_run_id, 0)
+                    .map(|registration| std::mem::forget(registration))
+            });
+
+            let cancellation_registry = registry.clone();
+            let cancellation_run_id = run_id.clone();
+            let cancellation_barrier = barrier.clone();
+            let cancellation = std::thread::spawn(move || {
+                cancellation_barrier.wait();
+                cancellation_registry.cancel_run(&cancellation_run_id);
+            });
+
+            barrier.wait();
+            let registered = registration.join().unwrap().is_some();
+            cancellation.join().unwrap();
+            assert!(registry.is_cancelled(&run_id));
+            if registered {
+                assert_eq!(registry.state.lock().unwrap().entries.len(), 1);
+            } else {
+                assert!(registry.state.lock().unwrap().entries.is_empty());
+            }
+            registry.complete(&run_id);
+            let state = registry.state.lock().unwrap();
+            assert!(state.entries.is_empty());
+            assert!(state.cancelled_runs.is_empty());
+            assert!(state.active_runs.is_empty());
+        }
+    }
+
+    #[test]
+    fn completed_runs_do_not_accumulate_state() {
+        let registry = ProcessRegistry::default();
+        for index in 0..10_000 {
+            let run_id = format!("run-{index}");
+            registry.begin_run(&run_id);
+            assert!(registry.register(&run_id, index + 1));
+            registry.complete(&run_id);
+        }
+        let state = registry.state.lock().unwrap();
+        assert!(state.entries.is_empty());
+        assert!(state.cancelled_runs.is_empty());
+        assert!(state.active_runs.is_empty());
+    }
 
     #[cfg(unix)]
     #[test]
@@ -3137,6 +3331,49 @@ mod tests {
         );
         let _ = fs::remove_file(&outside);
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn no_project_context_allows_global_tools_but_denies_workspace_tools() {
+        assert!(ToolDispatcher::tool_available_in_context(
+            "activate_skill",
+            None
+        ));
+        for tool in [
+            "read_file",
+            "write_file",
+            "patch_file",
+            "list_dir",
+            "grep_search",
+            "run_command",
+            "git_status",
+            "git_diff",
+            "git_log",
+            "git_branch",
+        ] {
+            assert!(!ToolDispatcher::tool_available_in_context(tool, None));
+        }
+        assert!(ToolDispatcher::tool_available_in_context(
+            "read_file",
+            Some(Path::new("."))
+        ));
+
+        let result = ToolDispatcher::execute_tool_tracked(
+            None,
+            &ToolCall {
+                id: "no-project-read".into(),
+                name: "read_file".into(),
+                arguments: serde_json::json!({"path":"secret.txt"}),
+            },
+            true,
+            &ProcessRegistry::default(),
+            "no-project-run",
+        );
+        assert!(!result.success);
+        assert_eq!(
+            result.error.as_deref(),
+            Some("Tool requires an active project workspace")
+        );
     }
 
     #[test]
