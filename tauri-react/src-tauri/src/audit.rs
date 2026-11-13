@@ -1,6 +1,6 @@
 use serde::Serialize;
 use sha2::{Digest, Sha256};
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
@@ -12,6 +12,9 @@ static AUDIT: OnceLock<AuditLog> = OnceLock::new();
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "snake_case")]
+/// Full event vocabulary is a versioned persistence contract. Some variants are
+/// reserved for future emitters and are intentionally retained.
+#[allow(dead_code)]
 pub enum EventKind {
     AppStarted,
     AppShutdown,
@@ -61,6 +64,14 @@ struct AuditLog {
 
 pub fn initialize(directory: PathBuf) -> Result<(), String> {
     fs::create_dir_all(&directory).map_err(|e| format!("audit directory unavailable: {e}"))?;
+    let directory = directory
+        .canonicalize()
+        .map_err(|e| format!("audit directory unavailable: {e}"))?;
+    let metadata = fs::symlink_metadata(&directory)
+        .map_err(|e| format!("audit directory unavailable: {e}"))?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err("Security error: audit location must be a real directory".into());
+    }
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -84,6 +95,35 @@ pub fn initialize(directory: PathBuf) -> Result<(), String> {
     Ok(())
 }
 
+pub fn check_persistence() -> Result<(), String> {
+    AUDIT
+        .get()
+        .ok_or_else(|| "audit log is not initialized".to_string())?
+        .check_persistence()
+}
+
+impl AuditLog {
+    fn check_persistence(&self) -> Result<(), String> {
+        let _guard = self
+            .lock
+            .lock()
+            .map_err(|_| "audit lock poisoned".to_string())?;
+        let path = self.directory.join("audit.jsonl");
+        if let Ok(metadata) = fs::symlink_metadata(&path)
+            && (metadata.file_type().is_symlink() || !metadata.is_file())
+        {
+            return Err("Security error: Audit log must be a regular non-symlink file".into());
+        }
+        OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .map_err(|error| format!("audit log is not writable: {error}"))?;
+        read_last_hash(&path).map(|_| ())
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 pub fn emit(
     kind: EventKind,
     correlation_id: &str,
@@ -179,6 +219,11 @@ impl AuditLog {
             .lock()
             .map_err(|_| "audit lock poisoned".to_string())?;
         let path = self.directory.join("audit.jsonl");
+        if let Ok(metadata) = fs::symlink_metadata(&path)
+            && (metadata.file_type().is_symlink() || !metadata.is_file())
+        {
+            return Err("Security error: Audit log must be a regular non-symlink file".into());
+        }
         let previous = read_last_hash(&path)?;
         let input = serde_json::to_vec(&HashInput {
             previous_hash: &previous,
@@ -198,11 +243,17 @@ impl AuditLog {
         {
             self.rotate()?;
         }
-        let mut file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&path)
-            .map_err(|e| e.to_string())?;
+        let mut options = OpenOptions::new();
+        options.create(true).append(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+        }
+        let mut file = options.open(&path).map_err(|e| e.to_string())?;
+        if !file.metadata().map_err(|e| e.to_string())?.is_file() {
+            return Err("Security error: Audit log must be a regular file".into());
+        }
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -216,17 +267,31 @@ impl AuditLog {
         Ok(())
     }
 
+    fn resolve_audit_component(&self, name: &str) -> Result<PathBuf, String> {
+        let path = self.directory.join(name);
+        if let Ok(metadata) = fs::symlink_metadata(&path)
+            && (metadata.file_type().is_symlink() || !metadata.is_file())
+        {
+            return Err(
+                "Security error: Audit component must be a regular non-symlink file".into(),
+            );
+        }
+        Ok(path)
+    }
+
     fn rotate(&self) -> Result<(), String> {
-        let oldest = self
-            .directory
-            .join(format!("audit.{}.jsonl", RETAINED_FILES));
-        let _ = fs::remove_file(oldest);
+        let oldest = self.resolve_audit_component(&format!("audit.{RETAINED_FILES}.jsonl"))?;
+        match fs::remove_file(&oldest) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.to_string()),
+        }
         for index in (1..RETAINED_FILES).rev() {
-            let from = self.directory.join(if index == 1 {
+            let from = self.resolve_audit_component(&if index == 1 {
                 "audit.jsonl".into()
             } else {
-                format!("audit.{}.jsonl", index)
-            });
+                format!("audit.{index}.jsonl")
+            })?;
             let to = self.directory.join(format!("audit.{}.jsonl", index + 1));
             if from.exists() {
                 fs::rename(from, to).map_err(|e| e.to_string())?;
@@ -237,10 +302,25 @@ impl AuditLog {
 }
 
 fn read_last_hash(path: &Path) -> Result<String, String> {
-    if !path.exists() {
-        return Ok(String::new());
+    match fs::symlink_metadata(path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(String::new()),
+        Err(error) => return Err(error.to_string()),
+        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => {
+            return Err("Security error: Audit log must be a regular non-symlink file".into());
+        }
+        Ok(_) => {}
     }
-    let file = File::open(path).map_err(|e| e.to_string())?;
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+    }
+    let file = options.open(path).map_err(|e| e.to_string())?;
+    if !file.metadata().map_err(|e| e.to_string())?.is_file() {
+        return Err("Security error: Audit log must be a regular file".into());
+    }
     let mut last = String::new();
     for line in BufReader::new(file).lines() {
         let line = line.map_err(|e| e.to_string())?;
@@ -296,6 +376,56 @@ mod tests {
         assert_eq!(event["request_id"], "request-1");
         assert_eq!(event["outcome"], "success");
         assert!(!line.contains("secret!"));
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn append_rejects_audit_log_symlink_without_touching_target() {
+        use std::os::unix::fs::symlink;
+        let base = std::env::current_dir().unwrap().join("target");
+        let dir = base.join(format!("openharness-audit-link-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&dir).unwrap();
+        let outside = dir.with_extension("outside");
+        fs::write(&outside, "protected").unwrap();
+        symlink(&outside, dir.join("audit.jsonl")).unwrap();
+        let log = AuditLog {
+            directory: dir.clone(),
+            lock: Mutex::new(()),
+        };
+        let result = log.emit(
+            EventKind::AgentFailed,
+            "run",
+            None,
+            None,
+            None,
+            None,
+            Some("failed"),
+            None,
+        );
+        assert!(result.is_err());
+        assert_eq!(fs::read_to_string(&outside).unwrap(), "protected");
+        fs::remove_dir_all(dir).unwrap();
+        fs::remove_file(outside).unwrap();
+    }
+
+    #[test]
+    fn persistence_probe_requires_a_readable_audit_chain_and_writable_file() {
+        let dir = std::env::current_dir()
+            .unwrap()
+            .join("target")
+            .join(format!("openharness-audit-probe-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&dir).unwrap();
+        let log = AuditLog {
+            directory: dir.clone(),
+            lock: Mutex::new(()),
+        };
+
+        assert!(log.check_persistence().is_ok());
+        fs::write(dir.join("audit.jsonl"), "not-json\\n").unwrap();
+        assert!(log.check_persistence().is_err());
+        fs::write(dir.join("audit.jsonl"), "").unwrap();
+        assert!(log.check_persistence().is_ok());
         fs::remove_dir_all(dir).unwrap();
     }
 
@@ -369,7 +499,7 @@ mod tests {
         })
         .unwrap();
         let second: serde_json::Value = serde_json::from_str(
-            &fs::read_to_string(dir.join("audit.jsonl"))
+            fs::read_to_string(dir.join("audit.jsonl"))
                 .unwrap()
                 .lines()
                 .nth(1)

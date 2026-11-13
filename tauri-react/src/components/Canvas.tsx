@@ -3,6 +3,7 @@ import {isNearBottom} from './conversationScroll';
 import {createRequestOwner} from './conversationRequests';
 import {CHAT_PANEL_GAP, getSplitLayout} from './splitLayout';
 import {containTabKey} from './modalFocus';
+import {withFailureNotice} from './stepLifecycle';
 import { SafeMarkdown } from './SafeMarkdown';
 import { MessageCrumbs } from './MessageCrumbs';
 import { readQueuedPrompts, upsertStep, markPromptActive, estimateMessageTokens, removeQueuedPrompt, nextQueuedPrompt, queuedPromptById, queuedPromptsForThread, persistQueuedPrompts, type QueuedPrompt } from './stepLifecycle';
@@ -653,10 +654,10 @@ export function Canvas() {
         }, (error) => {
           const errText = String(error);
           if (errText.includes('Generation stopped')) {
-          setMessages(prev => prev.map(message => message.id === assistantId ? {...message, status: 'done'} : message.id === userMessage.id || message.id === persistedUserMessage?.id ? {...message, status: 'cancelled'} : message));
+          setMessages(prev => prev.map(message => message.id === assistantId ? {...message, status: 'cancelled'} : message.id === userMessage.id || message.id === persistedUserMessage?.id ? {...message, status: 'cancelled'} : message));
           toast('Generation stopped');
           } else {
-          setMessages(prev => prev.map(message => message.id === assistantId ? {...message, text: errText, status: 'error'} : message.id === userMessage.id || message.id === persistedUserMessage?.id ? {...message, status: 'error'} : message));
+          setMessages(prev => prev.map(message => message.id === assistantId ? {...message, text: withFailureNotice(message.text, errText), status: 'error'} : message.id === userMessage.id || message.id === persistedUserMessage?.id ? {...message, status: 'error'} : message));
           toast(errText);
           }
         }, (approvalRequest) => setApproval(approvalRequest), step => {
@@ -670,10 +671,10 @@ export function Canvas() {
         const text = String(error);
         setApproval(null);
         if (text.includes('Generation stopped')) {
-          setMessages(prev => prev.map(message => message.id === assistantId ? {...message, status: 'done'} : message.id === userMessage.id || message.id === persistedUserMessage?.id ? {...message, status: 'cancelled'} : message));
+          setMessages(prev => prev.map(message => message.id === assistantId ? {...message, status: 'cancelled'} : message.id === userMessage.id || message.id === persistedUserMessage?.id ? {...message, status: 'cancelled'} : message));
           toast('Generation stopped');
         } else {
-          setMessages(prev => prev.map(message => message.id === assistantId ? {...message, text, status: 'error'} : message));
+          setMessages(prev => prev.map(message => message.id === assistantId ? {...message, text: withFailureNotice(message.text, text), status: 'error'} : message.id === userMessage.id || message.id === persistedUserMessage?.id ? {...message, status: 'error'} : message));
           toast(text);
         }
       } finally {

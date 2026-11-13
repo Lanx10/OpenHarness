@@ -86,6 +86,12 @@ export function estimateMessageTokens(text: string, attachments: string[] = []):
   return textTokens + imageTokens + (visibleText.trim() || imageTokens ? 8 : 0);
 }
 
+export function withFailureNotice(partial: string, notice: string): string {
+  const content = partial.trimEnd();
+  if (!content) return notice;
+  return content.endsWith(notice) ? content : `${content}\n\n${notice}`;
+}
+
 export function markPromptActive(prompt: QueuedPrompt): QueuedPrompt {
   const baseId = prompt.id.replace(/^active:/, '');
   return {...prompt, id: `active:${baseId}`};

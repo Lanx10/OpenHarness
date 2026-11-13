@@ -10,6 +10,7 @@ pub struct ModelMessage {
     pub attachments: Vec<String>,
     pub tool_call_id: Option<String>,
     pub tool_name: Option<String>,
+    pub tool_call_ids: Vec<String>,
 }
 
 pub struct ModelRequest<'a> {
@@ -71,6 +72,7 @@ impl ModelMessage {
             attachments: Vec::new(),
             tool_call_id: None,
             tool_name: None,
+            tool_call_ids: Vec::new(),
         }
     }
 
@@ -79,6 +81,7 @@ impl ModelMessage {
         message.role = "tool".to_string();
         message.tool_call_id = Some(id.to_string());
         message.tool_name = Some(name.to_string());
+        message.tool_call_ids.push(id.to_string());
         message
     }
 
@@ -92,7 +95,8 @@ const MAX_ERROR_BODY_CHARS: usize = 512;
 const MAX_RESPONSE_BYTES: usize = 1_000_000;
 
 pub fn is_image_attachment(attachment: &str) -> bool {
-    attachment.starts_with("![") && attachment.contains("](data:image/")
+    attachment.starts_with("data:image/")
+        || (attachment.starts_with("![") && attachment.contains("](data:image/"))
 }
 
 const MAX_IMAGE_BYTES: usize = 4 * 1024 * 1024;
@@ -208,7 +212,31 @@ fn attach_images_to_user(
 }
 
 fn safe_error_body(body: &str) -> String {
-    body.chars().take(MAX_ERROR_BODY_CHARS).collect()
+    let without_headers = body.split_once("\r\n\r\n").map_or(body, |(_, value)| value);
+    let without_bearer = regex_lite_bearer(without_headers);
+    without_bearer.chars().take(MAX_ERROR_BODY_CHARS).collect()
+}
+
+fn regex_lite_bearer(value: &str) -> String {
+    let mut output = String::with_capacity(value.len());
+    let mut rest = value;
+    while let Some(index) = rest.find("Bearer ") {
+        output.push_str(&rest[..index]);
+        let token_start = index + "Bearer ".len();
+        let token_end = rest[token_start..]
+            .find(|character: char| {
+                character.is_whitespace() || character == ',' || character == '"'
+            })
+            .map_or(rest.len(), |offset| token_start + offset);
+        if token_end == token_start {
+            output.push_str("Bearer ");
+        } else {
+            output.push_str("Bearer [redacted]");
+        }
+        rest = &rest[token_end..];
+    }
+    output.push_str(rest);
+    output
 }
 
 fn add_response_bytes(total: &mut usize, chunk_len: usize) -> Result<(), String> {
@@ -217,6 +245,90 @@ fn add_response_bytes(total: &mut usize, chunk_len: usize) -> Result<(), String>
         .filter(|size| *size <= MAX_RESPONSE_BYTES)
         .ok_or_else(|| "Provider response exceeded the maximum allowed size".to_string())?;
     Ok(())
+}
+
+fn validate_tool_definitions(tools: &[Value]) -> Result<(), String> {
+    let mut names = std::collections::HashSet::with_capacity(tools.len());
+    for (index, tool) in tools.iter().enumerate() {
+        let function = tool.get("function").ok_or_else(|| {
+            format!(
+                "Tool definition {} is missing its function object",
+                index + 1
+            )
+        })?;
+        let name = function
+            .get("name")
+            .and_then(Value::as_str)
+            .filter(|name| !name.trim().is_empty())
+            .ok_or_else(|| {
+                format!(
+                    "Tool definition {} must use function type, a nonempty name, and object parameters",
+                    index + 1
+                )
+            })?;
+        if tool.get("type").and_then(Value::as_str) != Some("function")
+            || !function.get("parameters").is_some_and(Value::is_object)
+        {
+            return Err(format!(
+                "Tool definition {} must use function type, a nonempty name, and object parameters",
+                index + 1
+            ));
+        }
+        if !names.insert(name) {
+            return Err(format!("Duplicate tool definition name: {name}"));
+        }
+    }
+    Ok(())
+}
+
+fn parse_ollama_stream_event(line: &str) -> Result<Value, String> {
+    serde_json::from_str(line).map_err(|error| format!("Malformed Ollama stream event: {error}"))
+}
+
+fn parse_ollama_completion(json: &Value) -> Result<String, String> {
+    if let Some(error) = json.get("error").and_then(Value::as_str) {
+        return Err(format_provider_error(
+            "Ollama",
+            reqwest::StatusCode::BAD_REQUEST,
+            error,
+        ));
+    }
+    json.pointer("/message/content")
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+        .ok_or_else(|| {
+            "Ollama returned an unexpected completion shape (missing message.content)".into()
+        })
+}
+
+fn format_transport_error(provider: &str, timed_out: bool) -> String {
+    let source = if timed_out {
+        "request timed out"
+    } else {
+        "network request failed"
+    };
+    format!("{provider}: {source}; check connectivity and endpoint availability")
+}
+
+fn format_provider_error(provider: &str, status: reqwest::StatusCode, body: &str) -> String {
+    let safe_body = safe_error_body(body);
+    let normalized = safe_body.to_ascii_lowercase();
+    let category = if status == reqwest::StatusCode::UNAUTHORIZED
+        || status == reqwest::StatusCode::FORBIDDEN
+    {
+        "authentication failed"
+    } else if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+        "rate limit exceeded"
+    } else if normalized.contains("context length")
+        || normalized.contains("context_length")
+        || normalized.contains("prompt is too long")
+        || normalized.contains("maximum context")
+    {
+        "context limit exceeded"
+    } else {
+        "request failed"
+    };
+    format!("{provider} {category} (HTTP {status}): {safe_body}")
 }
 
 async fn read_capped_body(response: reqwest::Response) -> Result<Vec<u8>, String> {
@@ -247,6 +359,146 @@ async fn read_capped_error(response: reqwest::Response) -> String {
 #[cfg(test)]
 mod utf8_stream_tests {
     use super::{process_sse_line, push_utf8_chunk};
+
+    #[test]
+    fn provider_errors_redact_bearer_secrets_and_bound_body_text() {
+        let result = super::safe_error_body(r#"{"message":"bad", "auth":"Bearer topsecret"}"#);
+        assert!(result.contains("Bearer [redacted]"));
+        assert!(!result.contains("topsecret"));
+        assert!(super::safe_error_body(&"x".repeat(600)).len() <= super::MAX_ERROR_BODY_CHARS);
+    }
+
+    #[test]
+    fn parses_completion_text_and_multiple_native_tool_calls() {
+        let result = super::parse_openai_completion(&serde_json::json!({
+            "choices": [{"finish_reason":"tool_calls", "message": {
+                "content": "working",
+                "tool_calls": [
+                    {"id":"call_a", "function":{"name":"read_file", "arguments":{"path":"a"}}},
+                    {"id":"call_b", "function":{"name":"list_dir", "arguments":{"path":"src"}}}
+                ]
+            }}]
+        }))
+        .unwrap();
+        let calls = crate::harness::ToolDispatcher::parse_tool_calls(&result);
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].id, "call_a");
+        assert_eq!(calls[0].name, "read_file");
+        assert_eq!(calls[0].arguments["path"], "a");
+        assert_eq!(calls[1].id, "call_b");
+        assert_eq!(calls[1].arguments["path"], "src");
+        assert!(result.starts_with("working"));
+    }
+
+    #[test]
+    fn rejects_malformed_or_truncated_completion_shapes_without_erasing_arguments() {
+        assert!(super::parse_openai_completion(&serde_json::json!({"choices":[]})).is_err());
+        assert!(
+            super::parse_openai_completion(&serde_json::json!({
+                "choices":[{"finish_reason":"length", "message":{"content":"partial"}}]
+            }))
+            .unwrap_err()
+            .contains("truncated")
+        );
+        assert!(super::parse_openai_completion(&serde_json::json!({
+            "choices":[{"message":{"tool_calls":[{"function":{"name":"read_file","arguments":[]}}]}}]
+        })).is_err());
+    }
+
+    #[test]
+    fn malformed_ollama_stream_json_is_an_error() {
+        assert!(super::parse_ollama_stream_event(r#"{"message":{"content":"ok"}}"#).is_ok());
+        assert!(
+            super::parse_ollama_stream_event("{broken")
+                .unwrap_err()
+                .contains("Malformed Ollama stream event")
+        );
+    }
+
+    #[test]
+    fn ollama_completion_rejects_error_and_missing_content() {
+        assert_eq!(
+            super::parse_ollama_completion(&serde_json::json!({"message":{"content":"ok"}}))
+                .unwrap(),
+            "ok"
+        );
+        assert!(
+            super::parse_ollama_completion(&serde_json::json!({"error":"model missing"})).is_err()
+        );
+        assert!(super::parse_ollama_completion(&serde_json::json!({})).is_err());
+    }
+
+    #[test]
+    fn ollama_final_line_without_newline_reports_usage_errors_and_malformed_json() {
+        let mut text = String::new();
+        let mut tools = std::collections::BTreeMap::new();
+        let mut usages = Vec::new();
+        let mut process = |line: &str| {
+            let json = super::parse_ollama_stream_event(line).unwrap();
+            if let Some(usage) = super::provider_usage_envelope("Ollama", &json) {
+                usages.push(usage);
+            }
+            text.push_str(json["message"]["content"].as_str().unwrap_or_default());
+            if let Some(calls) = json["message"]["tool_calls"].as_array() {
+                for call in calls {
+                    tools.insert(
+                        call["id"].as_str().unwrap_or_default().to_string(),
+                        call.clone(),
+                    );
+                }
+            }
+        };
+        process(r#"{"message":{"content":"done"},"prompt_eval_count":2,"eval_count":3}"#);
+        assert!(super::parse_ollama_stream_event("{truncated").is_err());
+        assert_eq!(text, "done");
+        assert_eq!(usages.len(), 1);
+        assert!(tools.is_empty());
+    }
+
+    #[test]
+    fn builds_provider_client_with_bounded_connect_and_request_timeouts() {
+        assert!(super::provider_http_client(std::time::Duration::from_secs(45)).is_ok());
+    }
+
+    #[test]
+    fn formats_transport_failures_without_exposing_sensitive_details() {
+        assert_eq!(
+            super::format_transport_error("OpenRouter", true),
+            "OpenRouter: request timed out; check connectivity and endpoint availability"
+        );
+        assert_eq!(
+            super::format_transport_error("Ollama", false),
+            "Ollama: network request failed; check connectivity and endpoint availability"
+        );
+    }
+
+    #[test]
+    fn reports_authentication_rate_limit_and_context_limit_statuses() {
+        assert!(
+            super::format_provider_error(
+                "OpenAI Compatible",
+                reqwest::StatusCode::UNAUTHORIZED,
+                r#"{"error":"missing credential"}"#
+            )
+            .contains("authentication")
+        );
+        assert!(
+            super::format_provider_error(
+                "OpenRouter",
+                reqwest::StatusCode::TOO_MANY_REQUESTS,
+                r#"{"error":"busy"}"#
+            )
+            .contains("rate limit")
+        );
+        assert!(
+            super::format_provider_error(
+                "Google AI Studio",
+                reqwest::StatusCode::BAD_REQUEST,
+                r#"{"error":{"message":"prompt is too long: context length exceeded"}}"#
+            )
+            .contains("context limit")
+        );
+    }
 
     #[test]
     fn final_sse_line_processes_content_tools_usage_finish_and_errors() {
@@ -286,6 +538,71 @@ mod utf8_stream_tests {
         assert_eq!(tools[&0].1, "read");
         assert_eq!(usages.len(), 1);
         assert!(error.is_some());
+    }
+
+    #[test]
+    fn rejects_invalid_tool_definitions_before_provider_request() {
+        let valid = serde_json::json!({"type":"function","function":{"name":"read_file","parameters":{"type":"object"}}});
+        assert!(super::validate_tool_definitions(std::slice::from_ref(&valid)).is_ok());
+        assert!(
+            super::validate_tool_definitions(&[serde_json::json!({"function": valid["function"]})])
+                .is_err()
+        );
+        assert!(
+            super::validate_tool_definitions(&[
+                serde_json::json!({"type":"function","function":{"name":" ","parameters":{}}})
+            ])
+            .is_err()
+        );
+        assert!(
+            super::validate_tool_definitions(&[valid.clone(), valid])
+                .unwrap_err()
+                .contains("Duplicate tool definition")
+        );
+    }
+
+    #[test]
+    fn rejects_unexpected_openai_stream_events() {
+        let mut text = String::new();
+        let mut tools = std::collections::BTreeMap::new();
+        let mut error = None;
+        process_sse_line(
+            r#"data: {"unexpected":"shape"}"#,
+            "OpenRouter",
+            &mut text,
+            &mut tools,
+            &mut |_| {},
+            &mut |_| {},
+            &mut |_| {},
+            &mut error,
+        );
+        assert!(text.is_empty());
+        assert!(
+            error
+                .unwrap()
+                .contains("Unexpected OpenRouter stream event shape")
+        );
+    }
+
+    #[test]
+    fn malformed_stream_tool_arguments_are_preserved_raw() {
+        let mut text = String::new();
+        let mut tools = std::collections::BTreeMap::new();
+        let mut error = None;
+        process_sse_line(
+            r#"data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_bad","function":{"name":"future_tool","arguments":"{"}}]}}]}"#,
+            "OpenRouter",
+            &mut text,
+            &mut tools,
+            &mut |_| {},
+            &mut |_| {},
+            &mut |_| {},
+            &mut error,
+        );
+        assert_eq!(tools[&0].0, "call_bad");
+        assert_eq!(tools[&0].1, "future_tool");
+        assert_eq!(tools[&0].2, "{");
+        assert!(error.is_none());
     }
 
     #[test]
@@ -352,12 +669,40 @@ pub(crate) fn push_utf8_chunk(
 
 fn messages_json_checked(messages: &[ModelMessage], ollama: bool) -> Result<Vec<Value>, String> {
     let mut normalized: Vec<Value> = Vec::new();
-    for message in messages.iter().enumerate() {
-        let (i, message) = message;
+    let mut unresolved_tool_calls = std::collections::HashSet::new();
+    for message in messages {
         if message.role == "assistant"
-            && let Ok(val) = serde_json::from_str::<Value>(&message.content)
-            && val.get("tool_calls").is_some()
+            && let Ok(mut val) = serde_json::from_str::<Value>(&message.content)
         {
+            if let Some(calls) = val.get_mut("tool_calls").and_then(Value::as_array_mut) {
+                for (call_index, call) in calls.iter_mut().enumerate() {
+                    if call
+                        .get("id")
+                        .and_then(Value::as_str)
+                        .is_none_or(|id| id.trim().is_empty())
+                    {
+                        call["id"] = serde_json::json!(format!("call_{}", call_index + 1));
+                    }
+                    if call["function"]["name"]
+                        .as_str()
+                        .is_none_or(|name| name.trim().is_empty())
+                    {
+                        call["function"]["name"] = serde_json::json!("unknown_tool");
+                    }
+                    if !call["function"]["arguments"].is_string()
+                        && !call["function"]["arguments"].is_object()
+                    {
+                        call["function"]["arguments"] = serde_json::json!("{}");
+                    }
+                }
+                for call in calls {
+                    if let Some(id) = call.get("id").and_then(Value::as_str)
+                        && !unresolved_tool_calls.insert(id.to_string())
+                    {
+                        return Err(format!("Duplicate tool call ID: {id}"));
+                    }
+                }
+            }
             normalized.push(val);
             continue;
         }
@@ -366,11 +711,18 @@ fn messages_json_checked(messages: &[ModelMessage], ollama: bool) -> Result<Vec<
             let id = message
                 .tool_call_id
                 .as_deref()
+                .filter(|id| !id.trim().is_empty())
                 .ok_or_else(|| "Tool result is missing its call ID".to_string())?;
             let name = message
                 .tool_name
                 .as_deref()
+                .filter(|name| !name.trim().is_empty())
                 .ok_or_else(|| "Tool result is missing its tool name".to_string())?;
+            if !unresolved_tool_calls.remove(id) {
+                return Err(format!(
+                    "Tool result references unknown or already answered tool call: {id}"
+                ));
+            }
             normalized.push(serde_json::json!({
                 "role": "tool",
                 "tool_call_id": id,
@@ -380,8 +732,23 @@ fn messages_json_checked(messages: &[ModelMessage], ollama: bool) -> Result<Vec<
             continue;
         }
 
+        if !unresolved_tool_calls.is_empty() {
+            return Err(format!(
+                "Provider request contains unresolved tool calls before message with role '{}': {}",
+                message.role,
+                unresolved_tool_calls
+                    .into_iter()
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+        }
+
         let role = if message.role == "system" {
-            if i == 0 { "system" } else { "user" }
+            if normalized.iter().all(|item| item["role"] == "system") {
+                "system"
+            } else {
+                "user"
+            }
         } else if message.role == "assistant" {
             "assistant"
         } else if message.role == "tool" {
@@ -423,6 +790,15 @@ fn messages_json_checked(messages: &[ModelMessage], ollama: bool) -> Result<Vec<
         } else {
             normalized.push(item);
         }
+    }
+    if !unresolved_tool_calls.is_empty() {
+        return Err(format!(
+            "Provider request contains unresolved tool calls: {}",
+            unresolved_tool_calls
+                .into_iter()
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
     }
     Ok(normalized)
 }
@@ -529,6 +905,62 @@ pub fn validated_endpoint_for_test(provider: &str, custom: Option<&str>) -> Resu
     endpoint_url(provider, custom)
 }
 
+fn parse_openai_completion(json: &Value) -> Result<String, String> {
+    let choice = json["choices"]
+        .as_array()
+        .and_then(|choices| choices.first())
+        .ok_or_else(|| "Provider returned no completion choices".to_string())?;
+    if choice["finish_reason"] == "length" {
+        return Err("Model response was truncated by its output token limit".into());
+    }
+    if choice["finish_reason"] == "content_filter" {
+        return Err("Model response was blocked by the provider's content filter".into());
+    }
+    let message = &choice["message"];
+    let mut output = message["content"].as_str().unwrap_or_default().to_string();
+    if let Some(calls) = message["tool_calls"].as_array() {
+        for call in calls {
+            let name = call
+                .pointer("/function/name")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            if name.trim().is_empty() {
+                return Err("Provider returned a tool call without a function name".into());
+            }
+            let id = call["id"]
+                .as_str()
+                .filter(|id| !id.trim().is_empty())
+                .unwrap_or("call_missing_id");
+            let arguments = match call.pointer("/function/arguments") {
+                Some(Value::String(raw)) => raw.clone(),
+                Some(value) if value.is_object() => value.to_string(),
+                _ => {
+                    return Err(format!(
+                        "Provider returned malformed arguments for tool '{name}'"
+                    ));
+                }
+            };
+            output.push_str(&format!(
+                "<tool_call>\\n{}\\n</tool_call>\\n",
+                serde_json::json!({"id": id, "name": name, "arguments": arguments})
+            ));
+        }
+    }
+    if output.is_empty() {
+        return Err("Provider returned an empty completion without text or tool calls".into());
+    }
+    Ok(output)
+}
+
+fn provider_http_client(timeout: Duration) -> Result<reqwest::Client, String> {
+    reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(10))
+        .timeout(timeout)
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .map_err(|e| e.to_string())
+}
+
 pub async fn query_llm(request: ModelRequest<'_>) -> Result<String, String> {
     let ModelRequest {
         provider,
@@ -540,11 +972,7 @@ pub async fn query_llm(request: ModelRequest<'_>) -> Result<String, String> {
         attachments,
         supports_vision,
     } = request;
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(45))
-        .redirect(reqwest::redirect::Policy::none())
-        .build()
-        .map_err(|e| e.to_string())?;
+    let client = provider_http_client(Duration::from_secs(45))?;
 
     match provider {
         "Ollama" => {
@@ -568,20 +996,18 @@ pub async fn query_llm(request: ModelRequest<'_>) -> Result<String, String> {
             let res = req
                 .send()
                 .await
-                .map_err(|e| format!("Failed to connect to Ollama (is it running?): {}", e))?;
+                .map_err(|e| format_transport_error("Ollama", e.is_timeout()))?;
 
             if !res.status().is_success() {
+                let status = res.status();
                 let error = read_capped_error(res).await;
-                return Err(format!("Ollama returned error: {}", error));
+                return Err(format_provider_error("Ollama", status, &error));
             }
 
             let body = read_capped_body(res).await?;
             let json: Value = serde_json::from_slice(&body)
                 .map_err(|e| format!("Failed to parse Ollama JSON: {}", e))?;
-            let content = json["message"]["content"]
-                .as_str()
-                .unwrap_or("No reply from Ollama");
-            Ok(content.to_string())
+            parse_ollama_completion(&json)
         }
         "OpenRouter" | "Google AI Studio" | "OpenAI Compatible" => {
             let images = image_data_urls(attachments)?;
@@ -612,55 +1038,18 @@ pub async fn query_llm(request: ModelRequest<'_>) -> Result<String, String> {
             let res = req
                 .send()
                 .await
-                .map_err(|e| format!("Network request failed: {}", e))?;
+                .map_err(|e| format_transport_error(provider, e.is_timeout()))?;
 
             if !res.status().is_success() {
+                let status = res.status();
                 let error = read_capped_error(res).await;
-                return Err(format!("{} returned error: {}", provider, error));
+                return Err(format_provider_error(provider, status, &error));
             }
 
             let body = read_capped_body(res).await?;
             let json: Value = serde_json::from_slice(&body)
                 .map_err(|e| format!("Failed to parse response JSON: {}", e))?;
-            let choice = &json["choices"][0];
-            if let Some(content) = choice["message"]["content"]
-                .as_str()
-                .filter(|s| !s.is_empty())
-            {
-                Ok(content.to_string())
-            } else if let Some(tool_calls) = choice["message"]["tool_calls"]
-                .as_array()
-                .filter(|a| !a.is_empty())
-            {
-                let mut formatted = String::new();
-                for (idx, tc) in tool_calls.iter().enumerate() {
-                    let call_id = tc["id"]
-                        .as_str()
-                        .map(str::to_string)
-                        .unwrap_or_else(|| format!("call_{}", idx + 1));
-                    let name = tc["function"]["name"].as_str().unwrap_or("");
-                    let args = &tc["function"]["arguments"];
-                    let parsed_args = if let Some(s) = args.as_str() {
-                        serde_json::from_str(s).unwrap_or_else(|_| serde_json::json!({}))
-                    } else {
-                        args.clone()
-                    };
-                    formatted.push_str(&format!(
-                        "<tool_call>\n{}\n</tool_call>\n",
-                        serde_json::json!({
-                            "id": call_id,
-                            "name": name,
-                            "arguments": parsed_args
-                        })
-                    ));
-                }
-                Ok(formatted)
-            } else {
-                Err(
-                    "Provider returned empty response choices without text or tool calls."
-                        .to_string(),
-                )
-            }
+            parse_openai_completion(&json)
         }
         other => Err(format!("Unsupported provider: {}", other)),
     }
@@ -783,41 +1172,13 @@ fn provider_usage_envelope(provider: &str, usage: &Value) -> Option<ProviderUsag
 }
 
 #[cfg(test)]
-fn normalize_test_usage(provider: &str, usage: &Value) -> Option<ProviderUsage> {
-    provider_usage_envelope(provider, usage)
-}
-
-#[cfg(test)]
 fn cached_input_tokens(usage: &Value) -> Option<u64> {
     openai_usage(usage)
         .or_else(|| google_usage(usage))?
         .cached_input_tokens
 }
 
-pub async fn query_llm_stream(
-    request: ModelRequest<'_>,
-    callbacks: ModelCallbacks<
-        impl Fn(String) + Send + Sync + 'static,
-        impl Fn(ProviderUsage) + Send + Sync + 'static,
-    >,
-) -> Result<String, String> {
-    let ModelCallbacks {
-        on_token, on_usage, ..
-    } = callbacks;
-    query_llm_stream_with_tools(
-        StreamingModelRequest {
-            request,
-            tools: &[],
-        },
-        ModelCallbacks {
-            on_token,
-            on_usage,
-            on_activity: |_| {},
-        },
-    )
-    .await
-}
-
+#[allow(clippy::too_many_arguments)]
 fn process_sse_line<OnToken, OnUsage, OnActivity>(
     line: &str,
     provider: &str,
@@ -851,6 +1212,7 @@ fn process_sse_line<OnToken, OnUsage, OnActivity>(
     );
 }
 
+#[allow(clippy::too_many_arguments)]
 fn process_sse_data<OnToken, OnUsage, OnActivity>(
     data: &str,
     provider: &str,
@@ -890,6 +1252,15 @@ fn process_sse_data<OnToken, OnUsage, OnActivity>(
             provider,
             safe_error_body(&error.to_string())
         ));
+    }
+    let has_choices = json.get("choices").is_some_and(Value::is_array);
+    let has_usage = json.get("usage").is_some() || json.get("usageMetadata").is_some();
+    if !has_choices && !has_usage && json.get("error").is_none() {
+        *stream_error = Some(format!(
+            "Unexpected {} stream event shape: expected choices, usage metadata, or an error",
+            provider
+        ));
+        return;
     }
     if let Some(reasoning) = json["choices"][0]["delta"]["reasoning"]
         .as_str()
@@ -979,11 +1350,8 @@ pub async fn query_llm_stream_with_tools(
         mut on_usage,
         mut on_activity,
     } = callbacks;
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(120))
-        .redirect(reqwest::redirect::Policy::none())
-        .build()
-        .map_err(|e| e.to_string())?;
+    validate_tool_definitions(tools)?;
+    let client = provider_http_client(Duration::from_secs(120))?;
 
     match provider {
         "Ollama" => {
@@ -1024,10 +1392,11 @@ pub async fn query_llm_stream_with_tools(
             let res = req
                 .send()
                 .await
-                .map_err(|e| format!("Failed to connect to Ollama (is it running?): {}", e))?;
+                .map_err(|e| format_transport_error("Ollama", e.is_timeout()))?;
             if !res.status().is_success() {
+                let status = res.status();
                 let error = read_capped_error(res).await;
-                return Err(format!("Ollama returned error: {}", error));
+                return Err(format_provider_error("Ollama", status, &error));
             }
             let mut stream = res.bytes_stream();
             let mut accumulated = String::new();
@@ -1036,18 +1405,27 @@ pub async fn query_llm_stream_with_tools(
             let mut native_calls = Vec::new();
             let mut received_bytes = 0;
             while let Some(chunk) = stream.next().await {
-                let chunk = chunk.map_err(|e| e.to_string())?;
+                let chunk = chunk.map_err(|e| format_transport_error("Ollama", e.is_timeout()))?;
                 add_response_bytes(&mut received_bytes, chunk.len())?;
-                if let Err(error) = push_utf8_chunk(&mut utf8_pending, &mut buffer, &chunk, false) {
-                    return Err(error);
-                }
+                push_utf8_chunk(&mut utf8_pending, &mut buffer, &chunk, false)?;
                 while let Some(pos) = buffer.find('\n') {
                     let line = buffer[..pos].trim().to_string();
                     buffer.drain(..=pos);
                     if line.is_empty() {
                         continue;
                     }
-                    if let Ok(json) = serde_json::from_str::<Value>(&line) {
+                    let json = parse_ollama_stream_event(&line)?;
+                    if let Some(usage) = provider_usage_envelope("Ollama", &json) {
+                        on_usage(usage);
+                    }
+                    if let Some(error) = json.get("error") {
+                        return Err(format_provider_error(
+                            "Ollama",
+                            reqwest::StatusCode::BAD_REQUEST,
+                            &error.to_string(),
+                        ));
+                    }
+                    {
                         if let Some(content) = json["message"]["content"]
                             .as_str()
                             .filter(|s| !s.is_empty())
@@ -1062,9 +1440,18 @@ pub async fn query_llm_stream_with_tools(
                 }
             }
             push_utf8_chunk(&mut utf8_pending, &mut buffer, &[], true)?;
-            if !buffer.trim().is_empty()
-                && let Ok(json) = serde_json::from_str::<Value>(buffer.trim())
-            {
+            if !buffer.trim().is_empty() {
+                let json = parse_ollama_stream_event(buffer.trim())?;
+                if let Some(usage) = provider_usage_envelope("Ollama", &json) {
+                    on_usage(usage);
+                }
+                if let Some(error) = json.get("error") {
+                    return Err(format_provider_error(
+                        "Ollama",
+                        reqwest::StatusCode::BAD_REQUEST,
+                        &error.to_string(),
+                    ));
+                }
                 if let Some(content) = json["message"]["content"]
                     .as_str()
                     .filter(|s| !s.is_empty())
@@ -1134,10 +1521,11 @@ pub async fn query_llm_stream_with_tools(
             let res = req
                 .send()
                 .await
-                .map_err(|e| format!("Network request failed: {}", e))?;
+                .map_err(|e| format_transport_error(provider, e.is_timeout()))?;
             if !res.status().is_success() {
+                let status = res.status();
                 let error = read_capped_error(res).await;
-                return Err(format!("{} returned error: {}", provider, error));
+                return Err(format_provider_error(provider, status, &error));
             }
             let mut stream = res.bytes_stream();
             let mut accumulated = String::new();
@@ -1150,7 +1538,8 @@ pub async fn query_llm_stream_with_tools(
             loop {
                 let at_eof = match stream.next().await {
                     Some(chunk) => {
-                        let chunk = chunk.map_err(|e| e.to_string())?;
+                        let chunk =
+                            chunk.map_err(|e| format_transport_error(provider, e.is_timeout()))?;
                         add_response_bytes(&mut received_bytes, chunk.len())?;
                         push_utf8_chunk(&mut utf8_pending, &mut buffer, &chunk, false)?;
                         false
@@ -1199,18 +1588,17 @@ pub async fn query_llm_stream_with_tools(
                     } else {
                         id
                     };
-                    let parsed_args = if arguments.trim().is_empty() {
-                        serde_json::json!({})
+                    let raw_arguments = if arguments.trim().is_empty() {
+                        "{}".to_string()
                     } else {
-                        serde_json::from_str::<Value>(&arguments)
-                            .unwrap_or_else(|_| serde_json::json!({ "raw": arguments }))
+                        arguments
                     };
                     accumulated.push_str(&format!(
                         "<tool_call>\n{}\n</tool_call>\n",
                         serde_json::json!({
                             "id": call_id,
                             "name": name,
-                            "arguments": parsed_args
+                            "arguments": raw_arguments
                         })
                     ));
                 }
@@ -1264,6 +1652,70 @@ mod image_payload_tests {
         );
         assert_eq!(payload[3]["role"], "assistant");
         assert_eq!(payload[3]["content"], "Recovered.");
+    }
+
+    #[test]
+    fn merges_leading_system_messages_into_one_system_block() {
+        let messages = vec![
+            ModelMessage::new("system", "Base instructions"),
+            ModelMessage::new("system", "Project instructions"),
+            ModelMessage::new("user", "Question"),
+        ];
+
+        let payload = messages_json_checked(&messages, false).unwrap();
+
+        assert_eq!(payload.len(), 2);
+        assert_eq!(payload[0]["role"], "system");
+        assert_eq!(
+            payload[0]["content"],
+            "Base instructions\n\nProject instructions"
+        );
+        assert_eq!(payload[1]["role"], "user");
+        assert_eq!(payload[1]["content"], "Question");
+    }
+
+    #[test]
+    fn demotes_system_messages_that_appear_after_conversation_start() {
+        let messages = vec![
+            ModelMessage::new("system", "Base instructions"),
+            ModelMessage::new("user", "Question"),
+            ModelMessage::new("system", "Mid-conversation note"),
+        ];
+
+        let payload = messages_json_checked(&messages, false).unwrap();
+
+        assert_eq!(payload[0]["role"], "system");
+        assert_eq!(payload.len(), 2);
+        assert_eq!(payload[1]["role"], "user");
+        assert_eq!(payload[1]["content"], "Question\n\nMid-conversation note");
+    }
+
+    #[test]
+    fn rejects_unresolved_tool_calls_instead_of_sending_incomplete_history() {
+        let assistant = ModelMessage::new(
+            "assistant",
+            r#"{"role":"assistant","content":null,"tool_calls":[{"id":"call_orphan","type":"function","function":{"name":"read_file","arguments":"{}"}}]}"#,
+        );
+        assert!(
+            messages_json_checked(&[assistant], false)
+                .unwrap_err()
+                .contains("unresolved tool calls")
+        );
+    }
+
+    #[test]
+    fn accepts_complete_tool_call_group_and_rejects_duplicate_result() {
+        let assistant = ModelMessage::new(
+            "assistant",
+            r#"{"role":"assistant","content":null,"tool_calls":[{"id":"call_1","type":"function","function":{"name":"read_file","arguments":"{}"}}]}"#,
+        );
+        let result = ModelMessage::tool_result("call_1", "read_file", "ok");
+        assert!(messages_json_checked(&[assistant.clone(), result.clone()], false).is_ok());
+        assert!(
+            messages_json_checked(&[assistant, result.clone(), result], false)
+                .unwrap_err()
+                .contains("unknown or already answered")
+        );
     }
 
     #[test]
@@ -1533,6 +1985,7 @@ mod image_payload_tests {
     fn image_attachment_is_not_treated_as_text_file() {
         let attachment = "![sample](data:image/png;base64,iVBORw0KGgo=)";
         assert!(is_image_attachment(attachment));
+        assert!(is_image_attachment("data:image/png;base64,iVBORw0KGgo="));
         assert!(!is_image_attachment("[notes.txt]\nhello"));
     }
 

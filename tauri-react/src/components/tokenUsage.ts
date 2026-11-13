@@ -42,8 +42,8 @@ export function addUsageOnce(
   usage: ProviderUsageLike,
 ): TokenUsageTotals {
   if (seenRequestIds.has(requestId)) return totals;
-  seenRequestIds.add(requestId);
   if (!Object.values(usage).some(value => typeof value === 'number' && Number.isFinite(value))) return totals;
+  seenRequestIds.add(requestId);
   const delta = tokenUsageTotals([{source: 'provider_reported', usage}]);
   return Object.fromEntries((Object.keys(totals) as (keyof TokenUsageTotals)[]).map(key => [
     key,

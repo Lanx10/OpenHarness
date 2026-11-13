@@ -27,17 +27,18 @@ export async function windowClose(): Promise<void> {
 export type ReadinessComponentLike = {
   id: string;
   displayName: string;
-  status: 'ready' | 'degraded' | 'unavailable' | 'disabled' | 'failed';
+  status: 'initializing' | 'ready' | 'degraded' | 'unavailable' | 'failed';
   message: string;
   required: boolean;
   recoverable: boolean;
   validatedAtUnixMs: number;
+  durationMs: number;
   diagnosticReference?: string | null;
 };
 
 export async function apiGetStartupReadiness(): Promise<ReadinessComponentLike[]> {
   if (isTauri()) return invoke('get_startup_readiness');
-  return [];
+  throw new Error('System readiness requires the Tauri backend.');
 }
 
 export type ProviderInfo = {
@@ -151,7 +152,7 @@ export async function apiTestProviderConnection(
   if (isTauri()) {
     return invoke('test_provider_connection', { provider, modelId, baseUrl, apiKey });
   }
-  return 'Web demo: connection simulated successfully';
+  throw new Error('Provider connection testing requires the Tauri backend; no browser validation is simulated.');
 }
 
 export async function apiListProviders(): Promise<ProviderInfo[]> {

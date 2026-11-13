@@ -1,4 +1,6 @@
+use cap_fs_ext::{DirExt, FollowSymlinks, OpenOptionsFollowExt};
 use serde::{Deserialize, Serialize};
+#[cfg(test)]
 use std::fs;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -61,6 +63,14 @@ struct ProcessState {
 }
 
 impl ProcessRegistry {
+    pub(crate) fn health(&self) -> Result<(), String> {
+        let _state = self
+            .state
+            .lock()
+            .map_err(|_| "process registry lock is unavailable".to_string())?;
+        Ok(())
+    }
+
     pub(crate) fn begin_run(&self, run_id: &str) {
         let mut state = self.state.lock().unwrap();
         state.cancelled_runs.remove(run_id);
@@ -91,6 +101,7 @@ impl ProcessRegistry {
         }
     }
 
+    #[cfg(test)]
     fn register(&self, run_id: &str, pid: u32) -> bool {
         let mut state = self.state.lock().unwrap();
         if !state.active_runs.contains(run_id) || state.cancelled_runs.contains(run_id) {
@@ -282,6 +293,49 @@ pub struct ToolCall {
     pub id: String,
     pub name: String,
     pub arguments: serde_json::Value,
+    #[serde(default)]
+    pub raw_arguments: serde_json::Value,
+}
+
+impl ToolCall {
+    pub fn new(id: String, name: String, arguments: serde_json::Value) -> Self {
+        Self {
+            id,
+            name,
+            arguments,
+            raw_arguments: serde_json::Value::Null,
+        }
+    }
+}
+
+fn native_call_parts(
+    value: &serde_json::Value,
+    next_id: usize,
+) -> (String, String, serde_json::Value) {
+    let function = value.get("function").unwrap_or(value);
+    let id = value
+        .get("id")
+        .and_then(|id| id.as_str())
+        .filter(|id| !id.trim().is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| format!("call_{}", next_id));
+    let name = function
+        .get("name")
+        .or_else(|| function.get("tool"))
+        .or_else(|| function.get("action"))
+        .and_then(|v| v.as_str())
+        .filter(|name| !name.trim().is_empty())
+        .unwrap_or("unknown_tool")
+        .to_string();
+    let arguments = function
+        .get("arguments")
+        .or_else(|| function.get("parameters"))
+        .or_else(|| function.get("params"))
+        .or_else(|| function.get("args"))
+        .or_else(|| function.get("input"))
+        .cloned()
+        .unwrap_or_else(|| serde_json::json!({}));
+    (id, name, arguments)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -304,6 +358,7 @@ const MAX_SELECTED_SKILLS: usize = 12;
 
 pub struct Sandbox {
     root: PathBuf,
+    dir: cap_std::fs::Dir,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -336,8 +391,16 @@ impl Sandbox {
                 canonical_root.display()
             ));
         }
+        let dir = cap_std::fs::Dir::open_ambient_dir(&canonical_root, cap_std::ambient_authority())
+            .map_err(|error| {
+                format!(
+                    "Could not open project sandbox '{}': {error}",
+                    canonical_root.display()
+                )
+            })?;
         Ok(Self {
             root: canonical_root,
+            dir,
         })
     }
 
@@ -348,71 +411,123 @@ impl Sandbox {
         working_dir: &Path,
     ) -> Result<Vec<ProjectInstruction>, String> {
         let requested = if working_dir.is_absolute() {
-            working_dir.to_path_buf()
+            working_dir
+                .canonicalize()
+                .map_err(|error| format!("Invalid instruction working directory: {error}"))?
+                .strip_prefix(&self.root)
+                .map(Path::to_path_buf)
+                .map_err(|_| {
+                    "Security error: Instruction working directory is outside project root"
+                        .to_string()
+                })?
         } else {
-            self.root.join(working_dir)
+            working_dir.to_path_buf()
         };
-        let task_dir = requested
-            .canonicalize()
-            .map_err(|error| format!("Invalid instruction working directory: {error}"))?;
-        if !task_dir.starts_with(&self.root) || !task_dir.is_dir() {
-            return Err("Security error: Instruction working directory is outside project root or not a directory".into());
+        let mut directories = Vec::new();
+        let mut cursor = self.open_dir_no_follow(Path::new(""))?;
+        let mut relative = PathBuf::new();
+        directories.push((
+            cursor.try_clone().map_err(|e| e.to_string())?,
+            relative.clone(),
+        ));
+        for component in requested.components() {
+            match component {
+                std::path::Component::Normal(part) => {
+                    relative = relative.join(part);
+                    cursor = cursor.open_dir_nofollow(part).map_err(|error| {
+                        format!(
+                            "Could not open instruction directory '{}': {error}",
+                            relative.display()
+                        )
+                    })?;
+                    directories.push((
+                        cursor.try_clone().map_err(|e| e.to_string())?,
+                        relative.clone(),
+                    ));
+                }
+                std::path::Component::CurDir => {}
+                std::path::Component::Prefix(_)
+                | std::path::Component::RootDir
+                | std::path::Component::ParentDir => {
+                    return Err("Security error: Invalid instruction working directory".to_string());
+                }
+            }
         }
-        let mut directories = task_dir
-            .ancestors()
-            .take_while(|directory| directory.starts_with(&self.root))
-            .collect::<Vec<_>>();
-        directories.reverse();
         let mut instructions = Vec::new();
-        for directory in directories {
-            let candidate = directory.join("AGENTS.md");
-            let metadata = match fs::symlink_metadata(&candidate) {
+        for (directory, relative_directory) in directories {
+            let display_path = self.root.join(&relative_directory).join("AGENTS.md");
+            let metadata = match directory.symlink_metadata("AGENTS.md") {
                 Ok(metadata) => metadata,
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
                 Err(error) => {
                     return Err(format!(
                         "Could not inspect instruction file '{}': {error}",
-                        candidate.display()
+                        display_path.display()
                     ));
                 }
             };
             if metadata.file_type().is_symlink() || !metadata.is_file() {
                 return Err(format!(
                     "Security error: Instruction file '{}' must be a regular non-symlink file",
-                    candidate.display()
+                    display_path.display()
                 ));
             }
             if metadata.len() as usize > MAX_READ_BYTES {
                 return Err(format!(
                     "Instruction file '{}' exceeds {} bytes",
-                    candidate.display(),
+                    display_path.display(),
                     MAX_READ_BYTES
                 ));
             }
-            let canonical = candidate.canonicalize().map_err(|error| {
-                format!(
-                    "Could not resolve instruction file '{}': {error}",
-                    candidate.display()
-                )
-            })?;
-            if !canonical.starts_with(&self.root) || canonical.parent() != Some(directory) {
-                return Err(format!(
-                    "Security error: Instruction file '{}' escapes its directory or project root",
-                    candidate.display()
-                ));
-            }
-            let content = fs::read_to_string(&canonical).map_err(|error| {
-                format!(
-                    "Could not read instruction file '{}': {error}",
-                    canonical.display()
-                )
-            })?;
+            let content = Self::read_instruction_file(&directory, &display_path, &metadata)?;
             instructions.push(ProjectInstruction {
-                path: canonical,
+                path: display_path,
                 content,
             });
         }
         Ok(instructions)
+    }
+
+    fn read_instruction_file(
+        directory: &cap_std::fs::Dir,
+        display_path: &Path,
+        expected: &cap_std::fs::Metadata,
+    ) -> Result<String, String> {
+        let mut options = cap_std::fs::OpenOptions::new();
+        options.read(true);
+        options.follow(FollowSymlinks::No);
+        let file = directory
+            .open_with("AGENTS.md", &options)
+            .map_err(|error| {
+                format!(
+                    "Could not open instruction file '{}': {error}",
+                    display_path.display()
+                )
+            })?;
+        let opened = file.metadata().map_err(|error| error.to_string())?;
+        if !opened.is_file() || opened.len() != expected.len() {
+            return Err(format!(
+                "Instruction file '{}' changed while opening",
+                display_path.display()
+            ));
+        }
+        let mut bytes = Vec::with_capacity(opened.len() as usize);
+        file.take(MAX_READ_BYTES as u64 + 1)
+            .read_to_end(&mut bytes)
+            .map_err(|error| {
+                format!(
+                    "Could not read instruction file '{}': {error}",
+                    display_path.display()
+                )
+            })?;
+        if bytes.len() as u64 != opened.len() {
+            return Err(format!(
+                "Instruction file '{}' changed while reading",
+                display_path.display()
+            ));
+        }
+        String::from_utf8(bytes)
+            .map_err(|_| format!("Instruction file '{}' is not UTF-8", display_path.display()))
     }
 
     pub fn resolve_path(&self, rel_path: &str) -> Result<PathBuf, String> {
@@ -448,9 +563,11 @@ impl Sandbox {
         }
         let trimmed = portable.as_str();
 
-        for component in Path::new(trimmed).components() {
-            if let std::path::Component::ParentDir = component {
-                return Err("Security error: Parent traversal '..' is forbidden".to_string());
+        if !portable.starts_with('/') {
+            for component in Path::new(&portable).components() {
+                if let std::path::Component::ParentDir = component {
+                    return Err("Security error: Parent traversal '..' is forbidden".to_string());
+                }
             }
         }
 
@@ -517,21 +634,8 @@ impl Sandbox {
         limit: Option<usize>,
     ) -> Result<String, String> {
         Self::validate_regular_file(rel_path.trim(), "Reading")?;
-        let full_path = self.resolve_path(rel_path.trim())?;
-        let metadata = fs::symlink_metadata(&full_path)
-            .map_err(|e| format!("Failed to read metadata for '{}': {}", rel_path, e))?;
-        if metadata.file_type().is_symlink() || !metadata.is_file() {
-            return Err("Security error: Reading requires a regular, non-symlink file".into());
-        }
-        if metadata.len() as usize > MAX_READ_BYTES {
-            return Err(format!(
-                "File '{}' exceeds maximum allowed size ({} bytes > {} max)",
-                rel_path,
-                metadata.len(),
-                MAX_READ_BYTES
-            ));
-        }
-        let content = Self::read_regular_file(&full_path, rel_path)?;
+        let relative_path = self.relative_path(rel_path.trim())?;
+        let content = self.read_regular_file(&relative_path, rel_path)?;
 
         if offset.is_none() && limit.is_none() {
             return Ok(content);
@@ -546,6 +650,12 @@ impl Sandbox {
             .collect();
 
         Ok(selected_lines.join("\n"))
+    }
+
+    pub fn read_file_optional(&self, rel_path: &str) -> Result<Option<String>, String> {
+        Self::validate_regular_file(rel_path.trim(), "Reading")?;
+        let relative_path = self.relative_path(rel_path.trim())?;
+        self.read_regular_file_optional(&relative_path, rel_path)
     }
 
     fn validate_regular_file(path: &str, operation: &str) -> Result<(), String> {
@@ -566,30 +676,115 @@ impl Sandbox {
         Ok(())
     }
 
-    fn read_regular_file(full_path: &Path, display_path: &str) -> Result<String, String> {
-        let metadata = fs::symlink_metadata(full_path)
-            .map_err(|error| format!("Could not inspect '{}': {}", display_path, error))?;
-        if metadata.file_type().is_symlink() || !metadata.is_file() {
+    fn open_dir_no_follow(&self, relative_dir: &Path) -> Result<cap_std::fs::Dir, String> {
+        let mut dir = self.dir.try_clone().map_err(|e| e.to_string())?;
+        for component in relative_dir.components() {
+            match component {
+                std::path::Component::CurDir => {}
+                std::path::Component::Normal(part) => {
+                    dir = dir.open_dir_nofollow(part).map_err(|e| e.to_string())?;
+                }
+                _ => return Err("Security error: Invalid directory path".to_string()),
+            }
+        }
+        Ok(dir)
+    }
+
+    fn relative_path(&self, rel_path: &str) -> Result<PathBuf, String> {
+        let full_path = self.resolve_path(rel_path)?;
+        full_path
+            .strip_prefix(&self.root)
+            .map(Path::to_path_buf)
+            .map_err(|_| "Security error: Path escapes project root".to_string())
+    }
+
+    fn parent_no_follow(&self, relative_path: &Path) -> Result<cap_std::fs::Dir, String> {
+        let parent = relative_path
+            .parent()
+            .ok_or_else(|| "Target path must have a parent directory".to_string())?;
+        self.open_dir_no_follow(parent)
+    }
+
+    fn create_parent_no_follow(&self, relative_dir: &Path) -> Result<cap_std::fs::Dir, String> {
+        let mut dir = self.dir.try_clone().map_err(|e| e.to_string())?;
+        for component in relative_dir.components() {
+            match component {
+                std::path::Component::CurDir => {}
+                std::path::Component::Normal(part) => {
+                    dir = match dir.open_dir_nofollow(part) {
+                        Ok(next) => next,
+                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                            dir.create_dir(part).map_err(|e| e.to_string())?;
+                            dir.open_dir_nofollow(part).map_err(|e| e.to_string())?
+                        }
+                        Err(error) => return Err(error.to_string()),
+                    };
+                }
+                _ => return Err("Security error: Invalid directory path".to_string()),
+            }
+        }
+        Ok(dir)
+    }
+
+    fn read_regular_file(
+        &self,
+        relative_path: &Path,
+        display_path: &str,
+    ) -> Result<String, String> {
+        self.read_regular_file_optional(relative_path, display_path)?
+            .ok_or_else(|| format!("Could not open '{}': file not found", display_path))
+    }
+
+    fn read_regular_file_optional(
+        &self,
+        relative_path: &Path,
+        display_path: &str,
+    ) -> Result<Option<String>, String> {
+        let parent_relative = relative_path
+            .parent()
+            .ok_or_else(|| "Target path must have a parent directory".to_string())?;
+        let file_name = relative_path
+            .file_name()
+            .ok_or_else(|| "Target path must name a file".to_string())?;
+        let parent = self.open_dir_no_follow(parent_relative)?;
+        let mut options = cap_std::fs::OpenOptions::new();
+        options.read(true);
+        options.follow(FollowSymlinks::No);
+        let file = match parent.open_with(file_name, &options) {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => {
+                return Err(format!("Could not open '{}': {}", display_path, error));
+            }
+        };
+        let opened_metadata = file
+            .metadata()
+            .map_err(|error| format!("Could not inspect opened '{}': {}", display_path, error))?;
+        if !opened_metadata.is_file() {
             return Err(
                 "Security error: File operations require a regular, non-symlink file".into(),
             );
         }
-        if metadata.len() as usize > MAX_READ_BYTES {
+        if opened_metadata.len() as usize > MAX_READ_BYTES {
             return Err(format!(
                 "File '{}' exceeds maximum allowed size ({} bytes > {} max)",
                 display_path,
-                metadata.len(),
+                opened_metadata.len(),
                 MAX_READ_BYTES
             ));
         }
-        let bytes = fs::read(full_path)
+        let mut bytes = Vec::with_capacity(opened_metadata.len() as usize);
+        let mut limited = file.take(opened_metadata.len().saturating_add(1));
+        limited
+            .read_to_end(&mut bytes)
             .map_err(|error| format!("Could not read '{}': {}", display_path, error))?;
-        let rechecked = fs::symlink_metadata(full_path)
+        drop(limited);
+        let rechecked = parent
+            .symlink_metadata(file_name)
             .map_err(|error| format!("Could not recheck '{}': {}", display_path, error))?;
         if rechecked.file_type().is_symlink()
             || !rechecked.is_file()
-            || rechecked.len() != metadata.len()
-            || rechecked.modified().ok() != metadata.modified().ok()
+            || rechecked.len() != opened_metadata.len()
             || bytes.len() as u64 != rechecked.len()
         {
             return Err(format!(
@@ -597,7 +792,7 @@ impl Sandbox {
                 display_path
             ));
         }
-        String::from_utf8(bytes).map_err(|_| {
+        String::from_utf8(bytes).map(Some).map_err(|_| {
             format!(
                 "File '{}' is not UTF-8 text; binary or non-UTF-8 files are unsupported",
                 display_path
@@ -628,10 +823,15 @@ impl Sandbox {
         if old_text.is_empty() {
             return Err("Patch text to replace cannot be empty".to_string());
         }
-        let full_path = self.resolve_path(rel_path.trim())?;
-        let metadata = fs::symlink_metadata(&full_path)
+        let relative_path = self.relative_path(rel_path)?;
+        let parent = self.parent_no_follow(&relative_path)?;
+        let file_name = relative_path
+            .file_name()
+            .ok_or_else(|| "Target path must name a file".to_string())?;
+        let metadata = parent
+            .symlink_metadata(file_name)
             .map_err(|error| format!("Could not inspect '{}': {}", rel_path, error))?;
-        if !metadata.is_file() || metadata.file_type().is_symlink() {
+        if metadata.file_type().is_symlink() || !metadata.is_file() {
             return Err(
                 "Security error: Patching requires a regular, non-symlink file".to_string(),
             );
@@ -642,8 +842,9 @@ impl Sandbox {
                 MAX_READ_BYTES
             ));
         }
-        let content = Self::read_regular_file(&full_path, rel_path)?;
-        let read_metadata = fs::symlink_metadata(&full_path)
+        let content = self.read_regular_file(&relative_path, rel_path)?;
+        let read_metadata = parent
+            .symlink_metadata(file_name)
             .map_err(|error| format!("Could not recheck '{}': {}", rel_path, error))?;
         if read_metadata.file_type().is_symlink()
             || read_metadata.len() != metadata.len()
@@ -668,7 +869,8 @@ impl Sandbox {
             content.replacen(old_text, new_text, 1)
         };
         self.write_file_unlocked(rel_path, &updated, Some(&content))?;
-        let verified = fs::read_to_string(&full_path)
+        let verified = self
+            .read_regular_file(&relative_path, rel_path)
             .map_err(|error| format!("Could not verify '{}': {}", rel_path, error))?;
         if verified != updated {
             return Err("Patch verification failed after write".to_string());
@@ -697,42 +899,31 @@ impl Sandbox {
         if trimmed.is_empty() {
             return Err("File path cannot be empty".to_string());
         }
-        let full_path = self.resolve_path(trimmed)?;
-        let parent = full_path
+        let relative_path = self.relative_path(rel_path.trim())?;
+        let relative_target = relative_path.as_path();
+        let relative_parent = relative_target
             .parent()
             .ok_or_else(|| "Target path must have a parent directory".to_string())?;
-
-        if !parent.exists() {
-            fs::create_dir_all(parent).map_err(|e| {
-                format!(
-                    "Failed to create directories for '{}': {}",
-                    parent.display(),
-                    e
-                )
-            })?;
-        }
-
-        let canonical_parent = parent.canonicalize().map_err(|e| {
-            format!(
-                "Failed to canonicalize parent '{}': {}",
-                parent.display(),
-                e
-            )
-        })?;
-        if !canonical_parent.starts_with(&self.root) {
-            return Err("Security error: Destination parent escapes project root".to_string());
-        }
-
-        let original_metadata = if full_path.exists() {
-            let meta = fs::symlink_metadata(&full_path).map_err(|e| e.to_string())?;
-            if meta.file_type().is_symlink() || !meta.is_file() {
-                return Err(
-                    "Security error: Writing requires a regular, non-symlink file".to_string(),
-                );
+        let parent = self.create_parent_no_follow(relative_parent)?;
+        let target_name = relative_target
+            .file_name()
+            .ok_or_else(|| "Target path must name a file".to_string())?;
+        let original_metadata = match parent.symlink_metadata(target_name) {
+            Ok(meta) => {
+                if meta.file_type().is_symlink() || !meta.is_file() {
+                    return Err(
+                        "Security error: Writing requires a regular, non-symlink file".to_string(),
+                    );
+                }
+                Some(meta)
             }
-            Some(meta)
-        } else {
-            None
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => {
+                return Err(format!(
+                    "Could not inspect destination '{}': {}",
+                    rel_path, error
+                ));
+            }
         };
         if let Some(expected) = expected_current {
             let Some(metadata) = original_metadata.as_ref() else {
@@ -744,13 +935,13 @@ impl Sandbox {
                     MAX_READ_BYTES
                 ));
             }
-            let current = fs::read_to_string(&full_path)
-                .map_err(|error| format!("Could not re-read '{}': {}", rel_path, error))?;
-            let rechecked = fs::symlink_metadata(&full_path).map_err(|error| error.to_string())?;
+            let current = self.read_regular_file(&relative_path, rel_path)?;
+            let rechecked = parent
+                .symlink_metadata(target_name)
+                .map_err(|error| error.to_string())?;
             if current != expected
                 || rechecked.file_type().is_symlink()
                 || rechecked.len() != metadata.len()
-                || rechecked.modified().ok() != metadata.modified().ok()
             {
                 return Err(
                     "File changed while preparing patch; read it again and retry".to_string(),
@@ -758,69 +949,58 @@ impl Sandbox {
             }
         }
 
-        let suffix = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos();
-        let file_name = full_path
-            .file_name()
-            .ok_or_else(|| "Target path must name a file".to_string())?
-            .to_string_lossy();
-        let temp_path = parent.join(format!(
-            ".{}.openharness-{}-{}.tmp",
-            file_name,
+        let relative_temp = format!(
+            ".{}.openharness-{}-{}-{}.tmp",
+            target_name.to_string_lossy(),
             std::process::id(),
-            suffix
-        ));
+            uuid::Uuid::new_v4(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        );
         let write_result = (|| -> Result<(), String> {
-            let mut options = fs::OpenOptions::new();
+            let mut options = cap_std::fs::OpenOptions::new();
             options.write(true).create_new(true);
-            let mut temp = options.open(&temp_path).map_err(|e| {
+            options.follow(FollowSymlinks::No);
+            let mut temp = parent.open_with(&relative_temp, &options).map_err(|e| {
                 format!("Failed to create temporary file for '{}': {}", rel_path, e)
             })?;
             temp.write_all(content.as_bytes())
                 .map_err(|e| format!("Failed to write temporary file for '{}': {}", rel_path, e))?;
             temp.sync_all()
                 .map_err(|e| format!("Failed to sync temporary file for '{}': {}", rel_path, e))?;
-            drop(temp);
-            if let Some(metadata) = original_metadata.as_ref() {
-                fs::set_permissions(&temp_path, metadata.permissions()).map_err(|error| {
+            if original_metadata.is_some() {
+                let permissions = parent
+                    .symlink_metadata(target_name)
+                    .map_err(|error| {
+                        format!("Could not inspect destination '{}': {}", rel_path, error)
+                    })?
+                    .permissions();
+                temp.set_permissions(permissions).map_err(|error| {
                     format!(
                         "Failed to preserve permissions for '{}': {}",
                         rel_path, error
                     )
                 })?;
             }
-            if full_path.exists() {
-                let current = fs::symlink_metadata(&full_path).map_err(|e| e.to_string())?;
-                if current.file_type().is_symlink() || !current.is_file() {
+            drop(temp);
+            if let Some(expected) = expected_current {
+                let current_content = self.read_regular_file(&relative_path, rel_path)?;
+                if current_content != expected {
                     return Err(
-                        "Security error: Destination changed to a non-regular file".to_string()
+                        "File changed before patch replacement; re-read and retry".to_string()
                     );
                 }
-                if let Some(expected) = expected_current {
-                    let current_content = fs::read_to_string(&full_path).map_err(|error| {
-                        format!(
-                            "Could not recheck '{}' before replacement: {}",
-                            rel_path, error
-                        )
-                    })?;
-                    if current_content != expected {
-                        return Err(
-                            "File changed before patch replacement; re-read and retry".to_string()
-                        );
-                    }
-                }
-                fs::rename(&temp_path, &full_path)
-                    .map_err(|e| format!("Failed to replace '{}': {}", rel_path, e))?;
-            } else {
-                fs::rename(&temp_path, &full_path)
-                    .map_err(|e| format!("Failed to create '{}': {}", rel_path, e))?;
             }
+
+            parent
+                .rename(&relative_temp, &parent, target_name)
+                .map_err(|e| format!("Failed to replace '{}': {}", rel_path, e))?;
             Ok(())
         })();
         if write_result.is_err() {
-            let _ = fs::remove_file(&temp_path);
+            let _ = parent.remove_file(&relative_temp);
         }
         write_result?;
         Ok(content.len())
@@ -831,17 +1011,26 @@ impl Sandbox {
             Some(path) => self.resolve_path(path)?,
             None => self.root.clone(),
         };
-
-        if !target_dir.is_dir() {
-            return Err(format!("'{}' is not a directory", target_dir.display()));
+        let relative_dir = target_dir
+            .strip_prefix(&self.root)
+            .map_err(|_| "Security error: Directory escapes project root".to_string())?;
+        let display_dir = target_dir.clone();
+        let target_dir = self.open_dir_no_follow(relative_dir)?;
+        let metadata = target_dir
+            .dir_metadata()
+            .map_err(|error| error.to_string())?;
+        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+            return Err(
+                "Security error: Listing requires a regular, non-symlink directory".to_string(),
+            );
         }
-
-        let canonical_dir = target_dir.canonicalize().map_err(|e| e.to_string())?;
-        if !canonical_dir.starts_with(&self.root) {
-            return Err("Security error: Directory escapes project root".to_string());
-        }
-        let entries = fs::read_dir(&canonical_dir)
-            .map_err(|e| format!("Failed to list directory '{}': {}", target_dir.display(), e))?;
+        let entries = target_dir.read_dir(".").map_err(|e| {
+            format!(
+                "Failed to list directory '{}': {}",
+                display_dir.display(),
+                e
+            )
+        })?;
 
         let mut results = Vec::new();
         for entry in entries {
@@ -849,33 +1038,21 @@ impl Sandbox {
                 Ok(e) => e,
                 Err(_) => continue,
             };
-            let name = entry.file_name().to_string_lossy().to_string();
+            let entry_path = entry.file_name();
+            let name = entry_path.to_string_lossy().to_string();
             if name == ".git" || name == "node_modules" || name == "target" {
                 continue;
             }
-            let path = entry.path();
-            let Ok(metadata) = fs::symlink_metadata(&path) else {
-                continue;
+            let metadata = match entry.metadata() {
+                Ok(m) => m,
+                Err(_) => continue,
             };
             if metadata.file_type().is_symlink() {
                 continue;
             }
-            let Ok(canonical_path) = path.canonicalize() else {
-                continue;
-            };
-            if !canonical_path.starts_with(&self.root) {
-                continue;
-            }
             let is_dir = metadata.is_dir();
-            let size = if is_dir {
-                0
-            } else {
-                entry.metadata().map(|m| m.len()).unwrap_or(0)
-            };
-            let rel_entry_path = path
-                .strip_prefix(&self.root)
-                .map(|p| p.to_string_lossy().to_string())
-                .unwrap_or_else(|_| name.clone());
+            let size = if is_dir { 0 } else { metadata.len() };
+            let rel_entry_path = relative_dir.join(&entry_path).to_string_lossy().to_string();
 
             results.push(FileEntry {
                 name,
@@ -907,79 +1084,93 @@ impl Sandbox {
         let pattern_ext = pattern.map(|p| p.trim_start_matches('*').to_lowercase());
 
         fn visit_dir(
-            dir: &Path,
-            root: &Path,
+            dir: &cap_std::fs::Dir,
+            relative_dir: &Path,
             query_lower: &str,
             pattern_ext: Option<&str>,
             matches: &mut Vec<GrepMatch>,
-        ) {
+        ) -> Result<(), String> {
             if matches.len() >= MAX_GREP_MATCHES {
-                return;
+                return Ok(());
             }
-            let entries = match fs::read_dir(dir) {
-                Ok(e) => e,
-                Err(_) => return,
-            };
+            let entries = dir.read_dir(".").map_err(|e| e.to_string())?;
             for entry in entries.flatten() {
-                let path = entry.path();
-                let name = entry.file_name().to_string_lossy().to_string();
-                if name.starts_with('.') || name == "node_modules" || name == "target" {
+                let name = entry.file_name();
+                let name_text = name.to_string_lossy();
+                if name_text.starts_with('.')
+                    || name_text == "node_modules"
+                    || name_text == "target"
+                {
                     continue;
                 }
-                let Ok(metadata) = fs::symlink_metadata(&path) else {
+                let Ok(metadata) = entry.metadata() else {
                     continue;
                 };
                 if metadata.file_type().is_symlink() {
                     continue;
                 }
-                let Ok(canonical_path) = path.canonicalize() else {
-                    continue;
-                };
-                if !canonical_path.starts_with(root) {
+                if metadata.is_dir() {
+                    let next = dir.open_dir_nofollow(&name).map_err(|e| e.to_string())?;
+                    visit_dir(
+                        &next,
+                        &relative_dir.join(&name),
+                        query_lower,
+                        pattern_ext,
+                        matches,
+                    )?;
                     continue;
                 }
-                if metadata.is_dir() {
-                    visit_dir(&path, root, query_lower, pattern_ext, matches);
-                } else if metadata.is_file() {
-                    if let Some(ext) = pattern_ext
-                        && !name.to_lowercase().ends_with(ext)
-                    {
-                        continue;
-                    }
-                    if let Ok(metadata) = entry.metadata()
-                        && metadata.len() > 1_000_000
-                    {
-                        continue;
-                    }
-                    if let Ok(content) = fs::read_to_string(&path) {
-                        let rel_file = path
-                            .strip_prefix(root)
-                            .map(|p| p.to_string_lossy().to_string())
-                            .unwrap_or_else(|_| name.clone());
-                        for (idx, line) in content.lines().enumerate() {
-                            if line.to_lowercase().contains(query_lower) {
-                                matches.push(GrepMatch {
-                                    file: rel_file.clone(),
-                                    line_number: idx + 1,
-                                    line_text: line.chars().take(200).collect(),
-                                });
-                                if matches.len() >= MAX_GREP_MATCHES {
-                                    return;
-                                }
-                            }
+                if !metadata.is_file() {
+                    continue;
+                }
+                if let Some(ext) = pattern_ext
+                    && !name_text.to_lowercase().ends_with(ext)
+                {
+                    continue;
+                }
+                if metadata.len() > 1_000_000 {
+                    continue;
+                }
+                let mut options = cap_std::fs::OpenOptions::new();
+                options.read(true);
+                options.follow(FollowSymlinks::No);
+                let file = dir.open_with(&name, &options).map_err(|e| e.to_string())?;
+                let opened = file.metadata().map_err(|e| e.to_string())?;
+                if !opened.is_file() || opened.len() != metadata.len() {
+                    return Err("Grep target changed while opening".to_string());
+                }
+                let mut content = String::new();
+                file.take(MAX_READ_BYTES as u64 + 1)
+                    .read_to_string(&mut content)
+                    .map_err(|e| e.to_string())?;
+                if content.len() as u64 != opened.len() {
+                    return Err("Grep target changed while reading".to_string());
+                }
+                let rel_file = relative_dir.join(&name).to_string_lossy().to_string();
+                for (idx, line) in content.lines().enumerate() {
+                    if line.to_lowercase().contains(query_lower) {
+                        matches.push(GrepMatch {
+                            file: rel_file.clone(),
+                            line_number: idx + 1,
+                            line_text: line.chars().take(200).collect(),
+                        });
+                        if matches.len() >= MAX_GREP_MATCHES {
+                            return Ok(());
                         }
                     }
                 }
             }
+            Ok(())
         }
 
+        let root = self.open_dir_no_follow(Path::new(""))?;
         visit_dir(
-            &self.root,
-            &self.root,
+            &root,
+            Path::new(""),
             &query_lower,
             pattern_ext.as_deref(),
             &mut matches,
-        );
+        )?;
         Ok(matches)
     }
 }
@@ -1272,11 +1463,7 @@ impl ToolDispatcher {
     pub fn save_project_memory(root: &Path, memory: &[String]) -> Result<String, String> {
         let sandbox = Sandbox::new(root.to_path_buf())?;
         let path = "AGENTS.md";
-        let existing = match std::fs::read_to_string(root.join(path)) {
-            Ok(content) => content,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
-            Err(error) => return Err(format!("Could not read project memory: {}", error)),
-        };
+        let existing = sandbox.read_file_optional(path)?.unwrap_or_default();
         let heading = "## OpenHarness learned project notes";
         let mut additions: Vec<String> = Vec::new();
         for item in memory
@@ -1360,7 +1547,8 @@ impl ToolDispatcher {
         if !target.starts_with(&sandbox.root) {
             return Err("Project memory path escapes workspace".into());
         }
-        std::fs::write(&target, &updated)
+        sandbox
+            .write_file(path, &updated)
             .map_err(|error| format!("Could not save project memory: {}", error))?;
         Ok(format!("AGENTS.md ({} new note(s))", additions.len()))
     }
@@ -1458,11 +1646,11 @@ impl ToolDispatcher {
         let mut scanned_entries = 0;
         let mut total_skill_bytes = 0;
         for directory in [".agents/skills", ".claude/skills", ".kilo/skills"] {
-            let directory_path = match sandbox.resolve_path(directory) {
-                Ok(path) => path,
+            let skills_dir = match sandbox.open_dir_no_follow(Path::new(directory)) {
+                Ok(dir) => dir,
                 Err(_) => continue,
             };
-            let entries = match fs::read_dir(&directory_path) {
+            let entries = match skills_dir.read_dir(".") {
                 Ok(entries) => entries,
                 Err(_) => continue,
             };
@@ -1482,55 +1670,12 @@ impl ToolDispatcher {
                     );
                     continue;
                 }
-                match fs::symlink_metadata(entry.path()) {
-                    Ok(metadata)
-                        if metadata.is_dir()
-                            && !metadata.file_type().is_symlink()
-                            && entry
-                                .path()
-                                .canonicalize()
-                                .is_ok_and(|path| path.starts_with(&sandbox.root)) => {}
-                    _ => continue,
-                }
+                let _skill_dir = match skills_dir.open_dir_nofollow(&name) {
+                    Ok(dir) => dir,
+                    Err(_) => continue,
+                };
                 let skill_path = format!("{}/{}/SKILL.md", directory, name);
-                let unresolved_skill_path = directory_path.join(&name).join("SKILL.md");
-                let metadata = match fs::symlink_metadata(&unresolved_skill_path) {
-                    Ok(metadata) if metadata.is_file() && !metadata.file_type().is_symlink() => {
-                        metadata
-                    }
-                    Ok(_) => {
-                        log::warn!(
-                            "event=skill_discovery_skipped name={} origin={:?} reason=missing_or_nonregular_skill_md",
-                            name,
-                            origin
-                        );
-                        continue;
-                    }
-                    Err(error) => {
-                        log::warn!(
-                            "event=skill_discovery_skipped name={} origin={:?} reason=skill_md_unavailable error={}",
-                            name,
-                            origin,
-                            error
-                        );
-                        continue;
-                    }
-                };
-                let resolved_skill_path = match sandbox.resolve_path(&skill_path) {
-                    Ok(path) if path == unresolved_skill_path => path,
-                    _ => continue,
-                };
-                if metadata.len() as usize > MAX_SKILL_FILE_BYTES {
-                    continue;
-                }
-                total_skill_bytes += metadata.len() as usize;
-                if total_skill_bytes > MAX_SKILL_METADATA_BYTES {
-                    return Err(format!(
-                        "Global skill metadata exceeds the {} MB scan limit",
-                        MAX_SKILL_METADATA_BYTES / 1_000_000
-                    ));
-                }
-                let content = match fs::read_to_string(&resolved_skill_path) {
+                let content = match sandbox.read_file(&skill_path, None, None) {
                     Ok(content) => content,
                     Err(error) => {
                         log::warn!(
@@ -1542,6 +1687,16 @@ impl ToolDispatcher {
                         continue;
                     }
                 };
+                if content.len() > MAX_SKILL_FILE_BYTES {
+                    continue;
+                }
+                total_skill_bytes += content.len();
+                if total_skill_bytes > MAX_SKILL_METADATA_BYTES {
+                    return Err(format!(
+                        "Global skill metadata exceeds the {} MB scan limit",
+                        MAX_SKILL_METADATA_BYTES / 1_000_000
+                    ));
+                }
                 let (metadata, body) = Self::parse_skill_frontmatter(&content);
                 let description = metadata.get("description").cloned().unwrap_or_default();
                 let valid_name = metadata.get("name").is_some_and(|value| value == &name)
@@ -1550,7 +1705,7 @@ impl ToolDispatcher {
                 if require_metadata && !available {
                     continue;
                 }
-                let resources = Self::skill_resources(&entry.path());
+                let resources = Self::skill_resources(&_skill_dir);
                 log::info!(
                     "event=skill_discovered name={} origin={:?} path={} resources={}",
                     name,
@@ -1597,62 +1752,42 @@ impl ToolDispatcher {
                 .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
     }
 
-    fn skill_resources(directory: &Path) -> Vec<(String, String)> {
-        let Ok(skill_root) = directory.canonicalize() else {
-            return Vec::new();
-        };
-        let mut pending = vec![(directory.to_path_buf(), String::new())];
+    fn skill_resources(directory: &cap_std::fs::Dir) -> Vec<(String, String)> {
+        let mut pending = vec![(directory.try_clone().ok(), String::new())];
         let mut resources = Vec::new();
         let mut scanned = 0usize;
-        while let Some((current, prefix)) = pending.pop() {
-            let entries = match fs::read_dir(&current) {
-                Ok(entries) => entries,
-                Err(error) => {
-                    log::warn!(
-                        "event=skill_resource_discovery_failed path={} error={}",
-                        current.display(),
-                        error
-                    );
-                    continue;
-                }
+        while let Some((Some(current), prefix)) = pending.pop() {
+            let Ok(entries) = current.read_dir(".") else {
+                continue;
             };
-            for entry in entries.filter_map(Result::ok) {
+            for entry in entries.flatten() {
                 scanned += 1;
                 if scanned > MAX_SKILL_SCAN_ENTRIES {
-                    log::warn!(
-                        "event=skill_resource_discovery_truncated path={} limit={}",
-                        skill_root.display(),
-                        MAX_SKILL_SCAN_ENTRIES
-                    );
                     return resources;
                 }
-                let path = entry.path();
                 let name = entry.file_name().to_string_lossy().to_string();
                 let relative = if prefix.is_empty() {
                     name.clone()
                 } else {
                     format!("{prefix}/{name}")
                 };
-                match fs::symlink_metadata(&path) {
-                    Ok(metadata) if metadata.file_type().is_symlink() => {}
-                    Ok(metadata)
-                        if metadata.is_dir()
-                            && path
-                                .canonicalize()
-                                .is_ok_and(|resolved| resolved.starts_with(&skill_root)) =>
-                    {
-                        pending.push((path, relative))
+                let Ok(metadata) = entry.metadata() else {
+                    continue;
+                };
+                if metadata.file_type().is_symlink() {
+                    continue;
+                }
+                if metadata.is_dir() {
+                    if let Ok(child) = current.open_dir_nofollow(&name) {
+                        pending.push((Some(child), relative));
                     }
-                    Ok(metadata)
-                        if metadata.is_file()
-                            && name != "SKILL.md"
-                            && path
-                                .canonicalize()
-                                .is_ok_and(|resolved| resolved.starts_with(&skill_root)) =>
-                    {
-                        resources.push((relative.clone(), relative))
+                } else if metadata.is_file() && name != "SKILL.md" {
+                    let mut options = cap_std::fs::OpenOptions::new();
+                    options.read(true);
+                    options.follow(FollowSymlinks::No);
+                    if entry.open_with(&options).is_ok() {
+                        resources.push((relative.clone(), relative));
                     }
-                    _ => {}
                 }
             }
         }
@@ -1706,41 +1841,22 @@ impl ToolDispatcher {
             }
         };
         let sandbox = Sandbox::new(root.to_path_buf())?;
-        let instruction_path = sandbox.resolve_path(&skill.path)?;
-        let metadata = fs::symlink_metadata(&instruction_path)
-            .map_err(|error| format!("Could not inspect skill {}: {}", name, error))?;
-        if !metadata.is_file()
-            || metadata.file_type().is_symlink()
-            || metadata.len() as usize > MAX_SKILL_FILE_BYTES
-        {
-            return Err(format!(
-                "Skill {} is not a regular file within the {} byte limit",
-                name, MAX_SKILL_FILE_BYTES
-            ));
-        }
         log::info!(
             "event=skill_selected name={} origin={:?} path={}",
             name,
             skill.origin,
             skill.path
         );
-        let instruction_file = fs::File::open(&instruction_path).map_err(|error| {
-            log::warn!("event=skill_activation_failed name={} origin={:?} reason=instruction_open error={}", name, skill.origin, error);
+        let mut instructions = sandbox.read_file(&skill.path, None, None).map_err(|error| {
+            log::warn!("event=skill_activation_failed name={} origin={:?} reason=instruction_read error={}", name, skill.origin, error);
             format!("Could not load skill {}: {}", name, error)
         })?;
-        if !instruction_file
-            .metadata()
-            .map_err(|error| error.to_string())?
-            .is_file()
-        {
-            return Err(format!("Skill {} is not a regular file", name));
+        if instructions.len() > MAX_SKILL_FILE_BYTES {
+            return Err(format!(
+                "Skill {} exceeds {} bytes",
+                name, MAX_SKILL_FILE_BYTES
+            ));
         }
-        let mut instructions = String::new();
-        instruction_file.take((MAX_SKILL_FILE_BYTES + 1) as u64).read_to_string(&mut instructions)
-            .map_err(|error| {
-                log::warn!("event=skill_activation_failed name={} origin={:?} reason=instruction_read error={}", name, skill.origin, error);
-                format!("Could not load skill {}: {}", name, error)
-            })?;
         if instructions.len() > Self::MAX_SKILL_INSTRUCTION_BYTES {
             let boundary = instructions
                 .char_indices()
@@ -1751,12 +1867,11 @@ impl ToolDispatcher {
             instructions.truncate(boundary);
             instructions.push_str("\n[truncated]");
         }
-        let skill_dir = sandbox
-            .resolve_path(&skill.path)?
+        let skill_dir_rel = Path::new(&skill.path)
             .parent()
-            .ok_or("Invalid skill path")?
-            .to_path_buf();
-        let available_resources = Self::skill_resources(&skill_dir);
+            .ok_or("Invalid skill path")?;
+        let skill_dir_handle = sandbox.open_dir_no_follow(skill_dir_rel)?;
+        let available_resources = Self::skill_resources(&skill_dir_handle);
         let mut loaded = Vec::new();
         for resource in resources {
             if !Self::safe_skill_resource(resource)
@@ -1764,78 +1879,38 @@ impl ToolDispatcher {
             {
                 return Err(format!("Skill resource is unavailable: {}", resource));
             }
-            let resource_path = format!("{}/{}", skill.path.trim_end_matches("SKILL.md"), resource);
-            let resolved_resource = sandbox.resolve_path(&resource_path)?;
-            let canonical_resource = resolved_resource.canonicalize().map_err(|error| {
-                format!("Could not resolve skill resource {}: {}", resource, error)
-            })?;
-            if !canonical_resource.starts_with(&skill_dir) {
-                return Err(format!(
-                    "Skill resource escapes its skill directory: {}",
-                    resource
-                ));
-            }
-            let resource_metadata = fs::symlink_metadata(&resolved_resource).map_err(|error| {
-                format!("Could not inspect skill resource {}: {}", resource, error)
-            })?;
-            if !resource_metadata.is_file() || resource_metadata.file_type().is_symlink() {
-                return Err(format!(
-                    "Skill resource is not a regular file: {}",
-                    resource
-                ));
-            }
-            let expected_metadata = fs::metadata(&canonical_resource).map_err(|error| {
-                format!("Could not verify skill resource {}: {}", resource, error)
-            })?;
-            log::info!(
-                "event=skill_resource_access name={} origin={:?} resource={}",
-                name,
-                skill.origin,
+            let resource_path = format!(
+                "{}/{}",
+                skill
+                    .path
+                    .rsplit_once('/')
+                    .map(|(directory, _)| directory)
+                    .ok_or("Invalid skill path")?,
                 resource
             );
-            let resource_file = fs::File::open(&canonical_resource).map_err(|error| {
-                log::warn!(
-                    "event=skill_resource_failed name={} origin={:?} resource={} error={}",
-                    name,
-                    skill.origin,
-                    resource,
-                    error
-                );
-                format!("Could not read skill resource {}: {}", resource, error)
-            })?;
-            let opened_resource_path = canonical_resource
-                .canonicalize()
-                .map_err(|error| error.to_string())?;
-            let resource_metadata = resource_file
-                .metadata()
-                .map_err(|error| error.to_string())?;
-            if opened_resource_path != canonical_resource
-                || !resource_metadata.is_file()
-                || resource_metadata.len() != expected_metadata.len()
-                || resource_metadata.modified().ok() != expected_metadata.modified().ok()
-            {
-                return Err(format!(
-                    "Skill resource is not a regular file: {}",
-                    resource
-                ));
-            }
-            let mut content = String::new();
-            resource_file
-                .take((Self::MAX_SKILL_RESOURCE_BYTES + 1) as u64)
-                .read_to_string(&mut content)
-                .map_err(|error| {
-                    format!("Could not read skill resource {}: {}", resource, error)
-                })?;
-            let content = if content.len() > Self::MAX_SKILL_RESOURCE_BYTES {
-                let boundary = content
+            let resource_content =
+                sandbox
+                    .read_file(&resource_path, None, None)
+                    .map_err(|error| {
+                        log::warn!(
+                            "event=skill_resource_failed name={} origin={:?} resource={} error={}",
+                            name,
+                            skill.origin,
+                            resource,
+                            error
+                        );
+                        format!("Could not read skill resource {}: {}", resource, error)
+                    })?;
+            let content = if resource_content.len() > Self::MAX_SKILL_RESOURCE_BYTES {
+                let boundary = resource_content
                     .char_indices()
                     .map(|(index, _)| index)
                     .take_while(|index| *index <= Self::MAX_SKILL_RESOURCE_BYTES)
                     .last()
                     .unwrap_or(0);
-                format!("{}\n[truncated]", &content[..boundary])
+                format!("{}\n[truncated]", &resource_content[..boundary])
             } else {
-                content
+                resource_content
             };
             loaded.push((resource.clone(), content));
         }
@@ -1922,30 +1997,8 @@ impl ToolDispatcher {
             }
             .ok_or_else(|| format!("Skill root unavailable for {}", name))?;
             let sandbox = Sandbox::new(root.to_path_buf())?;
-            let path = sandbox.resolve_path(&skill.path)?;
-            let metadata = fs::symlink_metadata(&path)
-                .map_err(|error| format!("Could not inspect skill {}: {}", name, error))?;
-            if !metadata.is_file()
-                || metadata.file_type().is_symlink()
-                || metadata.len() as usize > MAX_SKILL_FILE_BYTES
-            {
-                return Err(format!(
-                    "Skill {} is not a regular file within the {} byte limit",
-                    name, MAX_SKILL_FILE_BYTES
-                ));
-            }
-            let file = fs::File::open(path)
-                .map_err(|error| format!("Could not open skill {}: {}", name, error))?;
-            if !file
-                .metadata()
-                .map_err(|error| error.to_string())?
-                .is_file()
-            {
-                return Err(format!("Skill {} is not a regular file", name));
-            }
-            let mut contents = String::new();
-            file.take((MAX_SKILL_FILE_BYTES + 1) as u64)
-                .read_to_string(&mut contents)
+            let contents = sandbox
+                .read_file(&skill.path, None, None)
                 .map_err(|error| format!("Could not read skill {}: {}", name, error))?;
             if contents.len() > MAX_SKILL_FILE_BYTES {
                 return Err(format!(
@@ -1973,19 +2026,8 @@ impl ToolDispatcher {
                 continue;
             };
             let sandbox = Sandbox::new(root.to_path_buf())?;
-            let path = sandbox.resolve_path(&skill.path)?;
-            let metadata = fs::symlink_metadata(&path)
-                .map_err(|error| format!("Could not inspect skill {}: {}", name, error))?;
-            if metadata.file_type().is_symlink()
-                || !metadata.is_file()
-                || metadata.len() as usize > MAX_SKILL_FILE_BYTES
-            {
-                return Err(format!(
-                    "Skill {} is not a regular file within the {} byte limit",
-                    name, MAX_SKILL_FILE_BYTES
-                ));
-            }
-            let contents = fs::read_to_string(path)
+            let contents = sandbox
+                .read_file(&skill.path, None, None)
                 .map_err(|error| format!("Could not read skill {}: {}", name, error))?;
             if contents.len() > MAX_SKILL_FILE_BYTES {
                 return Err(format!(
@@ -1999,12 +2041,47 @@ impl ToolDispatcher {
     }
 
     pub fn native_tool_call(value: &serde_json::Value, next_id: usize) -> Option<ToolCall> {
+        Some(Self::tool_call_from_native(value, next_id))
+    }
+
+    fn tool_call_from_native(value: &serde_json::Value, next_id: usize) -> ToolCall {
+        let (call_id, raw_name, arguments) = native_call_parts(value, next_id);
+        match Self::try_native_tool_call(value, next_id) {
+            Ok(mut parsed) => {
+                parsed.raw_arguments = arguments.clone();
+                if parsed
+                    .arguments
+                    .get("__native_argument_parse_error")
+                    .is_some()
+                {
+                    parsed.arguments["raw_arguments"] = arguments;
+                }
+                parsed
+            }
+            Err(error) => {
+                let mut call = ToolCall::new(
+                    call_id,
+                    raw_name.to_string(),
+                    serde_json::json!({"__native_argument_parse_error": error, "raw_arguments": arguments}),
+                );
+                call.raw_arguments = arguments;
+                call
+            }
+        }
+    }
+
+    pub(crate) fn try_native_tool_call(
+        value: &serde_json::Value,
+        next_id: usize,
+    ) -> Result<ToolCall, String> {
         let function = value.get("function").unwrap_or(value);
         let raw_name = function
             .get("name")
             .or_else(|| function.get("tool"))
             .or_else(|| function.get("action"))
-            .and_then(|v| v.as_str())?;
+            .and_then(|v| v.as_str())
+            .filter(|name| !name.trim().is_empty())
+            .unwrap_or("unknown_tool");
 
         let canonical_name = match raw_name.to_lowercase().replace(['-', ' '], "_").as_str() {
             "read_file" | "readfile" | "read" | "cat" | "view_file" => "read_file",
@@ -2021,7 +2098,7 @@ impl ToolDispatcher {
             "git_log" | "gitlog" => "git_log",
             "git_branch" | "gitbranch" => "git_branch",
             "activate_skill" | "activate_skill_instructions" => "activate_skill",
-            _ => return None,
+            _ => raw_name,
         };
 
         let mut arguments = if let Some(args_val) = function
@@ -2153,14 +2230,21 @@ impl ToolDispatcher {
             }
         }
 
-        Some(ToolCall {
+        Ok(ToolCall {
             id: value
                 .get("id")
                 .and_then(|id| id.as_str())
+                .filter(|id| !id.trim().is_empty())
                 .map(str::to_string)
                 .unwrap_or_else(|| format!("call_{}", next_id)),
             name: canonical_name.to_string(),
-            arguments,
+            arguments: arguments.clone(),
+            raw_arguments: value
+                .get("function")
+                .and_then(|function| function.get("arguments"))
+                .or_else(|| value.get("arguments"))
+                .cloned()
+                .unwrap_or_else(|| arguments.clone()),
         })
     }
 
@@ -2291,25 +2375,39 @@ impl ToolDispatcher {
     }
 
     pub fn parse_tool_calls_with_id(text: &str, native_id: Option<&str>) -> Vec<ToolCall> {
+        let mut calls = Self::parse_tool_calls_infallible(text);
+        if let (Some(id), Some(call)) = (native_id, calls.first_mut())
+            && !id.trim().is_empty()
+        {
+            call.id = id.to_string();
+        }
+        let mut seen = std::collections::HashSet::new();
+        for (index, call) in calls.iter_mut().enumerate() {
+            if !seen.insert(call.id.clone()) {
+                let base = format!("call_{}", index + 1);
+                let mut unique = base.clone();
+                let mut suffix = 1;
+                while !seen.insert(unique.clone()) {
+                    unique = format!("{}_{}", base, suffix);
+                    suffix += 1;
+                }
+                call.id = unique;
+            }
+        }
+        calls
+    }
+
+    fn parse_tool_calls_infallible(text: &str) -> Vec<ToolCall> {
         if let Ok(value) = serde_json::from_str::<serde_json::Value>(text)
             && let Some(items) = value["tool_calls"].as_array()
         {
             let mut calls = Vec::new();
             for (index, item) in items.iter().enumerate() {
-                if let Some(call) = Self::native_tool_call(item, index + 1) {
-                    calls.push(call);
-                }
+                calls.push(Self::tool_call_from_native(item, index + 1));
             }
             if !calls.is_empty() {
                 return calls;
             }
-        }
-        if let Some(id) = native_id
-            && let Ok(value) = serde_json::from_str::<serde_json::Value>(text)
-            && let Some(mut call) = Self::native_tool_call(&value, 1)
-        {
-            call.id = id.to_string();
-            return vec![call];
         }
         let mut calls = Vec::new();
         let tag_pairs = [
@@ -2475,19 +2573,18 @@ impl ToolDispatcher {
                 return items
                     .iter()
                     .enumerate()
-                    .filter_map(|(i, item)| ToolDispatcher::native_tool_call(item, next_id + i))
+                    .map(|(i, item)| ToolDispatcher::tool_call_from_native(item, next_id + i))
                     .next();
             }
             if val["function"].is_object() {
-                return ToolDispatcher::native_tool_call(val, next_id);
+                return Some(ToolDispatcher::tool_call_from_native(val, next_id));
             }
             let name = val["name"].as_str().or_else(|| val["tool"].as_str())?;
             let arguments = val.get("arguments").cloned().unwrap_or_else(|| val.clone());
-            let call = ToolDispatcher::native_tool_call(
+            Some(ToolDispatcher::tool_call_from_native(
                 &serde_json::json!({"id": val["id"], "name": name, "arguments": arguments}),
                 next_id,
-            )?;
-            Some(call)
+            ))
         }
 
         // Check for markdown code blocks containing tool call JSON
@@ -2574,6 +2671,7 @@ impl ToolDispatcher {
         calls
     }
 
+    #[cfg(test)]
     pub fn execute_tool(root: &Path, call: &ToolCall, approved: bool) -> ToolResult {
         Self::execute_tool_tracked(
             Some(root),
@@ -3111,7 +3209,7 @@ mod tests {
                 registration_barrier.wait();
                 registration_registry
                     .registration(&registration_run_id, 0)
-                    .map(|registration| std::mem::forget(registration))
+                    .map(std::mem::forget)
             });
 
             let cancellation_registry = registry.clone();
@@ -3193,6 +3291,64 @@ mod tests {
     }
 
     #[test]
+    fn unsupported_native_tool_is_preserved_for_structured_rejection() {
+        let calls = ToolDispatcher::parse_tool_calls(
+            r#"{"tool_calls":[{"id":"call_unknown","type":"function","function":{"name":"future_tool","arguments":"{}"}}]}"#,
+        );
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].id, "call_unknown");
+        assert_eq!(calls[0].name, "future_tool");
+        let result = ToolDispatcher::execute_tool(Path::new("."), &calls[0], true);
+        assert!(!result.success);
+        assert_eq!(result.error.as_deref(), Some("Unknown tool: future_tool"));
+    }
+
+    #[test]
+    fn unknown_native_tool_is_not_discarded_by_compatibility_parser() {
+        let call = ToolDispatcher::native_tool_call(
+            &serde_json::json!({"id":"x","name":"future_tool","arguments":"{}"}),
+            1,
+        )
+        .expect("native calls must be represented even when unsupported");
+        assert_eq!(call.name, "future_tool");
+    }
+
+    #[test]
+    fn malformed_native_tool_arguments_keep_raw_payload() {
+        let call = ToolDispatcher::native_tool_call(
+            &serde_json::json!({"id":"x","name":"read_file","arguments":"{broken"}),
+            1,
+        )
+        .unwrap();
+        assert_eq!(call.arguments["raw_arguments"], "{broken");
+        assert!(call.arguments["__native_argument_parse_error"].is_string());
+    }
+
+    #[test]
+    fn duplicate_tool_call_ids_are_made_unique_without_losing_calls() {
+        let calls = ToolDispatcher::parse_tool_calls(
+            r#"{"tool_calls":[
+                {"id":"same","name":"git_status","arguments":{}},
+                {"id":"same","name":"git_diff","arguments":{}}
+            ]}"#,
+        );
+        assert_eq!(calls.len(), 2);
+        assert_ne!(calls[0].id, calls[1].id);
+        assert_eq!(calls[1].id, "call_2");
+    }
+
+    #[test]
+    fn missing_native_tool_id_gets_a_nonempty_fallback() {
+        let call = ToolDispatcher::native_tool_call(
+            &serde_json::json!({"id":"","name":"future_tool","arguments":"{}"}),
+            4,
+        )
+        .unwrap();
+        assert_eq!(call.id, "call_4");
+        assert_eq!(call.name, "future_tool");
+    }
+
+    #[test]
     fn invalid_native_tool_arguments_are_rejected_without_execution() {
         let call = ToolDispatcher::native_tool_call(
             &serde_json::json!({"id":"call_bad_json","name":"read_file","arguments":"{"}),
@@ -3220,6 +3376,24 @@ mod tests {
                 .unwrap()
                 .contains("JSON object")
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn save_project_memory_rejects_symlinked_agents_file_without_writing_target() {
+        use std::os::unix::fs::symlink;
+        let root =
+            std::env::temp_dir().join(format!("openharness-memory-link-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&root).unwrap();
+        let target = root.join("notes.txt");
+        fs::write(&target, "unrelated file").unwrap();
+        symlink(&target, root.join("AGENTS.md")).unwrap();
+
+        let result = ToolDispatcher::save_project_memory(&root, &["new note".into()]);
+
+        assert!(result.is_err());
+        assert_eq!(fs::read_to_string(target).unwrap(), "unrelated file");
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
@@ -3364,6 +3538,7 @@ mod tests {
                 id: "no-project-read".into(),
                 name: "read_file".into(),
                 arguments: serde_json::json!({"path":"secret.txt"}),
+                raw_arguments: serde_json::Value::Null,
             },
             true,
             &ProcessRegistry::default(),
@@ -3678,6 +3853,222 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn sandbox_rejects_symlink_escapes_and_symlink_writes() {
+        let root = std::env::temp_dir().join(format!(
+            "openharness-symlink-sandbox-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        let outside = root.with_file_name(format!("outside-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&root).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        fs::write(outside.join("secret.txt"), "outside").unwrap();
+        std::os::unix::fs::symlink(&outside, root.join("escape")).unwrap();
+        std::os::unix::fs::symlink(outside.join("secret.txt"), root.join("file-link")).unwrap();
+        let sandbox = Sandbox::new(root.clone()).unwrap();
+
+        assert!(sandbox.read_file("escape/secret.txt").is_err());
+        assert!(sandbox.read_file("file-link").is_err());
+        assert!(
+            sandbox
+                .write_file("escape/replaced.txt", "blocked")
+                .is_err()
+        );
+        assert!(sandbox.write_file("file-link", "replaced").is_err());
+        assert!(!outside.join("replaced.txt").exists());
+        assert_eq!(
+            fs::read_to_string(outside.join("secret.txt")).unwrap(),
+            "outside"
+        );
+        let _ = fs::remove_dir_all(root);
+        let _ = fs::remove_dir_all(outside);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn concurrent_sandbox_writes_do_not_replace_files_with_symlinks() {
+        use std::sync::Arc;
+
+        let root = std::env::temp_dir().join(format!(
+            "openharness-write-race-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("target.txt"), "initial").unwrap();
+        let sandbox = Arc::new(Sandbox::new(root.clone()).unwrap());
+        let mut joins = Vec::new();
+        for value in 0..16 {
+            let sandbox = sandbox.clone();
+            joins.push(std::thread::spawn(move || {
+                for _ in 0..50 {
+                    assert!(
+                        sandbox
+                            .write_file("target.txt", &format!("write-{value}"))
+                            .is_ok()
+                    );
+                }
+            }));
+        }
+        for join in joins {
+            join.join().unwrap();
+        }
+        assert!(sandbox.read_file("target.txt").is_ok());
+        assert!(
+            !root
+                .join("target.txt")
+                .symlink_metadata()
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn concurrent_file_symlink_swap_never_reads_external_target() {
+        use std::os::unix::fs::symlink;
+        use std::sync::Arc;
+
+        let base = std::env::temp_dir().join(format!(
+            "openharness-read-symlink-race-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let root = base.join("workspace");
+        let outside = base.join("outside");
+        fs::create_dir_all(&root).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        fs::write(root.join("target.txt"), "inside").unwrap();
+        fs::write(outside.join("secret.txt"), "external-secret").unwrap();
+        let sandbox = Arc::new(Sandbox::new(root.clone()).unwrap());
+        let attack_root = root.clone();
+        let attack_outside = outside.clone();
+        let attacker = std::thread::spawn(move || {
+            for _ in 0..1000 {
+                let held = attack_root.join("held.txt");
+                if fs::rename(attack_root.join("target.txt"), &held).is_ok() {
+                    if symlink(
+                        attack_outside.join("secret.txt"),
+                        attack_root.join("target.txt"),
+                    )
+                    .is_ok()
+                    {
+                        let _ = fs::remove_file(attack_root.join("target.txt"));
+                    }
+                    let _ = fs::rename(held, attack_root.join("target.txt"));
+                }
+            }
+        });
+        for _ in 0..1000 {
+            if let Ok(contents) = sandbox.read_file("target.txt") {
+                assert_eq!(
+                    contents, "inside",
+                    "sandbox read escaped through swapped symlink"
+                );
+            }
+        }
+        attacker.join().unwrap();
+        assert_eq!(
+            fs::read_to_string(outside.join("secret.txt")).unwrap(),
+            "external-secret"
+        );
+        let _ = fs::remove_dir_all(base);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn concurrent_parent_replacement_cannot_write_outside_sandbox() {
+        use std::os::unix::fs::symlink;
+        use std::sync::Arc;
+
+        let base =
+            std::env::temp_dir().join(format!("openharness-parent-race-{}", uuid::Uuid::new_v4()));
+        let root = base.join("workspace");
+        let outside = base.join("outside");
+        fs::create_dir_all(root.join("nested")).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        fs::write(outside.join("value.txt"), "protected").unwrap();
+        let sandbox = Arc::new(Sandbox::new(root.clone()).unwrap());
+        let attack_root = root.clone();
+        let attack_outside = outside.clone();
+        let attacker = std::thread::spawn(move || {
+            for _ in 0..1000 {
+                let held = attack_root.join("held");
+                if fs::rename(attack_root.join("nested"), &held).is_ok() {
+                    let _ = symlink(&attack_outside, attack_root.join("nested"));
+                    let _ = fs::remove_file(attack_root.join("nested"));
+                    let _ = fs::rename(held, attack_root.join("nested"));
+                }
+            }
+        });
+        let writer = sandbox.clone();
+        let writes = std::thread::spawn(move || {
+            for _ in 0..1000 {
+                let _ = writer.write_file("nested/value.txt", "sandbox");
+            }
+        });
+        attacker.join().unwrap();
+        writes.join().unwrap();
+        assert_eq!(
+            fs::read_to_string(outside.join("value.txt")).unwrap(),
+            "protected"
+        );
+        let _ = fs::remove_dir_all(base);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn sandbox_rejects_junction_directory_escape() {
+        let test_root = std::env::current_dir()
+            .unwrap()
+            .join("target")
+            .join(format!(
+                "openharness-junction-safety-{}",
+                uuid::Uuid::new_v4()
+            ));
+        let root = test_root.join("workspace");
+        let outside = test_root.join("outside");
+        fs::create_dir_all(&root).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        fs::write(outside.join("protected.txt"), "outside").unwrap();
+        let junction = root.join("linked");
+        let command = std::process::Command::new("cmd")
+            .args([
+                "/c",
+                "mklink",
+                "/J",
+                &junction.to_string_lossy(),
+                &outside.to_string_lossy(),
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            command.status.success(),
+            "mklink /J failed: {}",
+            String::from_utf8_lossy(&command.stderr)
+        );
+        let sandbox = Sandbox::new(root.clone()).unwrap();
+        assert!(sandbox.list_dir(Some("linked")).is_err());
+        assert!(
+            sandbox
+                .read_file("linked/protected.txt", None, None)
+                .is_err()
+        );
+        assert!(
+            sandbox
+                .write_file("linked/protected.txt", "changed")
+                .is_err()
+        );
+        assert_eq!(
+            fs::read_to_string(outside.join("protected.txt")).unwrap(),
+            "outside"
+        );
+        let _ = fs::remove_dir_all(test_root);
+    }
+
     #[test]
     fn sandbox_rejects_absolute_drive_and_nonportable_paths() {
         let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target");
@@ -3750,6 +4141,30 @@ mod tests {
         assert!(sandbox.write_file("file-link", "overwrite").is_err());
 
         assert_eq!(fs::read_to_string(outside_file).unwrap(), "outside secret");
+        let _ = fs::remove_dir_all(test_root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn patch_file_rejects_parent_directory_replaced_after_initial_validation() {
+        use std::os::unix::fs::symlink;
+        let test_root = std::env::current_dir()
+            .unwrap()
+            .join("target")
+            .join(format!("openharness-parent-swap-{}", uuid::Uuid::new_v4()));
+        let root = test_root.join("workspace");
+        let other = test_root.join("other");
+        fs::create_dir_all(&root).unwrap();
+        fs::create_dir_all(&other).unwrap();
+        let sandbox = Sandbox::new(root.clone()).unwrap();
+        let other_file = other.join("source.rs");
+        fs::write(&other_file, "original\n").unwrap();
+        symlink(&other, root.join("directory")).unwrap();
+
+        let result = sandbox.write_file("directory/source.rs", "modified\n");
+
+        assert!(result.is_err());
+        assert_eq!(fs::read_to_string(&other_file).unwrap(), "original\n");
         let _ = fs::remove_dir_all(test_root);
     }
 

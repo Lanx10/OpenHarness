@@ -5,13 +5,20 @@
 }
 
 :root {
-  --bg: #090a09;
-  --surface: #0e0f0e;
-  --surface-hover: #171917;
+  --bg: var(--black-1);
+  --surface: var(--black-2);
+  --surface-hover: var(--black-3);
   --fg: #e8e8e6;
   --muted: #7d827d;
-  --border: #1c1e1c;
+  --border: var(--black-border);
+  --overlay: rgba(0, 0, 0, 0.68);
   --accent: #ccff00;
+  --accent-pink: var(--color-accent-pink);
+  --accent-pink-hover: var(--color-accent-pink-hover);
+  --accent-pink-muted: var(--color-accent-pink-muted);
+  --accent-pink-border: var(--color-accent-pink-border);
+  --accent-pink-soft: var(--color-accent-pink-soft);
+  --accent-hover: color-mix(in oklch, var(--accent) 88%, black);
   --accent-soft: rgba(204, 255, 0, 0.12);
   --accent-fg: #080907;
   --accent-muted: #96bb00;
@@ -64,13 +71,13 @@ svg { display: block; }
 .rail {
   width: 58px;
   flex: 0 0 58px;
-  background: var(--accent);
+  background: var(--black-2);
   display: flex;
   flex-direction: column;
   align-items: center;
   padding: 12px 0 14px;
   z-index: 20;
-  border-right: 1px solid color-mix(in oklch, var(--accent) 75%, black);
+  border-right: 1px solid var(--black-border);
 }
 .rail-button {
   position: relative;
@@ -80,13 +87,13 @@ svg { display: block; }
   place-items: center;
   border: 0;
   border-radius: 10px;
-  color: color-mix(in oklch, var(--accent-fg) 66%, transparent);
+  color: var(--muted);
   background: transparent;
   transition: background .14s ease, color .14s ease, transform .14s ease;
 }
 .rail-button svg { width: 18px; height: 18px; }
-.rail-button:hover { color: var(--accent-fg); background: color-mix(in oklch, var(--accent) 75%, white); transform: translateY(-1px); }
-.rail-button.active { color: var(--accent); background: var(--accent-fg); }
+.rail-button:hover { color: var(--fg); background: var(--black-3); transform: translateY(-1px); }
+.rail-button.active { color: var(--accent); background: var(--black-4); }
 .rail-skills { margin-top: 8px; }
 .rail-bottom { margin-top: auto; }
 .rail-badge-dot { position: absolute; top: 5px; right: 5px; width: 7px; height: 7px; border: 1px solid var(--accent); border-radius: 50%; background: #e36b43; }
@@ -2193,7 +2200,7 @@ svg { display: block; }
 .settings-modal-backdrop {
   position: fixed;
   inset: 0;
-  background: rgba(4, 6, 4, 0.64);
+  background: var(--overlay);
   backdrop-filter: blur(4px);
   -webkit-backdrop-filter: blur(4px);
   display: flex;
@@ -2678,3 +2685,119 @@ svg { display: block; }
 .skill-row-copy > span { display: -webkit-box; overflow: hidden; -webkit-box-orient: vertical; -webkit-line-clamp: 3; line-height: 1.55; }
 .skill-row-copy small { margin-top: 2px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 @media (prefers-reduced-motion: reduce) { .skills-list li { transition: none; } }
+
+/* Black structural surfaces; Citrus and Hot Pink remain semantic accents. */
+.app, .chat-window, .workspace, .canvas { background: var(--black-0); }
+.rail, .workspace-tool-header, .file-panel-header, .browser-panel-header,
+.tab, .action-button, .project-search, .settings-nav { background: var(--black-2); }
+.drawer, .thread-sidebar, .titlebar, .browser-presets-bar,
+.terminal-input-row, .settings-page.settings-modal, .settings-content { background: var(--black-1); }
+.drawer-foot { background: var(--black-1); }
+.project-row:hover, .project-row:focus-within, .project:hover, .thread-item:hover,
+.tab:hover, .action-button:hover, .tab-close:hover, .icon-button:hover { background: var(--black-3); }
+.project.selected, .thread-item-active { background: var(--black-4); border-color: var(--black-border); }
+.workspace-tool-panel, .file-panel, .git-panel, .browser-side-panel,
+.composer, .providers-card, .saved-provider, .advanced-panel, .update-panel,
+.modal, .approval-dialog { background: var(--black-2); border-color: var(--black-border); }
+.browser-controls-row, .browser-status-bar, .terminal-header { background: var(--black-2); }
+.browser-url-form, .workspace-file-content pre, .git-diff-pre, .terminal-output,
+.code-block-modern { background: var(--black-0); }
+.browser-viewport-container { background: #000; }
+.settings-modal-backdrop, .modal-backdrop { background: var(--overlay); }
+button:disabled, input:disabled, select:disabled { cursor: not-allowed; }
+
+/* Citrus primary interactions use the shared accent tokens. */
+.rail-button.active { color: var(--accent); background: var(--black-4); }
+.rail-button:focus-visible { outline-color: var(--accent); }
+.new-thread-primary, .new-thread-btn, .new-chat-primary,
+.collapsed-drawer-primary, .thread-collapsed-action { color: var(--accent-fg); background: var(--accent); border-color: var(--accent); }
+.new-thread-primary:hover, .new-thread-btn:hover, .new-chat-primary:hover,
+.collapsed-drawer-primary:hover, .thread-collapsed-action:hover { color: var(--accent-fg); background: var(--accent-hover); border-color: var(--accent-hover); }
+.project.selected, .thread-item-active, .file-panel-tab.active,
+.file-panel-split-toggle.active, .browser-tool-btn.active, .browser-preset-chip.active { color: var(--accent); border-color: color-mix(in oklch, var(--accent) 45%, var(--border)); background: var(--accent-soft); }
+.project.selected::before { background: var(--accent); }
+.send-button, .save-provider, .add-provider, .check-updates,
+.approval-actions button.confirm, .modal-actions .confirm { color: var(--accent-fg); background: var(--accent); border-color: var(--accent); }
+.send-button:hover, .save-provider:hover, .add-provider:hover, .check-updates:hover,
+.approval-actions button.confirm:hover, .modal-actions .confirm:hover { color: var(--accent-fg); background: var(--accent-hover); border-color: var(--accent-hover); }
+.quick-pill.local, .terminal-new, .file-panel-tab.active,
+.provider-setup, .advanced-toggle[aria-expanded="true"],
+.browser-status-open-btn, .browser-status-warning button { color: var(--accent); }
+.terminal-input-row button { color: var(--accent-fg); background: var(--accent); border-color: var(--accent); }
+.terminal-input-row button:hover { background: var(--accent-hover); border-color: var(--accent-hover); }
+.provider-vision-toggle input[type="checkbox"]:checked,
+.provider-preset-btn.active, .skill-row input:checked { color: var(--accent-fg); background: var(--accent); border-color: var(--accent); }
+.provider-vision-toggle input[type="checkbox"]:checked::after { background: var(--accent-fg); }
+.progress-highlight, .browser-loading-bar { background: var(--accent); box-shadow: 0 0 10px var(--accent-soft); }
+.send-button.stop-generation { color: var(--fg); background: var(--black-4); border-color: var(--accent); }
+
+/* Hot Pink is reserved for secondary emphasis and optional controls. */
+.project-actions button:hover:not([aria-label^="Delete"]):not([aria-label^="Remove"]),
+.chatgpt-user-actions button:hover, .chatgpt-assistant-actions button:hover,
+.thread-delete:hover, .compose-icon:hover, .canvas-actions .iconbtn:hover,
+.window-tools-popover button:hover, .settings-nav-item:hover,
+.file-panel-tab:hover, .browser-tool-btn:hover:not(.active),
+.browser-nav-btn:hover:not(:disabled), .browser-preset-chip:hover,
+.model-option:hover, .approval-mode-option:hover, .quick-pill:hover,
+.provider-preset-btn:hover:not(.active), .advanced-toggle:hover,
+.modal-header .iconbtn:hover, .browse-btn:hover:not(:disabled),
+.back-button:hover, .provider-delete-confirm button:not(:first-of-type):hover {
+  color: var(--accent-pink-hover);
+  background-color: var(--accent-pink-soft);
+}
+.project-actions button:hover:not([aria-label^="Delete"]):not([aria-label^="Remove"]),
+.provider-preset-btn:hover:not(.active), .file-panel-tab:hover,
+.browser-tool-btn:hover:not(.active), .browser-preset-chip:hover {
+  border-color: var(--accent-pink-border);
+}
+.chatgpt-user-actions button:focus-visible,
+.chatgpt-assistant-actions button:focus-visible,
+.project-actions button:focus-visible, .thread-delete:focus-visible,
+.provider-preset-btn:focus-visible, .browser-tool-btn:focus-visible,
+.browser-nav-btn:focus-visible, .browser-preset-chip:focus-visible,
+.model-option:focus-visible, .approval-mode-option:focus-visible,
+.settings-nav-item:focus-visible, .back-button:focus-visible {
+  outline-color: var(--accent-pink);
+}
+.model-option.chosen, .approval-mode-option.selected,
+.settings-nav-item.active, .provider-openai-fields,
+.advanced-panel:focus-within {
+  border-color: var(--accent-pink-border);
+}
+.model-option.chosen, .approval-mode-option.selected,
+.settings-nav-item.active {
+  background: var(--accent-pink-muted);
+}
+.message-crumb.thinking, .composer-running-label { color: var(--accent-pink); }
+.message-crumb-detail { border-color: var(--accent-pink-border); }
+.message-crumb:hover:not(.thinking), .composer-skill-menu button:hover,
+.composer-skill-menu button[aria-selected="true"] {
+  background-color: var(--accent-pink-soft);
+}
+.browser-viewport-toggles .browser-tool-btn:hover:not(.active) {
+  color: var(--accent-pink-hover);
+  background: var(--accent-pink-soft);
+}
+.browser-preset-chip.active { border-color: var(--accent-pink-border); }
+.browser-viewport-toggles .browser-tool-btn.active { color: var(--accent-pink); background: var(--accent-pink-soft); border: 1px solid var(--accent-pink-border); }
+.settings-nav-item.active { box-shadow: inset 2px 0 var(--accent-pink); }
+.advanced-toggle[aria-expanded="true"] { color: var(--accent-pink); }
+.provider-openai-protocol-badge { border-color: var(--accent-pink-border); }
+.provider-openai-callout { border-color: var(--accent-pink-border); }
+.provider-openai-callout-icon { color: var(--accent-pink); background: var(--accent-pink-soft); }
+.provider-openai-examples span { border-color: var(--accent-pink-border); }
+.model-provider-mark, .model-option-mark { background: var(--accent-pink-soft); color: var(--accent-pink); }
+.attachment-chip { border-color: color-mix(in oklch, var(--accent-pink) 20%, var(--black-border)); }
+.attachment-chip button:hover { background: var(--accent-pink-soft); color: var(--accent-pink-hover); }
+.learning-proposal { border-color: var(--accent-pink-border); }
+.learning-proposal-actions button:not(:first-child):hover { border-color: var(--accent-pink-border); color: var(--accent-pink-hover); }
+.approval-mode-control:hover { border-color: var(--accent-pink-border); }
+.window-tools-popover { border-color: var(--accent-pink-border); }
+.file-panel-split-toggle:hover { color: var(--accent-pink-hover); background: var(--accent-pink-soft); }
+.git-status-badge { border-color: var(--accent-pink-border); }
+.modal-actions button:not(.confirm):hover,
+.approval-actions button:not(.confirm):hover {
+  border-color: var(--accent-pink-border);
+  color: var(--accent-pink-hover);
+  background: var(--accent-pink-soft);
+}

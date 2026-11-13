@@ -315,7 +315,8 @@ export function SettingsPage({onClose, initialSection = 'Providers'}: SettingsPa
     };
     let cancelled = false;
     void loadReadiness();
-    return () => { cancelled = true; };
+    const interval = setInterval(loadReadiness, 30000);
+    return () => { cancelled = true; clearInterval(interval); };
   }, [readinessRevision]);
 
   useEffect(() => {

@@ -3,6 +3,20 @@ import assert from 'node:assert/strict';
 import { readQueuedPrompts, upsertStep, markPromptActive, estimateMessageTokens, removeQueuedPrompt, nextQueuedPrompt, queuedPromptById, queuedPromptsForThread, persistQueuedPrompts, type QueuedPrompt } from '../src/components/stepLifecycle.ts';
 import type { StepEventLike } from '../src/components/StepEvent.ts';
 import { cleanMessageText } from '../src/utils/cleanMessageText.ts';
+import { withFailureNotice } from '../src/components/stepLifecycle.ts';
+
+ test('failure notice preserves partial assistant output and is idempotent', () => {
+  const partial = 'First paragraph.\n\nSecond paragraph';
+  const failed = withFailureNotice(partial, 'Provider request failed');
+  assert.ok(failed.startsWith(partial));
+  assert.ok(failed.includes('Provider request failed'));
+  assert.equal(withFailureNotice(failed, 'Provider request failed'), failed);
+});
+
+ test('failure notice remains visible when no assistant output arrived', () => {
+  assert.equal(withFailureNotice('', 'Provider request failed'), 'Provider request failed');
+});
+
 
 test('restores queued prompts with attachments, model context and selected skills', () => {
   const prompt: QueuedPrompt = {
@@ -77,10 +91,10 @@ test('persisting an oversized queue clears the stale stored queue', () => {
   assert.equal(stored, null);
 });
 
-test('message token estimate includes attachments and is empty-safe', () => {
+test('message token estimate includes attachments and message overhead', () => {
   assert.equal(estimateMessageTokens('', []), 0);
-  assert.equal(estimateMessageTokens('1234', []), 1);
-  assert.equal(estimateMessageTokens('1234', ['5678']), 3);
+  assert.equal(estimateMessageTokens('1234', []), 10);
+  assert.equal(estimateMessageTokens('1234', ['5678']), 11);
 });
 
 test('active prompt markers keep queued prompt data and are idempotent', () => {

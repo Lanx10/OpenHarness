@@ -8,9 +8,10 @@ import {estimateMessageTokens} from '../src/components/stepLifecycle.ts';
   assert.ok(estimateMessageTokens('tiny', ['![image](data:image/png;base64,AAAA)']) > estimateMessageTokens('tiny'));
 });
 
- test('estimator includes fixed message overhead even for tiny text', () => {
+ test('estimator includes fixed message overhead for nonempty messages', () => {
   assert.ok(estimateMessageTokens('x') > estimateMessageTokens(''));
-  assert.ok(estimateMessageTokens('') > 0);
+  assert.equal(estimateMessageTokens(''), 0);
+  assert.equal(estimateMessageTokens('x'), 9);
 });
 
  test('preserves a recent message suffix during compaction', () => {
@@ -50,6 +51,14 @@ test('excludes estimates and deduplicates streaming usage updates by request ID'
   const duplicate = addUsageOnce(first, seen, 'request-1', {input_tokens: 7, output_tokens: 2});
   assert.deepEqual(first, {input: 7, output: 2, total: null, cached: null, reasoning: null});
   assert.equal(duplicate, first);
+});
+
+test('missing provider usage does not block later usage for the same request', () => {
+  const seen = new Set<string>();
+  const initial = emptyTokenUsage();
+  const withoutMetadata = addUsageOnce(initial, seen, 'request-2', {});
+  const reported = addUsageOnce(withoutMetadata, seen, 'request-2', {input_tokens: 9, output_tokens: 3});
+  assert.deepEqual(reported, {input: 9, output: 3, total: null, cached: null, reasoning: null});
 });
 
 test('rejects stale async loads when selected thread changed or was deleted', () => {
